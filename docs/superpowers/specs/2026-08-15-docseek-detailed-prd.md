@@ -113,6 +113,220 @@ flowchart TB
 - Admin routes are hidden or disabled when the user lacks their capabilities.
 - During processing, read operations remain available but all property mutation controls are disabled.
 
+### 5.2 Spatial UI Layouts
+
+The following Mermaid diagrams are structural wireframes. They define placement and containment of UI regions; typography, colors, spacing, and responsive breakpoints belong to the implementation plan.
+
+#### 5.2.1 Whole authenticated shell
+
+```mermaid
+flowchart TB
+  subgraph APP_SHELL["Authenticated DocSeek shell"]
+    direction TB
+    TOP_BAR["Top bar: logo | project selector | search | profile | admin actions"]
+    subgraph PROJECT_WORKSPACE["Selected project workspace"]
+      direction LR
+      TREE_PANEL["Left panel<br/>Property tree only"]
+      subgraph CENTER_PAGE["Center tab page"]
+        direction TB
+        TABS["Entity Graph | Property Graph | AI Query"]
+        ACTIVE_VIEW["Active tab canvas"]
+      end
+    end
+    STATUS_BANNER["Processing status banner when project is locked"]
+  end
+  TOP_BAR --> PROJECT_WORKSPACE
+  PROJECT_WORKSPACE --> STATUS_BANNER
+  TREE_PANEL -. "property selected" .-> PREVIEW_FLOAT["Floating Property Preview"]
+  TREE_PANEL -. "property selected" .-> ATTRIBUTE_FLOAT["Floating Property Attribute"]
+  ACTIVE_VIEW -. "property selected" .-> PREVIEW_FLOAT
+  ACTIVE_VIEW -. "property selected" .-> ATTRIBUTE_FLOAT
+```
+
+#### 5.2.2 Login and session layout
+
+```mermaid
+flowchart TB
+  subgraph LOGIN_PAGE["Login page"]
+    direction TB
+    BRAND["DocSeek identity"]
+    subgraph LOGIN_CARD["Sign in"]
+      USERNAME["Username field"]
+      PASSWORD["Password field"]
+      SIGN_IN["Sign in action"]
+      LOGIN_ERROR["Inline authentication error"]
+    end
+    SERVER_HINT["Self-hosted server name or address"]
+  end
+  BRAND --> LOGIN_CARD
+  LOGIN_CARD --> SERVER_HINT
+```
+
+#### 5.2.3 Project management layout
+
+```mermaid
+flowchart LR
+  subgraph PROJECT_MANAGER["Project management view"]
+    direction LR
+    PROJECT_LIST["Project list<br/>name | status | updated"]
+    subgraph PROJECT_MAIN["Project detail and actions"]
+      direction TB
+      PROJECT_HEADER["Selected project header"]
+      PROJECT_ACTIONS["Create | Rename | Delete"]
+      PROJECT_STORAGE["Resolved server storage paths"]
+      PROJECT_ACTIVITY["Current processing status"]
+    end
+  end
+  PROJECT_LIST --> PROJECT_MAIN
+```
+
+#### 5.2.4 Property tree with floating windows
+
+```mermaid
+flowchart LR
+  TREE["Left property tree<br/>directories and properties"]
+  CENTER["Center tab canvas<br/>Entity Graph, Property Graph, or AI Query"]
+  subgraph FLOATING_WINDOWS["Floating windows over the center canvas"]
+    direction TB
+    PREVIEW["Property Preview<br/>source content and filename"]
+    ATTRIBUTE["Property Attribute<br/>definition and entity list"]
+  end
+  TREE -. "click property" .-> PREVIEW
+  TREE -. "click property" .-> ATTRIBUTE
+  CENTER -. "select property node" .-> PREVIEW
+  CENTER -. "select property node" .-> ATTRIBUTE
+```
+
+#### 5.2.5 Processing status layout
+
+```mermaid
+flowchart TB
+  subgraph PROCESSING_VIEW["Project processing status"]
+    direction TB
+    LOCKED["Project locked for property mutations"]
+    CURRENT["Current agent and progress"]
+    STAGES["DG | EC | GA | PGB | EGB | vector/index refresh"]
+    RESULT["Complete snapshot activated or previous snapshot retained"]
+    ACTIONS["Retry failed job | close status"]
+  end
+  LOCKED --> CURRENT --> STAGES --> RESULT --> ACTIONS
+```
+
+#### 5.2.6 Entity Graph tab layout
+
+```mermaid
+flowchart TB
+  subgraph ENTITY_GRAPH_PAGE["Entity Graph tab"]
+    direction TB
+    ENTITY_TOOLBAR["Search entities | filter | zoom | fit all | reset"]
+    ENTITY_CANVAS["Complete project Entity Graph canvas<br/>all entities and entity edges"]
+    ENTITY_DETAILS["Selected entity details and linked properties"]
+  end
+  ENTITY_TOOLBAR --> ENTITY_CANVAS --> ENTITY_DETAILS
+```
+
+#### 5.2.7 Property Graph tab layout
+
+```mermaid
+flowchart TB
+  subgraph PROPERTY_GRAPH_PAGE["Property Graph tab"]
+    direction TB
+    PROPERTY_TOOLBAR["Search properties | filter | zoom | fit all | reset"]
+    PROPERTY_CANVAS["Complete project Property Graph canvas<br/>all properties and property edges"]
+    PROPERTY_SELECTION["Selected property opens floating Preview and Attribute"]
+  end
+  PROPERTY_TOOLBAR --> PROPERTY_CANVAS --> PROPERTY_SELECTION
+```
+
+#### 5.2.8 AI Query tab layout
+
+```mermaid
+flowchart TB
+  subgraph AI_QUERY_PAGE["AI Query tab"]
+    direction TB
+    QUERY_CONTEXT["Selected project context and query options"]
+    QUESTION_BAR["Question input | submit | stop generation"]
+    subgraph ANSWER_ROW["Answer workspace"]
+      direction LR
+      ANSWER_PANEL["Grounded answer"]
+      CITATION_PANEL["Citations and source properties"]
+    end
+    QUERY_STATUS["Retrieval and model status"]
+  end
+  QUERY_CONTEXT --> QUESTION_BAR --> ANSWER_ROW --> QUERY_STATUS
+```
+
+#### 5.2.9 System Configuration layout
+
+```mermaid
+flowchart LR
+  subgraph SYSTEM_CONFIG_PAGE["System Configuration"]
+    direction LR
+    CONFIG_NAV["Configuration sections<br/>providers | agent routes | storage | MCP"]
+    subgraph CONFIG_MAIN["Selected configuration form"]
+      direction TB
+      PROFILE_LIST["Provider profiles and models"]
+      ROUTE_TABLE["Agent route table"]
+      PATH_FIELDS["conf and projects paths"]
+      VALIDATE_SAVE["Validate | Save | Restore valid config"]
+    end
+  end
+  CONFIG_NAV --> CONFIG_MAIN
+```
+
+#### 5.2.10 User, group, and role management layout
+
+```mermaid
+flowchart LR
+  subgraph ACCESS_ADMIN["User, Group, and Role management"]
+    direction LR
+    SUBJECT_LIST["Users or groups list"]
+    ROLE_LIST["Role list<br/>built-in and custom"]
+    subgraph PERMISSION_MAIN["Permission detail"]
+      direction TB
+      MEMBERSHIP["Group membership and role assignment"]
+      CAPABILITY_TABLE["Action-level capability table"]
+      EFFECTIVE_VIEW["Effective capabilities preview"]
+      ADMIN_SAVE["Save assignment"]
+    end
+  end
+  SUBJECT_LIST --> MEMBERSHIP
+  ROLE_LIST --> CAPABILITY_TABLE
+  MEMBERSHIP --> EFFECTIVE_VIEW
+  CAPABILITY_TABLE --> EFFECTIVE_VIEW --> ADMIN_SAVE
+```
+
+#### 5.2.11 User profile layout
+
+```mermaid
+flowchart TB
+  subgraph PROFILE_PAGE["User profile"]
+    direction TB
+    IDENTITY_CARD["Username and account status"]
+    MEMBERSHIPS["Read-only group and role memberships"]
+    PASSWORD_FORM["Change password"]
+    PREFERENCES["Personal preferences"]
+    SESSION_ACTIONS["Sign out current or all sessions"]
+  end
+  IDENTITY_CARD --> MEMBERSHIPS
+  MEMBERSHIPS --> PASSWORD_FORM
+  PASSWORD_FORM --> PREFERENCES --> SESSION_ACTIONS
+```
+
+#### 5.2.12 MCP settings layout
+
+```mermaid
+flowchart LR
+  subgraph MCP_SETTINGS_PAGE["MCP settings"]
+    direction LR
+    MCP_STATUS["Server status and enablement"]
+    MCP_ENDPOINT["Endpoint and transport settings"]
+    MCP_AUTH["Authentication and capability policy"]
+    MCP_TEST["Connection test and status"]
+  end
+  MCP_STATUS --> MCP_ENDPOINT --> MCP_AUTH --> MCP_TEST
+```
+
 ## 6. Module Requirements and UI Designs
 
 Each module below defines its responsibility, primary UI, and release-1 requirements.
