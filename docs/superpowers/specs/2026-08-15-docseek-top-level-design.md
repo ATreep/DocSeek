@@ -1,209 +1,209 @@
 # DocSeek Top-Level Platform Design
 
 Date: 2026-08-15
-Status: Design approved in brainstorming; pending written-spec review
+Status: Revised design approved in brainstorming; pending written-spec review
 
-## 1. Purpose and Release Boundary
+## 1. Product Boundary
 
-DocSeek is a self-hosted internal knowledge-base management and query system for one enterprise, organization, or person per deployment. Release 1 includes the complete product surface: property ingestion and editing, definition and entity extraction, smart grouping, Property Graph and Entity Graph construction, GraphRAG and vector retrieval, source-grounded AI Query, the React WebUI, local authentication and permissions, user/group/role management, System Configuration, and MCP exposure.
+DocSeek is a self-hosted internal knowledge-base management and query system for one enterprise, organization, or person per deployment. Release 1 includes property ingestion and editing, definition generation, smart grouping, Property Graph and Entity Graph construction, natural-language Search, GraphRAG-based AI Query, the React WebUI, local authentication, global role-based permissions, user/group/role administration, System Configuration, and MCP exposure.
 
-Audit is explicitly out of scope. DocSeek will retain only the operational status required to process work safely, display progress, recover interrupted jobs, and retry failures. It will not provide an audit timeline or compliance-audit subsystem.
+Audit is explicitly excluded. DocSeek keeps only the operational state needed for locks, processing status, recovery, and retry. It does not provide an audit timeline or compliance-audit subsystem.
 
-The release is one product but is decomposed into bounded implementation tracks so that each subsystem has a clear owner and test boundary.
+## 2. Deployment and Runtime
 
-## 2. Deployment and Runtime Boundary
+The first release is optimized for a private server or other self-hosted infrastructure. One deployment serves one organization-wide authentication realm and one global permission policy. The application is a modular monolith with API, worker, and React runtime processes where useful, but all business capabilities share explicit domain interfaces.
 
-The first release is optimized for a private server or other self-hosted infrastructure. A deployment contains one organization-wide authentication realm and one set of global permission policies. The application is a modular monolith with separate API, worker, and React runtime processes where useful, but all business capabilities are owned by one codebase and share explicit internal interfaces.
+The principal modules are:
 
-The main modules are:
-
-- React WebUI and navigation shell
+- React WebUI and project workbench
 - Python API and domain services
 - Local authentication, groups, roles, and authorization
 - Project and property management
-- Agent orchestration and job coordination
-- LLM and embedding provider adapters
-- SQLite metadata access
-- Vector-store and GraphRAG-store adapters
-- Retrieval and AI Query
-- MCP adapter
+- Definition Generation Agent (DG-Agent)
+- Group Arrangement Agent (GA-Agent)
+- Property Graph Building Agent (PGB-Agent)
+- Neo4j GraphRAG Entity Graph pipeline
+- Neo4j Property Graph and Entity Graph databases
+- Shared embedding and retrieval services
+- AI Query
+- MCP server and MCP management view
 
-All WebUI and MCP operations pass through the same authorization policy. MCP is an alternate transport, not a second implementation of business logic.
+EC-Agent and EGB-Agent are removed. Entity extraction and entity-graph writing are performed by the Neo4j GraphRAG pipeline.
 
-## 3. Projects and Storage
+## 3. Projects and Filesystem Boundary
 
-Projects are independent knowledge corpora. Every authenticated user can discover and use all projects for which they have the relevant global module/action capability; there are no project-specific ACLs in release 1.
+Projects are independent knowledge corpora. Every authenticated user can discover and use all projects for which the relevant global capabilities are granted; there are no project-specific ACLs in release 1.
 
-The server-side directory layout is:
+The application directory has this shape:
 
 ```text
 <program directory>/
   conf/
   projects/
-    <project-id>/
-      properties/
-      metadata.sqlite
-      vector-data/
-      graphrag-data/
-      indexes/
-      jobs/
+    <stable-project-id>/
+      properties/          # original uploaded properties
+      extracted-text/      # normalized text for text properties
+      jobs/                # optional operational job artifacts
 ```
 
-`conf/` stores system configuration and user configuration beside the program's Python files. The default project root is the sibling `projects/` directory. System Configuration displays and validates the resolved server paths and may set the deployment's project-root path when a mounted or external server directory is required; the configuration directory remains program-relative.
+The user must enter a project name when creating a project. The server assigns a stable project ID for the directory. Renaming changes the display name and can happen whenever the user has `project.rename`; it does not move the stable project directory.
 
-Each project stores original uploaded files and all project-derived data on the server. Project data is never implicitly sent elsewhere.
+`conf/` stores system configuration, local users/groups/roles, provider profiles, and durable operational state. Neo4j stores canonical property, attribute, entity, graph, and vector-index data. No property or entity records are stored in project SQLite.
 
-### 3.1 SQLite Metadata
+## 4. Neo4j Graph Architecture
 
-The project SQLite database is the canonical source for non-graph metadata:
-
-- Property records and the current processing revision
-- One-sentence property definitions and property attributes
-- Entity identities, names, types, descriptions, and canonical metadata
-- Attribute-to-entity membership
-- Property-to-entity affiliation metadata needed by the property UI
-- Agent job state, active project snapshot, and processing status
-
-An attribute can list multiple entities, so the relationship is normalized rather than stored as a serialized list:
+DocSeek uses one Neo4j server with two named databases:
 
 ```text
-property_attribute_entity.property_attribute_id -> property_attribute.id
-property_attribute_entity.entity_id             -> entity.id
+property_graph
+entity_graph
 ```
 
-SQLite foreign keys are enforced. Entity and property records in SQLite are authoritative for identity and metadata; graph storage is a derived projection.
+### 4.1 Property Graph
 
-The SQLite attribute-to-entity association is canonical metadata for the Property Attribute view. When that association is needed for graph traversal, its graph edge is materialized in the single GraphRAG database; the two stores use the same stable IDs.
+Every property becomes a node in `property_graph`, including image properties. A property node stores its stable property ID, filename, type, definition, source metadata, and embedding.
 
-### 3.2 Graph and Vector Stores
+PGB-Agent receives the current property-node inventory, property names, definitions, and applicable relationship rules. It generates **edges only**. DocSeek validates and writes those edges between existing property nodes. PGB-Agent never creates property nodes.
 
-One project-level GraphRAG database stores all graph-specific data, including Property Graph and Entity Graph nodes, entity-to-entity edges, property/entity traversal edges, relationship metadata, and graph indexes. Graph records reference the canonical SQLite IDs and do not become a second authority for entity descriptions.
+### 4.2 Entity Graph
 
-The project vector store contains document chunks and embeddings used for retrieval. Vector and graph stores are rebuildable from the published SQLite-backed project snapshot.
+Only non-image property text documents are sent to the Neo4j GraphRAG Knowledge Graph Builder. The builder extracts entity nodes and relationships, applies the fixed DocSeek entity schema and extraction prompt, resolves duplicate entities, and writes the result to `entity_graph`.
 
-## 4. Property Mutation and Agent Pipeline
+Images are never input to the Entity Graph pipeline. The Entity Graph tab reads all entity nodes and relationships from `entity_graph`.
 
-Property changes are explicit user actions: upload, Replace, or WebUI Save. A successful mutation creates the next processing input and automatically starts the worker pipeline.
+The DocSeek entity schema and extraction prompt are system-wide and editable only in System Configuration. Projects cannot override them. A schema or prompt change requires rebuilding `entity_graph` from all current non-image property text.
 
-The pipeline uses the following dependency order:
+### 4.3 Shared Embeddings and Retrieval
 
-1. Normalize and persist the property input.
-2. DG-Agent generates the one-sentence definition and a meaningful filename suggestion from document content.
-3. EC-Agent updates the entity pool and entity relationships using the current project graph context.
-4. GA-Agent assigns the property to an appropriate smart-tree location and suggests meaningful directory naming where needed.
-5. PGB-Agent updates the complete Property Graph projection.
-6. EGB-Agent updates the complete Entity Graph projection.
-7. Vector and retrieval indexes are refreshed for the new project snapshot.
+One configured embedding route is shared by:
 
-The exact internal scheduling may parallelize independent stages, but publication waits for every required stage.
+- Property Graph property nodes
+- Entity Graph entity/document records
+- Natural-language Search
+- AI Query retrieval
 
-### 4.1 Project-Wide Processing Lock
+Search embeds the user query, retrieves matching Properties and Entities from the two Neo4j databases, and may expand relevant graph neighborhoods. Search never invokes an LLM.
 
-While any worker pipeline is processing a project, all property mutations in that project are disabled. The property tree, graph views, previews, and query results remain readable. The UI shows the active stage and prevents upload, Replace, edit, rename, move, and delete actions; the API rejects any bypass attempt.
+AI Query retrieves from both `property_graph` and `entity_graph`, combines graph and source context, and sends that context to the configured AI Query LLM for answer generation.
 
-This conservative project-wide lock ensures that graph and index workers never publish results based on a property pool that changed during processing. Projects not being processed remain fully writable.
+## 5. Property Lifecycle and Agent Pipeline
 
-### 4.2 Active Snapshot and Processing Status
+Supported properties include text, Markdown, PDF, Word, HTML, code, and images.
 
-The **active project snapshot** is the last complete, internally consistent set of SQLite metadata, GraphRAG data, vector data, and indexes. Workers build candidate outputs for the next snapshot in staging locations. DocSeek switches the active pointer only after validation succeeds across all required stores.
+1. User uploads, edits, replaces, or removes a property.
+2. The project-wide property-mutation lock activates.
+3. DG-Agent generates a definition. For images, the configured DG-Agent model must support image input; its vision result is used as the property definition.
+4. The property node and shared embedding are written to a candidate `property_graph` snapshot.
+5. PGB-Agent proposes edges only; validated edges are written between candidate property nodes.
+6. Non-image properties are normalized into text documents and passed as the complete corpus to Neo4j GraphRAG for a candidate `entity_graph` rebuild.
+7. Candidate graph/vector indexes are validated.
+8. The candidate snapshot becomes active, or the previous active snapshot remains available on failure.
+9. The project unlocks.
 
-**Processing status** is the current operational state of the worker pipeline: queued, running, complete, interrupted, or failed, with the current agent, timestamps, heartbeat, and retryable failure message. It is not an audit log.
+Remove permanently deletes the original property and its Property Graph node, embedding, PGB edges, and all derived references. The Entity Graph is rebuilt from the remaining non-image text properties.
 
-If a pipeline fails, the previous active snapshot remains readable, the failure stage and retry action are shown, and the project unlocks. DG-Agent's filename suggestion is presented after the lock is released; the user may accept or revise it without it being silently applied.
+## 6. Project-Wide Consistency Lock
 
-## 5. Provider and System Configuration
+While a worker pipeline is processing a project, all property mutations in that project are disabled. Read-only property tree, graph, preview, Search, and AI Query views remain available against the previous active snapshot. The API rejects bypass attempts.
 
-System Configuration is restricted to the system-configuration capability and is normally assigned only to the immutable Superuser role.
+The operational state store persists the lock, job stage, heartbeat, candidate snapshot ID, and failure details. It is not a property/entity store and is not an audit history.
 
-Administrators can create multiple LLM provider profiles and embedding provider profiles. Each agent has an independent route to a profile and model:
+Candidate graph data uses a snapshot identifier. Reads use the active snapshot until every required candidate database/index is ready. A failed candidate never replaces the active state. Restart recovery detects stale jobs and clears or requeues them so a project cannot remain permanently locked.
 
-- DG-Agent
-- EC-Agent
-- GA-Agent
-- PGB-Agent
-- EGB-Agent
-- AI Query
-- Future agents added later
+## 7. React WebUI Structure
 
-The view validates provider connectivity and model capability before accepting a profile. A worker captures its selected provider and model at job start, so a configuration change cannot modify an active job halfway through. Credentials are never displayed in clear text.
+The selected project workspace has:
 
-## 6. Permission Model
+- A top bar with project selector, natural-language Search, user profile, and permission-gated administration.
+- A left panel containing only the property tree.
+- A center tab page with Entity Graph, Property Graph, and AI Query.
+- Floating Property Preview and Property Attribute windows when a property is selected in the tree or Property Graph.
+- A project-scoped MCP Management view with explicit Open MCP and Close MCP actions.
 
-Release 1 uses global, action-level permissions. Permissions are assigned to roles, roles are assigned to groups, and users receive capabilities only through group membership. A user may belong to multiple groups; effective access is the union of the capabilities granted by the user's roles. There are no direct user grants or deny rules.
+Property Preview renders image properties as images and supported document formats through their previewers. Property Attribute reads the property node’s definition and related metadata from `property_graph`.
 
-Built-in role templates and administrator-created custom roles are both supported. The immutable Superuser role always retains every capability, including user, group, role, and System Configuration management, and cannot be edited or removed through the WebUI.
+Entity Graph displays all entities from `entity_graph` by default. Property Graph displays all property nodes and PGB-Agent edges from `property_graph` by default. Filters and focus controls alter only the viewport.
 
-The initial capability families are:
+## 8. System Configuration
+
+System Configuration is superuser-only by default. It provides:
+
+- Multiple LLM provider profiles.
+- Multiple embedding provider profiles.
+- A DG-Agent route that must support images when image properties are processed.
+- A GA-Agent route.
+- A PGB-Agent route.
+- An AI Query LLM route.
+- One shared embedding route for both graph databases and Search.
+- Neo4j URI, credentials, `property_graph` database, and `entity_graph` database.
+- Neo4j schema/index readiness checks.
+- Fixed system-wide Entity Graph schema, constraints, and extraction prompt.
+- Project-root and original-file storage validation.
+- MCP endpoint enablement settings.
+
+Workers capture routes at job start; configuration changes do not alter active work.
+
+## 9. Permission Model
+
+Permissions are global and action-level. Permissions are assigned to roles, roles are assigned to groups, and users receive the union of role capabilities through group membership. There are no direct user grants, deny rules, or project-specific permission tables.
+
+Built-in role templates and custom roles are supported. The immutable Superuser role always has every capability and cannot be edited or removed through the WebUI.
+
+Initial capabilities include:
 
 - `project.view`, `project.create`, `project.rename`, `project.delete`
 - `property.view`, `property.upload`, `property.replace`, `property.edit`, `property.delete`, `property.rename`, `property.move`
 - `property.attribute.view`, `property.attribute.edit`
 - `graph.property.view`, `graph.entity.view`
-- `query.execute`
+- `search.properties`, `search.entities`, `query.execute`
 - `agent.status.view`, `agent.retry`, `agent.cancel`
 - `system.config.view`, `system.config.edit`
 - `user.manage`, `group.manage`, `role.manage`
 - `mcp.use`, `mcp.configure`
 
-Project creation, rename, and deletion are controlled by the separate project-management capabilities. No project-specific permission table is introduced in the first release.
+## 10. MCP Contract and Lifecycle
 
-## 7. React WebUI
+MCP is not globally enabled by default. After opening a project, the user must open MCP manually in the MCP Management view. The server binds to the currently selected project and is network-accessible without a separate MCP authentication step.
 
-The selected project screen uses an investigation-workbench structure with a deliberately simple left panel:
+The endpoint inherits the effective capabilities of the logged-in WebUI user who opened it. Each tool operation is checked against those capabilities. The network boundary is the only caller-authentication boundary.
 
-```text
-+--------------------------------------------------------------------+
-| DocSeek | Project selector | Search | User profile | Admin actions |
-+----------------------+---------------------------------------------+
-| Property tree only   | [Entity Graph] [Property Graph] [AI Query]  |
-|                      |                                             |
-| - directory         |                 active tab                 |
-| - property          |                                             |
-+----------------------+---------------------------------------------+
-```
+Closing MCP stops the server. Closing the project, logging out, or switching projects stops the old server. Switching to a new project does not automatically open MCP; the user must open it manually again.
 
-The Entity Graph tab displays all entities in the selected project by default. The Property Graph tab displays all properties. Search, filtering, focus, and layout controls affect only the view. They do not change the underlying graph.
+MCP has no project-management tools. The project context is implicit. Release-1 tools are:
 
-Clicking a property in the tree or Property Graph opens floating Property Preview and Property Attribute windows. Preview renders the source property; Attribute renders the definition and entity list. These windows are read-only while the project lock is active and expose edit controls only when the current user has the relevant capabilities and no worker is processing the project.
+- `list_properties`, `get_property`, `get_property_attribute`
+- `add_property`, `replace_property`, `remove_property`
+- `list_entities`, `get_entity`
+- `search_properties`, `search_entities`
+- `get_property_graph`, `get_entity_graph`
+- `ask_ai_query`, `get_processing_status`
 
-Project management, User/Group/Role management, System Configuration, MCP settings, and the current user's profile are top-level shell views or administrative routes and do not consume the property-tree panel.
+MCP property mutations use the same project-wide lock and permanent-remove behavior as the WebUI.
 
-## 8. MCP Contract
+## 11. Failure Handling and Verification
 
-The MCP server can be enabled and configured through the permission-gated MCP settings view. An MCP invocation first checks `mcp.use`, then evaluates the underlying capability for the requested operation. A caller cannot gain access through MCP that the same login identity would not have in the WebUI.
+- Parser or DG-Agent failure prevents property activation.
+- PGB-Agent failure prevents candidate Property Graph edges from activating.
+- Neo4j GraphRAG failure prevents candidate Entity Graph data from activating.
+- Invalid provider configuration leaves the last valid route active.
+- Search errors return retrieval failures without invoking an LLM.
+- AI Query errors preserve the question and expose a retryable generation error.
+- Server restart recovers stale jobs and preserves the previous active graphs.
 
-MCP responses use the same project, property, graph, and query services as the WebUI so behavior, citations, processing locks, and error handling remain identical.
+Verification includes unit tests for capability resolution, lock state, project naming, snapshot transitions, and provider routing; Neo4j integration tests for schemas, vector indexes, PGB edge writes, GraphRAG extraction, entity resolution, and two-database isolation; image processing tests; Search tests proving no LLM call; AI Query tests proving both graphs are retrieved; React end-to-end tests; and MCP lifecycle/capability tests.
 
-## 9. Failure Handling and Recovery
+## 12. Implementation Decomposition
 
-- Invalid file formats, parsing failures, provider errors, schema-invalid agent output, and storage errors stop publication before changing the active snapshot.
-- Candidate vector and GraphRAG outputs are isolated until validation succeeds.
-- The previous active snapshot remains readable after any failure.
-- Persisted job heartbeats allow restart recovery. Stale running jobs become interrupted and can be safely requeued.
-- Invalid provider configuration is rejected while the last valid configuration remains active.
-- A mutation received during a project lock is rejected by the API and disabled in the WebUI.
+Release 1 remains one product but is split into bounded tracks:
 
-## 10. Verification Strategy
+1. Runtime foundation, local authentication, roles, groups, and authorization.
+2. Project lifecycle, property originals, operational state, and project lock.
+3. DG-Agent, parsers, image preview, definitions, embeddings, and property node writes.
+4. PGB-Agent edge generation and `property_graph` Neo4j integration.
+5. Neo4j GraphRAG Entity Graph pipeline, fixed schema/prompt, entity resolution, and `entity_graph` integration.
+6. Search, AI Query, graph views, property overlays, and React workbench.
+7. System Configuration, MCP Management, MCP tools, and end-to-end verification.
 
-- Unit tests cover permission resolution, provider routing, SQLite foreign keys, snapshot transitions, filename suggestions, and lock behavior.
-- Integration tests use deterministic fake LLM and embedding providers to exercise the complete DG -> EC -> GA -> PGB/EGB pipeline, retries, rollback, and restart recovery.
-- Storage adapter tests cover SQLite, vector storage, and the single GraphRAG database.
-- End-to-end tests cover project management, upload/edit locking, floating property windows, graph tabs, AI Query citations, System Configuration, and role/group administration.
-- MCP parity tests verify that an operation allowed or denied in the WebUI is allowed or denied identically through MCP.
+## 13. Release 1 Success Criteria
 
-## 11. Implementation Decomposition
-
-Release 1 remains one complete product, but implementation should be split into bounded tracks:
-
-1. Runtime foundation, local authentication, groups, roles, and authorization.
-2. Server configuration, provider adapters, project directories, SQLite metadata, and processing state.
-3. Property ingestion, editing, project lock, DG-Agent, and smart grouping.
-4. Entity extraction, SQLite relationships, GraphRAG projections, vector indexing, and recovery behavior.
-5. React workbench, graph tabs, floating property windows, and AI Query.
-6. User administration, MCP exposure, permission parity, and end-to-end verification.
-
-Each track communicates through domain services and persisted project interfaces rather than reaching into another module's storage internals.
-
-## 12. Release 1 Success Criteria
-
-Release 1 is successful when a self-hosted operator can create local accounts and roles, configure multiple providers and per-agent model routes, create a project, upload or edit properties, observe the project-wide processing lock, receive DG-Agent definitions and filename suggestions, browse complete Property and Entity Graph views, inspect properties through floating windows, run cited AI Queries, manage authorized users/groups/roles, and invoke the same authorized capabilities through MCP. A server restart must not lose the active project snapshot or leave the project permanently locked.
+A self-hosted operator can create local accounts and roles, configure Neo4j and model providers, create and rename projects, upload text and image properties, see images in Property Preview, receive DG definitions, browse Property Graph and Entity Graph data from the two Neo4j databases, search Properties and Entities without an LLM, ask AI Query questions using both graphs, operate the project-scoped MCP tools, and recover safely from worker/server interruption without losing the last active state.
