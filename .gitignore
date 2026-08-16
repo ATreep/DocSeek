@@ -1,0 +1,19 @@
+# Ignore hidden files and directories, except this file itself.
+.*
+!/.gitignore
+
+# Python caches and build output
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+/dist/
+
+# Local runtime and project documentation
+data/
+docs/
+
+# Frontend dependencies and output
+frontend/node_modules/
+frontend/dist/
+*.tsbuildinfo

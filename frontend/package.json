@@ -1,0 +1,30 @@
+{
+  "name": "docseek-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "cytoscape": "^3.34.1",
+    "lucide-react": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "react-markdown": "latest",
+    "remark-gfm": "^4.0.1"
+  },
+  "devDependencies": {
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.4",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "jsdom": "^29.1.1",
+    "typescript": "latest",
+    "vite": "latest",
+    "vitest": "latest"
+  }
+}

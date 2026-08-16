@@ -1,0 +1,115 @@
+.check-ok,
+.check-warn,
+.check-info {
+  display: block;
+  padding: 8px 9px;
+  border-radius: 4px;
+}
+
+.check-info {
+  background: #eef4f6;
+  color: #526b76;
+}
+
+.provider-form-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: #52636f;
+  font-size: 12px;
+}
+
+.account-menu {
+  position: relative;
+}
+
+.account-menu-panel {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 8px);
+  right: 0;
+  min-width: 148px;
+  display: grid;
+  gap: 2px;
+  padding: 5px;
+  border: 1px solid #d5dde1;
+  border-radius: 5px;
+  background: #fff;
+  box-shadow: 0 12px 26px rgba(30, 49, 60, 0.16);
+  animation: floating-window-in 140ms ease-out both;
+}
+
+.account-menu-panel button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: #40515a;
+  padding: 8px 9px;
+  text-align: left;
+  font-size: 12px;
+}
+
+.account-menu-panel button:hover {
+  background: #eef5f2;
+  color: #1e5d48;
+}
+
+.avatar:hover,
+.avatar[aria-expanded="true"] {
+  background: #1e7a5a;
+}
+
+.top-create-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+}
+
+.workspace {
+  transition: grid-template-columns 160ms ease;
+}
+
+.workspace-sidebar-collapsed {
+  grid-template-columns: 58px minmax(0, 1fr);
+}
+
+.property-sidebar.collapsed .sidebar-heading {
+  justify-content: center;
+  padding-inline: 8px;
+}
+
+.property-sidebar.collapsed .sidebar-heading > div,
+.property-sidebar.collapsed .tree-actions,
+.property-sidebar.collapsed .property-tree,
+.property-sidebar.collapsed .sidebar-footer {
+  display: none;
+}
+
+@media (max-width: 800px) {
+  .top-create-button {
+    font-size: 0;
+    padding-inline: 4px;
+  }
+
+  .top-create-button svg {
+    margin: 0;
+  }
+
+  .workspace,
+  .workspace-sidebar-collapsed {
+    grid-template-columns: 1fr;
+  }
+
+  .property-sidebar.collapsed {
+    min-height: 52px;
+    max-height: 52px;
+  }
+
+  .property-sidebar.collapsed .sidebar-heading {
+    padding-block: 10px;
+  }
+}

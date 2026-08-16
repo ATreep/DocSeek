@@ -1,0 +1,177 @@
+import json
+from collections.abc import Callable
+from typing import Literal
+
+from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+
+from ..config import Settings, get_settings
+from ..security import get_current_user, require_capability
+from ..services.graph_store import Neo4jGraphStore
+from ..services.llm import AnswerLLM
+from ..services.providers import ProviderError
+from ..services.query_history import QueryHistoryStore
+from ..services.retrieval import Retriever
+from .projects import get_project
+
+router = APIRouter(prefix="/projects", tags=["query"])
+
+
+class QueryMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1)
+
+
+class QueryRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=1000)
+    history: list[QueryMessage] = Field(default_factory=list)
+
+
+def ai_query_events(
+    question: str,
+    context: dict,
+    answer_llm: AnswerLLM,
+    databases: list[str],
+    history: list[dict[str, str]] | None = None,
+    on_complete: Callable[[str, list[dict]], None] | None = None,
+):
+    result = answer_llm.stream_answer(question, context, history=history)
+    yield json.dumps(
+        {
+            "type": "sources",
+            "citations": result["citations"],
+            "retrieved": {
+                "properties": len(context.get("properties", [])),
+                "entities": len(context.get("entities", [])),
+                "databases": databases,
+            },
+        }
+    ) + "\n"
+    answer_chunks = []
+    try:
+        for chunk in result["chunks"]:
+            answer_chunks.append(chunk)
+            yield json.dumps({"type": "delta", "content": chunk}) + "\n"
+    except ProviderError as exc:
+        yield json.dumps({"type": "error", "message": str(exc)}) + "\n"
+        return
+    if on_complete:
+        on_complete("".join(answer_chunks), result["citations"])
+    yield json.dumps({"type": "done"}) + "\n"
+
+
+def _llm_history(messages: list[dict]) -> list[dict[str, str]]:
+    return [
+        {"role": message["role"], "content": message["content"]}
+        for message in messages
+        if message.get("role") in {"user", "assistant"}
+        and isinstance(message.get("content"), str)
+        and message["content"]
+    ]
+
+
+@router.get("/{project_id}/ai-query/history")
+def get_ai_query_history(
+    project_id: str,
+    settings: Settings = Depends(get_settings),
+    user=Depends(require_capability("query.execute")),
+):
+    if not get_project(settings, project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+    return {"messages": QueryHistoryStore(settings).list(project_id, user["id"])}
+
+
+@router.delete("/{project_id}/ai-query/history", status_code=status.HTTP_204_NO_CONTENT)
+def clear_ai_query_history(
+    project_id: str,
+    settings: Settings = Depends(get_settings),
+    user=Depends(require_capability("query.execute")),
+):
+    if not get_project(settings, project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+    QueryHistoryStore(settings).clear(project_id, user["id"])
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/{project_id}/search")
+def search(project_id: str, payload: QueryRequest, settings: Settings = Depends(get_settings), user=Depends(get_current_user)):
+    if not get_project(settings, project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+    if not ({"search.properties", "search.entities"} & user["capabilities"]):
+        raise HTTPException(status_code=403, detail="Missing search capability")
+    store = Neo4jGraphStore(settings)
+    grouped = Retriever(store).search(project_id, payload.query)
+    result = {}
+    if "search.properties" in user["capabilities"]:
+        result["properties"] = grouped["properties"]
+    if "search.entities" in user["capabilities"]:
+        result["entities"] = grouped["entities"]
+    return result
+
+
+@router.post("/{project_id}/search/properties")
+def search_properties(project_id: str, payload: QueryRequest, settings: Settings = Depends(get_settings), user=Depends(require_capability("search.properties"))):
+    if not get_project(settings, project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+    return {"properties": Retriever(Neo4jGraphStore(settings)).search_properties(project_id, payload.query)}
+
+
+@router.post("/{project_id}/search/entities")
+def search_entities(project_id: str, payload: QueryRequest, settings: Settings = Depends(get_settings), user=Depends(require_capability("search.entities"))):
+    if not get_project(settings, project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+    return {"entities": Neo4jGraphStore(settings).search(project_id, payload.query, "entities")}
+
+
+@router.post("/{project_id}/ai-query")
+def ai_query(project_id: str, payload: QueryRequest, settings: Settings = Depends(get_settings), user=Depends(require_capability("query.execute"))):
+    if not get_project(settings, project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+    store = Neo4jGraphStore(settings)
+    context = Retriever(store).context(project_id, payload.query)
+    history_store = QueryHistoryStore(settings)
+    saved_history = history_store.list(project_id, user["id"])
+    client_history = [message.model_dump() for message in payload.history]
+    history = _llm_history(saved_history or client_history)
+    result = AnswerLLM(settings=settings).answer(payload.query, context, history=history)
+    history_store.append_exchange(
+        project_id,
+        user["id"],
+        payload.query,
+        result["answer"],
+        result["citations"],
+        initial_history=client_history,
+    )
+    return {**result, "retrieved": {"properties": len(context["properties"]), "entities": len(context["entities"]), "databases": [settings.neo4j_property_database, settings.neo4j_entity_database]}}
+
+
+@router.post("/{project_id}/ai-query/stream")
+def ai_query_stream(project_id: str, payload: QueryRequest, settings: Settings = Depends(get_settings), user=Depends(require_capability("query.execute"))):
+    if not get_project(settings, project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+    context = Retriever(Neo4jGraphStore(settings)).context(project_id, payload.query)
+    history_store = QueryHistoryStore(settings)
+    saved_history = history_store.list(project_id, user["id"])
+    client_history = [message.model_dump() for message in payload.history]
+    history = _llm_history(saved_history or client_history)
+    events = ai_query_events(
+        payload.query,
+        context,
+        AnswerLLM(settings=settings),
+        [settings.neo4j_property_database, settings.neo4j_entity_database],
+        history,
+        on_complete=lambda answer, citations: history_store.append_exchange(
+            project_id,
+            user["id"],
+            payload.query,
+            answer,
+            citations,
+            initial_history=client_history,
+        ),
+    )
+    return StreamingResponse(
+        events,
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
