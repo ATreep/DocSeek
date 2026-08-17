@@ -38,10 +38,12 @@ import RelationOverlay from "./RelationOverlay";
 import ProjectEmptyState from "./ProjectEmptyState";
 import EntityOverlay, { type Entity } from "./EntityOverlay";
 import AccountMenu from "./AccountMenu";
+import LanguageSwitcher from "./LanguageSwitcher";
 import type { ChatCitation, ChatMessage } from "./AIQueryChat";
 import PropertyTree from "./PropertyTree";
 import SettingsPanel from "./SettingsPanel";
 import { canLeaveProject, closeMcpBeforeSwitch } from "../project-switch";
+import { useLanguage } from "../i18n";
 import {
   applyAIQueryEvent,
   type AIQueryStreamEvent,
@@ -94,6 +96,7 @@ type PropertyImportTarget = {
 };
 
 export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
+  const { t } = useLanguage();
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectCatalogLoaded, setProjectCatalogLoaded] = useState(false);
   const [project, setProject] = useState<Project | null>(null);
@@ -175,7 +178,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
       .catch((err) => {
         if (disposed) return;
         setChatHistoryProjectId(projectId);
-        setError(err instanceof Error ? err.message : "Unable to load AI Query history");
+        setError(err instanceof Error ? err.message : t("Unable to load AI Query history"));
       });
     return () => {
       disposed = true;
@@ -250,10 +253,10 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
 
   async function createProject(providedName?: string) {
     if (!canLeaveProject(processing)) {
-      setError("Project navigation is locked while the candidate build is processing.");
+      setError(t("Project navigation is locked while the candidate build is processing."));
       return false;
     }
-    const name = providedName ?? window.prompt("Project name");
+    const name = providedName ?? window.prompt(t("Project name"));
     if (!name?.trim()) return false;
     try {
       const created = await request<Project>("/projects", {
@@ -264,7 +267,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
       setProject(created);
       return true;
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Unable to create project");
+      setError(err instanceof Error ? err.message : t("Unable to create project"));
       return false;
     }
   }
@@ -284,7 +287,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
         }),
       );
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Search failed");
+      setError(err instanceof Error ? err.message : t("Search failed"));
     } finally {
       setBusy(false);
     }
@@ -314,7 +317,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
           if (streamEvent.type === "error") setError(streamEvent.message);
         });
     } catch (err) {
-      const message = err instanceof Error ? err.message : "AI Query failed";
+      const message = err instanceof Error ? err.message : t("AI Query failed");
       setChatMessages((current) =>
         applyAIQueryEvent(current, { type: "error", message }),
       );
@@ -332,7 +335,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
       });
       setChatMessages([]);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Unable to clear AI Query history");
+      setError(err instanceof Error ? err.message : t("Unable to clear AI Query history"));
     } finally {
       setBusy(false);
     }
@@ -357,7 +360,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
         defaultFilename: result.suggested_filename || currentFilename,
       });
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Upload failed");
+      setError(err instanceof Error ? err.message : t("Upload failed"));
     } finally {
       setBusy(false);
     }
@@ -372,7 +375,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
       );
       setImportTarget(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Unable to cancel property import");
+      setError(err instanceof Error ? err.message : t("Unable to cancel property import"));
     } finally {
       setBusy(false);
     }
@@ -390,7 +393,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
       await refreshProjects();
       await refreshProcessingState();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Property import failed");
+      setError(err instanceof Error ? err.message : t("Property import failed"));
     } finally {
       setBusy(false);
     }
@@ -405,16 +408,16 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
       setMcpOpen(!mcpOpen);
       setMcpEndpoint(result.endpoint || "");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "MCP action failed");
+      setError(err instanceof Error ? err.message : t("MCP action failed"));
     }
   }
   async function switchProject(nextProject: Project | null) {
     if (importTarget) {
-      setError("Confirm or cancel the pending property import before switching projects.");
+      setError(t("Confirm or cancel the pending property import before switching projects."));
       return;
     }
     if (!canLeaveProject(processing)) {
-      setError("Project switching is locked while the candidate build is processing.");
+      setError(t("Project switching is locked while the candidate build is processing."));
       return;
     }
     try {
@@ -426,7 +429,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
       setRegroupOpen(false);
       setProject(nextProject);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Unable to switch project");
+      setError(err instanceof Error ? err.message : t("Unable to switch project"));
     }
   }
   async function cancelJob() {
@@ -436,7 +439,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
       await refreshProcessingState();
     } catch (err) {
       setError(
-        err instanceof Error ? err.message : "Unable to cancel processing",
+        err instanceof Error ? err.message : t("Unable to cancel processing"),
       );
     }
   }
@@ -448,7 +451,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
       await refreshProcessingState();
     } catch (err) {
       setError(
-        err instanceof Error ? err.message : "Unable to retry processing",
+        err instanceof Error ? err.message : t("Unable to retry processing"),
       );
     }
   }
@@ -464,7 +467,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
   }
   async function renameProject() {
     if (!project) return;
-    const name = window.prompt("Project name", project.name);
+    const name = window.prompt(t("Project name"), project.name);
     if (!name?.trim()) return;
     try {
       const updated = await request<Project>(`/projects/${project.id}`, {
@@ -474,22 +477,22 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
       setProject(updated);
       await refreshProjects();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Project rename failed");
+      setError(err instanceof Error ? err.message : t("Project rename failed"));
     }
   }
   async function deleteProject() {
     if (importTarget) {
-      setError("Confirm or cancel the pending property import before closing this project.");
+      setError(t("Confirm or cancel the pending property import before closing this project."));
       return;
     }
     if (!canLeaveProject(processing)) {
-      setError("Project closing is locked while the candidate build is processing.");
+      setError(t("Project closing is locked while the candidate build is processing."));
       return;
     }
     if (
       !project ||
       !window.confirm(
-        `Delete ${project.name}? This permanently removes its files and graph.`,
+        t("Delete {name}? This permanently removes its files and graph.", { name: project.name }),
       )
     )
       return;
@@ -502,7 +505,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
       setMcpEndpoint("");
       await refreshProjects();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Project delete failed");
+      setError(err instanceof Error ? err.message : t("Project delete failed"));
     }
   }
   function openPropertyRename() {
@@ -527,7 +530,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
       setRenameTarget(null);
       await refreshProject();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Property rename failed");
+      setError(err instanceof Error ? err.message : t("Property rename failed"));
     } finally {
       setBusy(false);
     }
@@ -547,7 +550,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
       setRegroupOpen(false);
       await Promise.all([refreshProject(), refreshProjects()]);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Property re-grouping failed");
+      setError(err instanceof Error ? err.message : t("Property re-grouping failed"));
     } finally {
       setBusy(false);
     }
@@ -555,7 +558,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
   async function removeProperty() {
     if (
       !selected ||
-      !window.confirm(`Permanently remove ${selected.filename}?`)
+      !window.confirm(t("Permanently remove {filename}?", { filename: selected.filename }))
     )
       return;
     try {
@@ -566,7 +569,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
       setSelected(null);
       await refreshProject();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Property removal failed");
+      setError(err instanceof Error ? err.message : t("Property removal failed"));
     }
   }
   function openReplacement() {
@@ -586,7 +589,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
       await refreshProject();
     } catch (err) {
       setError(
-        err instanceof Error ? err.message : "Property replacement failed",
+        err instanceof Error ? err.message : t("Property replacement failed"),
       );
     } finally {
       setBusy(false);
@@ -651,14 +654,14 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
           <select
             value={project?.id || ""}
             disabled={processing}
-            title={processing ? "Project navigation is locked while processing" : "Select project"}
+            title={processing ? t("Project navigation is locked while processing") : t("Select project")}
             onChange={(event) =>
               switchProject(
                 projects.find((item) => item.id === event.target.value) || null,
               )
             }
           >
-            <option value="">Select project</option>
+            <option value="">{t("Select project")}</option>
             {projects.map((item) => (
               <option key={item.id} value={item.id}>
                 {item.name}
@@ -672,7 +675,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
           <input
             value={search}
             onChange={(event) => setSearch(event.target.value)}
-            placeholder="Search properties and entities"
+            placeholder={t("Search properties and entities")}
           />
           <kbd>⌘ K</kbd>
         </form>
@@ -680,37 +683,38 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
           <button
             type="button"
             className="text-button top-create-button"
-            aria-label="Create project"
-            title="Create project"
+            aria-label={t("Create project")}
+            title={t("Create project")}
             disabled={processing}
             onClick={() => void createProject()}
           >
-            <FolderPlus size={15} /> New project
+            <FolderPlus size={15} /> {t("New project")}
           </button>
           <button
             type="button"
             className={`mcp-button ${mcpOpen ? "active" : ""}`}
             onClick={toggleMcp}
           >
-            <Network size={15} /> MCP {mcpOpen ? "open" : "closed"}
+            <Network size={15} /> {mcpOpen ? t("MCP open") : t("MCP closed")}
           </button>
           <button
             type="button"
             className="icon-button"
-            title="Settings"
-            aria-label="Settings"
+            title={t("Settings")}
+            aria-label={t("Settings")}
             onClick={() => setSettingsOpen(true)}
           >
             <Settings2 size={17} />
           </button>
+          <LanguageSwitcher />
           <AccountMenu onSignOut={signOut} />
         </div>
       </header>
       {mcpOpen && (
         <div className="mcp-warning">
-          <strong>MCP endpoint is publicly callable.</strong>
+          <strong>{t("MCP endpoint is publicly callable.")}</strong>
           <span>
-            It inherits this user&apos;s current capabilities until closed.
+            {t("It inherits this user\u2019s current capabilities until closed.")}
           </span>
           {mcpEndpoint && <code>{mcpEndpoint}</code>}
         </div>
@@ -729,8 +733,8 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
               <span>
                 {processingStatus.stage_detail ||
                   (processingStatus.locked
-                    ? "Project actions are locked until this stage completes."
-                    : "Build finished.")}
+                    ? t("Project actions are locked until this stage completes.")
+                    : t("Build finished."))}
                 {processingStatus.locked && processingElapsed
                   ? ` · ${processingElapsed}`
                   : ""}
@@ -742,10 +746,10 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
                 <button
                   type="button"
                   className="text-button"
-                  aria-label="Show error detail"
+                  aria-label={t("Show error detail")}
                   onClick={() => setProcessingErrorOpen(true)}
                 >
-                  <Bug size={14} /> Show error detail
+                  <Bug size={14} /> {t("Show error detail")}
                 </button>
               )}
               {processingStatus.locked && (
@@ -754,7 +758,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
                   className="text-button"
                   onClick={cancelJob}
                 >
-                  Cancel
+                  {t("Cancel")}
                 </button>
               )}
               {failedProperty && (
@@ -763,7 +767,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
                   className="text-button"
                   onClick={() => retryJob(failedProperty.id)}
                 >
-                  Retry
+                  {t("Retry")}
                 </button>
               )}
             </div>
@@ -773,14 +777,14 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
         <aside className={`property-sidebar ${sidebarCollapsed ? "collapsed" : ""}`}>
           <div className="sidebar-heading">
             <div>
-              <span className="eyebrow">PROJECT PROPERTIES</span>
-              <h2>{project?.name || "No project selected"}</h2>
+              <span className="eyebrow">{t("PROJECT PROPERTIES")}</span>
+              <h2>{project?.name || t("No project selected")}</h2>
             </div>
             <button
               type="button"
               className="icon-button"
-              title={sidebarCollapsed ? "Expand panel" : "Collapse panel"}
-              aria-label={sidebarCollapsed ? "Expand panel" : "Collapse panel"}
+              title={sidebarCollapsed ? t("Expand panel") : t("Collapse panel")}
+              aria-label={sidebarCollapsed ? t("Expand panel") : t("Collapse panel")}
               aria-expanded={!sidebarCollapsed}
               onClick={() => setSidebarCollapsed((current) => !current)}
             >
@@ -793,15 +797,15 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
               disabled={!project || processing}
               onClick={() => setUploadOpen(true)}
             >
-              <FilePlus2 size={15} /> Add property
+              <FilePlus2 size={15} /> {t("Add property")}
             </button>
             {project && (
               <>
                 <button
                   type="button"
                   className="icon-button"
-                  title="Re-group properties"
-                  aria-label="Re-group properties"
+                  title={t("Re-group properties")}
+                  aria-label={t("Re-group properties")}
                   disabled={processing || busy || properties.length === 0}
                   onClick={() => setRegroupOpen(true)}
                 >
@@ -809,14 +813,14 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
                 </button>
                 <button
                   className="icon-button"
-                  title="Rename project"
+                  title={t("Rename project")}
                   onClick={renameProject}
                 >
                   <Pencil size={16} />
                 </button>
                 <button
                   className="icon-button danger"
-                  title="Delete project"
+                  title={t("Delete project")}
                   onClick={deleteProject}
                   disabled={processing}
                 >
@@ -830,9 +834,9 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
               <PropertyTree properties={properties} onSelect={selectProperty} />
             ) : (
               <div className="tree-empty">
-                No properties yet.
+                {t("No properties yet.")}
                 <br />
-                Add a file to begin.
+                {t("Add a file to begin.")}
               </div>
             )}
           </div>
@@ -840,7 +844,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
             <span className={`connection-dot ${processing ? "busy" : ""}`} />{" "}
             {processing
               ? processingStageLabel(processingStatus?.stage || "queued")
-              : "Active snapshot ready"}
+              : t("Active snapshot ready")}
           </div>
         </aside>
         <main className="center-workspace">
@@ -851,21 +855,21 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
                 className={tab === "entity" ? "active" : ""}
                 onClick={() => setTab("entity")}
               >
-                <Network size={15} /> Entity Graph
+                <Network size={15} /> {t("Entity Graph")}
               </button>
               <button
                 type="button"
                 className={tab === "property" ? "active" : ""}
                 onClick={() => setTab("property")}
               >
-                <FolderOpen size={15} /> Property Graph
+                <FolderOpen size={15} /> {t("Property Graph")}
               </button>
               <button
                 type="button"
                 className={tab === "query" ? "active" : ""}
                 onClick={() => setTab("query")}
               >
-                <MessageSquareText size={15} /> AI Query
+                <MessageSquareText size={15} /> {t("AI Query")}
               </button>
             </div>
             <div className="tab-status">
@@ -971,7 +975,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
         <div className="search-drawer">
           <div className="overlay-header">
             <div>
-              <span className="eyebrow">SEARCH RESULTS</span>
+              <span className="eyebrow">{t("SEARCH RESULTS")}</span>
               <h2>{search}</h2>
             </div>
             <button
@@ -984,7 +988,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
           </div>
           <section>
             <h3>
-              Properties <span>{results.properties.length}</span>
+              {t("Properties")} <span>{results.properties.length}</span>
             </h3>
             {results.properties.map((item) => (
               <button
@@ -1006,7 +1010,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
           </section>
           <section>
             <h3>
-              Entities <span>{results.entities.length}</span>
+              {t("Entities")} <span>{results.entities.length}</span>
             </h3>
             {results.entities.map((item) => (
               <button
@@ -1030,8 +1034,8 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
           <form className="upload-modal" onSubmit={submitUpload}>
             <div className="overlay-header">
               <div>
-                <span className="eyebrow">INGEST PROPERTY</span>
-                <h2>Add to {project?.name}</h2>
+                <span className="eyebrow">{t("INGEST PROPERTY")}</span>
+                <h2>{t("Add to {name}", { name: project?.name || "" })}</h2>
               </div>
               <button
                 type="button"
@@ -1043,20 +1047,20 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
             </div>
             <label className="dropzone">
               <Upload size={24} />
-              <strong>Choose a file</strong>
-              <span>Text, code, documents, or images</span>
+              <strong>{t("Choose a file")}</strong>
+              <span>{t("Text, code, documents, or images")}</span>
               <input type="file" name="file" required />
             </label>
             <label>
-              Optional context
+              {t("Optional context")}
               <textarea
                 name="comment"
                 rows={3}
-                placeholder="Add document details or grouping context"
+                placeholder={t("Add document details or grouping context")}
               />
             </label>
             <button className="primary-button" disabled={busy}>
-              <Upload size={15} /> Prepare import
+              <Upload size={15} /> {t("Prepare import")}
             </button>
           </form>
         </div>

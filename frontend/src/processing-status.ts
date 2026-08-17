@@ -1,4 +1,6 @@
-const STAGE_LABELS: Record<string, string> = {
+import { translate, type MessageKey } from './i18n'
+
+const STAGE_LABELS: Record<string, MessageKey> = {
   queued: 'Queued for processing',
   'dg-agent': 'Analyzing document',
   'ga-agent': 'Organizing property',
@@ -26,7 +28,8 @@ export type ProcessingRefreshStatus = {
 }
 
 export function processingStageLabel(stage?: string | null): string {
-  return (stage && STAGE_LABELS[stage]) || 'Preparing candidate build'
+  const key = (stage && STAGE_LABELS[stage]) || 'Preparing candidate build'
+  return translate(key)
 }
 
 export function processingElapsedLabel(

@@ -2,6 +2,7 @@ import { useEffect, useRef, type FormEvent } from 'react'
 import { Bot, CircleDot, FileText, Send, Trash2, UserRound } from 'lucide-react'
 import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import { useLanguage } from '../i18n'
 
 const markdownComponents: Components = {
   table: ({ node: _node, ...props }) => <div className="chat-table-scroll"><table {...props} /></div>,
@@ -31,6 +32,7 @@ type AIQueryChatProps = {
 }
 
 export default function AIQueryChat({ question, messages, busy, onQuestionChange, onSubmit, onClear, onCitationSelect }: AIQueryChatProps) {
+  const { t } = useLanguage()
   const transcriptRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -38,17 +40,17 @@ export default function AIQueryChat({ question, messages, busy, onQuestionChange
     if (transcript) transcript.scrollTop = transcript.scrollHeight
   }, [messages])
 
-  return <section className="query-panel chat-panel" aria-label="AI Query chat">
+  return <section className="query-panel chat-panel" aria-label={t('AI Query')}>
     <div className="chat-header">
       <div className="chat-title">
-        <span className="eyebrow">AI QUERY</span>
-        <h1>Ask across both graphs.</h1>
+        <span className="eyebrow">{t('AI QUERY')}</span>
+        <h1>{t('Ask across both graphs.')}</h1>
       </div>
       <button
         type="button"
         className="icon-button chat-clear-button"
-        aria-label="Clear chat history"
-        title="Clear chat history"
+        aria-label={t('Clear chat history')}
+        title={t('Clear chat history')}
         disabled={busy || messages.length === 0 || !onClear}
         onClick={onClear}
       >
@@ -56,22 +58,22 @@ export default function AIQueryChat({ question, messages, busy, onQuestionChange
       </button>
     </div>
     <div className="chat-transcript" aria-live="polite" ref={transcriptRef}>
-      {!messages.length && <div className="chat-empty"><Bot size={24} /><strong>Start a grounded conversation</strong><span>Ask about the active project and its source context.</span></div>}
+      {!messages.length && <div className="chat-empty"><Bot size={24} /><strong>{t('Start a grounded conversation')}</strong><span>{t('Ask about the active project and its source context.')}</span></div>}
       {messages.map((message, index) => <article className={`chat-message ${message.role}`} key={`${message.role}-${index}`}>
         <div className="chat-avatar" aria-hidden="true">{message.role === 'assistant' ? <Bot size={15} /> : <UserRound size={15} />}</div>
         <div className="chat-message-body">
-          <span className="chat-role">{message.role === 'assistant' ? 'DocSeek' : 'You'}</span>
+          <span className="chat-role">{message.role === 'assistant' ? 'DocSeek' : t('You')}</span>
           <div className="chat-bubble">
             {message.role === 'assistant' ? <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{message.content}</ReactMarkdown> : <p>{message.content}</p>}
-            {message.streaming ? <span className="chat-streaming-caret" role="status" aria-label="DocSeek is responding" /> : null}
+            {message.streaming ? <span className="chat-streaming-caret" role="status" aria-label={t('DocSeek is responding')} /> : null}
           </div>
           {message.citations?.length ? <div className="citation-row">{message.citations.map((citation, citationIndex) => {
-            const label = citation.label || citation.id || citation.kind || 'Source'
+            const label = citation.label || citation.id || citation.kind || t('Source')
             return <button
               type="button"
               className={`citation citation-${citation.kind || 'source'}`}
               key={`${citation.id || citation.label || 'citation'}-${citationIndex}`}
-              aria-label={`Open ${citation.kind || 'source'} ${label}`}
+              aria-label={t('Open {kind} {label}', { kind: citation.kind || t('Source'), label })}
               disabled={!onCitationSelect}
               onClick={() => onCitationSelect?.(citation)}
             >{citation.kind === 'entity' ? <CircleDot size={13} /> : <FileText size={13} />}{label}</button>
@@ -81,7 +83,7 @@ export default function AIQueryChat({ question, messages, busy, onQuestionChange
     </div>
     <form className="chat-composer" onSubmit={onSubmit}>
       <textarea
-        aria-label="Ask AI Query"
+        aria-label={t('Ask AI Query')}
         value={question}
         onChange={event => onQuestionChange(event.target.value)}
         onKeyDown={event => {
@@ -90,11 +92,11 @@ export default function AIQueryChat({ question, messages, busy, onQuestionChange
             event.currentTarget.form?.requestSubmit()
           }
         }}
-        placeholder="Ask a question about this project"
+        placeholder={t('Ask a question about this project')}
         rows={1}
       />
-      <button type="submit" className="primary-button" aria-label="Send query" disabled={busy || !question.trim()}>
-        <Send size={15} /> {busy ? 'Thinking...' : 'Send'}
+      <button type="submit" className="primary-button" aria-label={t('Send query')} disabled={busy || !question.trim()}>
+        <Send size={15} /> {busy ? t('Thinking...') : t('Send')}
       </button>
     </form>
   </section>

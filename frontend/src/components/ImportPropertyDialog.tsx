@@ -1,5 +1,6 @@
 import { FormEvent, useEffect, useRef, useState } from 'react'
 import { Check, X } from 'lucide-react'
+import { useLanguage } from '../i18n'
 import FloatingWindow from './FloatingWindow'
 
 type ImportPropertyDialogProps = {
@@ -12,6 +13,7 @@ type ImportPropertyDialogProps = {
 }
 
 export default function ImportPropertyDialog({ open, originalFilename, defaultFilename, busy, onCancel, onConfirm }: ImportPropertyDialogProps) {
+  const { t } = useLanguage()
   const [filename, setFilename] = useState(defaultFilename)
   const inputRef = useRef<HTMLInputElement>(null)
 
@@ -30,18 +32,18 @@ export default function ImportPropertyDialog({ open, originalFilename, defaultFi
   }
 
   return <FloatingWindow open={open} className="modal-backdrop">
-    <form className="upload-modal rename-modal" role="dialog" aria-modal="true" aria-label="Import property dialog" onSubmit={submit}>
+    <form className="upload-modal rename-modal" role="dialog" aria-modal="true" aria-label={t('Import property dialog')} onSubmit={submit}>
       <div className="overlay-header">
-        <div><span className="eyebrow">IMPORT PROPERTY</span><h2>{originalFilename}</h2></div>
-        <button type="button" className="icon-button" aria-label="Close import window" disabled={busy} onClick={() => void onCancel()}><X size={16} /></button>
+        <div><span className="eyebrow">{t('IMPORT PROPERTY')}</span><h2>{originalFilename}</h2></div>
+        <button type="button" className="icon-button" aria-label={t('Close import window')} disabled={busy} onClick={() => void onCancel()}><X size={16} /></button>
       </div>
       <label className="rename-field">
-        Property filename
+        {t('Property filename')}
         <input ref={inputRef} value={filename} onChange={(event) => setFilename(event.target.value)} required />
       </label>
       <div className="modal-actions">
-        <button type="button" className="secondary-button" disabled={busy} onClick={() => void onCancel()}>Cancel</button>
-        <button type="submit" className="primary-button" disabled={busy || !filename.trim()}><Check size={15} /> Import property</button>
+        <button type="button" className="secondary-button" disabled={busy} onClick={() => void onCancel()}>{t('Cancel')}</button>
+        <button type="submit" className="primary-button" disabled={busy || !filename.trim()}><Check size={15} /> {t('Import property')}</button>
       </div>
     </form>
   </FloatingWindow>

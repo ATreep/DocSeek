@@ -1,5 +1,6 @@
 import { FormEvent, useEffect, useRef, useState } from 'react'
 import { Check, X } from 'lucide-react'
+import { useLanguage } from '../i18n'
 import FloatingWindow from './FloatingWindow'
 
 type PropertyRenameDialogProps = {
@@ -12,6 +13,7 @@ type PropertyRenameDialogProps = {
 }
 
 export default function PropertyRenameDialog({ open, currentFilename, defaultFilename, busy, onClose, onSubmit }: PropertyRenameDialogProps) {
+  const { t } = useLanguage()
   const [filename, setFilename] = useState(defaultFilename)
   const inputRef = useRef<HTMLInputElement>(null)
 
@@ -30,18 +32,18 @@ export default function PropertyRenameDialog({ open, currentFilename, defaultFil
   }
 
   return <FloatingWindow open={open} className="modal-backdrop">
-    <form className="upload-modal rename-modal" role="dialog" aria-modal="true" aria-label="Rename property dialog" onSubmit={submit}>
+    <form className="upload-modal rename-modal" role="dialog" aria-modal="true" aria-label={t('Rename property dialog')} onSubmit={submit}>
       <div className="overlay-header">
-        <div><span className="eyebrow">RENAME PROPERTY</span><h2>{currentFilename}</h2></div>
-        <button type="button" className="icon-button" aria-label="Close rename window" onClick={onClose}><X size={16} /></button>
+        <div><span className="eyebrow">{t('RENAME PROPERTY')}</span><h2>{currentFilename}</h2></div>
+        <button type="button" className="icon-button" aria-label={t('Close rename window')} onClick={onClose}><X size={16} /></button>
       </div>
       <label className="rename-field">
-        Property filename
+        {t('Property filename')}
         <input ref={inputRef} value={filename} onChange={(event) => setFilename(event.target.value)} required />
       </label>
       <div className="modal-actions">
-        <button type="button" className="secondary-button" onClick={onClose}>Cancel</button>
-        <button type="submit" className="primary-button" disabled={busy || !filename.trim()}><Check size={15} /> Rename property</button>
+        <button type="button" className="secondary-button" onClick={onClose}>{t('Cancel')}</button>
+        <button type="submit" className="primary-button" disabled={busy || !filename.trim()}><Check size={15} /> {t('Rename property')}</button>
       </div>
     </form>
   </FloatingWindow>
