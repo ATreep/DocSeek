@@ -70,6 +70,22 @@ def test_clear_only_removes_the_selected_users_project_history(tmp_path):
     assert store.list("project-b", "user-a")
 
 
+def test_query_history_preserves_citation_retrieval_paths(tmp_path):
+    settings = Settings(data_dir=tmp_path / "data")
+    store = QueryHistoryStore(settings)
+    citation = {
+        "kind": "entity",
+        "id": "neo4j",
+        "label": "Neo4j",
+        "reason": "Related through USES",
+        "path": ["Atlas", "USES", "Neo4j"],
+    }
+
+    store.append_exchange("project", "user", "What does Atlas use?", "Neo4j.", [citation])
+
+    assert store.list("project", "user")[1]["citations"] == [citation]
+
+
 def test_history_api_uses_the_authenticated_user_id(monkeypatch, tmp_path):
     settings = Settings(data_dir=tmp_path / "data")
     store = QueryHistoryStore(settings)

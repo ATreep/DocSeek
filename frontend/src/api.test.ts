@@ -47,4 +47,23 @@ describe('request', () => {
 
     await expect(request('/property-import', { method: 'DELETE' })).resolves.toBeUndefined()
   })
+
+  it('sends the current WebUI language to the backend', async () => {
+    vi.stubGlobal('localStorage', {
+      getItem: (key: string) => key === 'docseek-language' ? 'zh' : null,
+    })
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    await request('/language-check')
+
+    expect(fetchMock.mock.calls[0][1].headers).toMatchObject({
+      'X-DocSeek-Language': 'Chinese',
+    })
+  })
 })

@@ -1,3 +1,5 @@
+import { useDocSeekTranslation } from '../i18n'
+
 type Capability = { id: string; label: string }
 
 const groups: Array<{ label: string; capabilities: Capability[] }> = [
@@ -10,6 +12,7 @@ const groups: Array<{ label: string; capabilities: Capability[] }> = [
 ]
 
 export default function CapabilityPicker({ value, onChange }: { value: string[]; onChange: (capabilities: string[]) => void }) {
+  const { t } = useDocSeekTranslation()
   const selected = new Set(value)
   function toggle(capability: string) {
     const next = new Set(selected)
@@ -24,8 +27,8 @@ export default function CapabilityPicker({ value, onChange }: { value: string[];
     onChange([...next].sort())
   }
 
-  return <div className="capability-picker" aria-label="Role capabilities">
-    <div className="capability-picker-summary"><span>Capabilities</span><strong>{value.length} selected</strong></div>
-    {groups.map(group => <fieldset className="capability-group" key={group.label}><legend>{group.label}<button type="button" aria-label={`${group.capabilities.every(capability => selected.has(capability.id)) ? 'Clear' : 'Select all'} ${group.label} capabilities`} onClick={() => toggleGroup(group.capabilities)}>{group.capabilities.every(capability => selected.has(capability.id)) ? 'Clear' : 'Select all'}</button></legend><div className="capability-options">{group.capabilities.map(capability => <label className="capability-option" key={capability.id}><input type="checkbox" aria-label={capability.label} checked={selected.has(capability.id)} onChange={() => toggle(capability.id)} /><span>{capability.label}<small>{capability.id}</small></span></label>)}</div></fieldset>)}
+  return <div className="capability-picker" aria-label={t('Role capabilities')}>
+    <div className="capability-picker-summary"><span>{t('Capabilities')}</span><strong>{value.length} {t('selected')}</strong></div>
+    {groups.map(group => <fieldset className="capability-group" key={group.label}><legend>{t(group.label)}<button type="button" aria-label={`${t(group.capabilities.every(capability => selected.has(capability.id)) ? 'Clear' : 'Select all')} ${t(group.label)} ${t('Capabilities')}`} onClick={() => toggleGroup(group.capabilities)}>{t(group.capabilities.every(capability => selected.has(capability.id)) ? 'Clear' : 'Select all')}</button></legend><div className="capability-options">{group.capabilities.map(capability => <label className="capability-option" key={capability.id}><input type="checkbox" aria-label={t(capability.label)} checked={selected.has(capability.id)} onChange={() => toggle(capability.id)} /><span>{t(capability.label)}<small>{capability.id}</small></span></label>)}</div></fieldset>)}
   </div>
 }

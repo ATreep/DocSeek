@@ -1,10 +1,14 @@
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import get_settings
 from .db import initialize
+from .services.display_language import (
+    DISPLAY_LANGUAGE_HEADER,
+    display_language_scope,
+)
 
 
 @asynccontextmanager
@@ -26,6 +30,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def scope_display_language(request: Request, call_next):
+    with display_language_scope(request.headers.get(DISPLAY_LANGUAGE_HEADER)):
+        return await call_next(request)
 
 
 @app.get("/api/health")

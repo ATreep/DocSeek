@@ -118,6 +118,36 @@ describe('AIQueryChat', () => {
     })
   })
 
+  it('keeps citation details in a tooltip instead of expanding the chip', () => {
+    render(<AIQueryChat
+      question=""
+      messages={[{
+        role: 'assistant',
+        content: 'Atlas uses Neo4j.',
+        citations: [{
+          kind: 'entity',
+          id: 'neo4j',
+          label: 'Neo4j',
+          reason: 'Related through USES',
+          path: ['Atlas', 'USES', 'Neo4j'],
+        }],
+      }]}
+      busy={false}
+      onQuestionChange={() => undefined}
+      onSubmit={() => undefined}
+    />)
+
+    const citation = screen.getByRole('button', {
+      name: 'Open entity Neo4j',
+    })
+
+    expect(citation.textContent).toBe('Neo4j')
+    expect(citation.getAttribute('title')).toBe(
+      'Related through USES · Atlas -> USES -> Neo4j',
+    )
+    expect(citation.querySelector('small')).toBeNull()
+  })
+
   it('shows when the assistant answer is still streaming', () => {
     render(<AIQueryChat question="" messages={[{ role: 'assistant', content: 'Partial', streaming: true }]} busy={true} onQuestionChange={() => undefined} onSubmit={() => undefined} />)
     expect(screen.getByLabelText('DocSeek is responding')).toBeTruthy()

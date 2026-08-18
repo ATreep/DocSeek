@@ -1,26 +1,51 @@
 import uuid
+import base64
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
+import json
 import mimetypes
+import shutil
+import tempfile
 import traceback
+import inspect
+from typing import BinaryIO, Iterator
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Response, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from ..config import Settings, get_settings
 from ..db import connect
 from ..security import get_current_user, require_capability
-from ..services.agents import DGAgent, DefinitionResult, GAAgent
-from ..services.grouping import apply_group_placements
+from ..services.agents import (
+    DGAgent,
+    DefinitionResult,
+    GAAgent,
+    PropertyFilenameAgent,
+    readable_property_identifier,
+    unique_readable_property_identifier,
+)
+from ..services.extraction_text import TemporaryExtractionStore, select_extraction_text
+from ..services.grouping import apply_group_placements, catalog_signature
+from ..services.model_errors import extract_model_response
 from ..services.parsers import extract_text, property_type
-from ..services.pipeline import _current_group_tree, run_pipeline
+from ..services.pipeline import _current_group_tree, run_batch_pipeline, run_pipeline, run_property_removal
+from ..services.graph_store import Neo4jGraphStore
 from ..services.property_imports import PropertyImportStore
-from ..services.storage import move_original, replace_original, safe_filename, safe_directory, save_original
+from ..services.text_metrics import property_content_metrics
+from ..services.storage import delete_property_text, move_original, read_property_text, replace_original, safe_filename, save_original, write_property_text
 from ..services.catalog import PropertyCatalog
+from ..services.display_language import (
+    current_display_language,
+    iterate_in_display_language,
+    run_in_display_language,
+)
 from .projects import get_project, is_locked, acquire_lock, release_lock
 
 router = APIRouter(prefix="/projects", tags=["properties"])
+
+PROPERTY_IMPORT_KEEPALIVE_SECONDS = 10.0
 
 
 class PropertyUpdate(BaseModel):
@@ -36,15 +61,36 @@ class PropertyImportConfirm(BaseModel):
     filename: str = Field(min_length=1, max_length=255)
 
 
+class PropertyImportBatchItemConfirm(BaseModel):
+    import_id: str = Field(min_length=1, max_length=255)
+    filename: str = Field(min_length=1, max_length=255)
+
+
+class PropertyImportBatchConfirm(BaseModel):
+    items: list[PropertyImportBatchItemConfirm] = Field(min_length=1)
+
+
 class RegroupRequest(BaseModel):
     revision_prompt: str = Field(min_length=1, max_length=4000)
 
 
+class RegroupConfirmationItem(BaseModel):
+    property_id: str = Field(min_length=1, max_length=255)
+    directory: str = Field(default="", max_length=255)
+    filename: str = Field(min_length=1, max_length=255)
+
+
+class RegroupConfirmation(BaseModel):
+    catalog_signature: str = Field(min_length=64, max_length=64)
+    items: list[RegroupConfirmationItem] = Field(min_length=1)
+
+
 def _schedule(background_tasks: BackgroundTasks | None, function, *args):
+    language = current_display_language()
     if background_tasks is None:
-        function(*args)
+        run_in_display_language(language, function, *args)
     else:
-        background_tasks.add_task(function, *args)
+        background_tasks.add_task(run_in_display_language, language, function, *args)
 
 
 def generate_property_metadata(
@@ -53,8 +99,72 @@ def generate_property_metadata(
     kind: str,
     path: Path,
     comment: str,
+    *,
+    full_text: str | None = None,
+    extraction_text: str | None = None,
+    existing_entities: list[dict] | None = None,
 ) -> DefinitionResult:
-    return DGAgent(settings=settings).generate(filename, kind, extract_text(path, kind), comment)
+    text = full_text if full_text is not None else extract_text(path, kind)
+    if extraction_text is None and kind != "image":
+        extraction_text = select_extraction_text(
+            text,
+            filename=filename,
+            import_context=comment,
+            existing_entities=existing_entities or [],
+        ).text
+    image_data_url = None
+    if kind == "image":
+        media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        image_data_url = (
+            f"data:{media_type};base64,"
+            f"{base64.b64encode(path.read_bytes()).decode('ascii')}"
+        )
+    return DGAgent(settings=settings).generate(
+        filename,
+        kind,
+        text,
+        comment,
+        image_data_url=image_data_url,
+        extraction_text=extraction_text,
+    )
+
+
+def _existing_entity_inventory(settings: Settings, project_id: str) -> list[dict]:
+    graph_store = Neo4jGraphStore(settings)
+    try:
+        graph = graph_store.graph(project_id, "entity") or {}
+        return [node for node in graph.get("nodes", []) if isinstance(node, dict)]
+    except Exception:
+        return []
+    finally:
+        graph_store.close()
+
+
+def _generate_metadata_compatibly(
+    settings: Settings,
+    filename: str,
+    kind: str,
+    path: Path,
+    comment: str,
+    *,
+    full_text: str,
+    extraction_text: str,
+    existing_entities: list[dict],
+) -> DefinitionResult:
+    """Allow tests and integrations with the previous five-argument seam."""
+    parameters = inspect.signature(generate_property_metadata).parameters
+    if "extraction_text" not in parameters:
+        return generate_property_metadata(settings, filename, kind, path, comment)
+    return generate_property_metadata(
+        settings,
+        filename,
+        kind,
+        path,
+        comment,
+        full_text=full_text,
+        extraction_text=extraction_text,
+        existing_entities=existing_entities,
+    )
 
 
 def _enqueue_property(settings: Settings, project_id: str, filename: str, content: bytes, content_type: str | None, comment: str = "", background_tasks: BackgroundTasks | None = None) -> dict:
@@ -62,42 +172,116 @@ def _enqueue_property(settings: Settings, project_id: str, filename: str, conten
         raise HTTPException(status_code=409, detail="Project is processing")
     filename, path = save_original(settings, project_id, filename, content)
     kind = property_type(filename, content_type)
-    property_id, job_id = str(uuid.uuid4()), str(uuid.uuid4())
+    catalog = PropertyCatalog(settings)
+    job_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
     if not acquire_lock(settings, project_id, job_id):
         path.unlink(missing_ok=True)
         raise HTTPException(status_code=409, detail="Project is processing")
     try:
-        PropertyCatalog(settings).create(project_id, {"id": property_id, "project_id": project_id, "filename": filename, "property_type": kind, "relative_path": f"properties/{filename}", "definition": None, "status": "queued", "created_at": now, "updated_at": now})
         with connect(settings.sqlite_path) as db:
-            db.execute("INSERT INTO jobs(id,project_id,stage,status,candidate_snapshot,heartbeat) VALUES (?,?,?,?,?,?)", (job_id, project_id, "queued", "queued", None, now))
+            db.execute("INSERT INTO jobs(id,project_id,stage,status,candidate_snapshot,heartbeat) VALUES (?,?,?,?,?,?)", (job_id, project_id, "dg-agent", "running", None, now))
     except Exception:
         release_lock(settings, project_id, job_id)
         path.unlink(missing_ok=True)
         raise
+    property_id = ""
+    catalog_created = False
+    extraction_path: Path | None = None
     try:
-        with connect(settings.sqlite_path) as db:
-            db.execute(
-                "UPDATE jobs SET stage='dg-agent', status='running', heartbeat=? WHERE id=?",
-                (datetime.now(timezone.utc).isoformat(), job_id),
-            )
-        metadata = generate_property_metadata(settings, filename, kind, path, comment)
+        full_text = extract_text(path, kind)
+        existing_entities = _existing_entity_inventory(settings, project_id)
+        initial_selection = select_extraction_text(
+            full_text,
+            filename=filename,
+            import_context=comment,
+            existing_entities=existing_entities,
+        )
+        metadata = _generate_metadata_compatibly(
+            settings,
+            filename,
+            kind,
+            path,
+            comment,
+            full_text=full_text,
+            extraction_text=initial_selection.text,
+            existing_entities=existing_entities,
+        )
+        used_property_ids = {
+            str(row.get("id") or "").casefold()
+            for row in catalog.list(project_id)
+        }
+        property_id = unique_readable_property_identifier(
+            metadata.property_id
+            or readable_property_identifier(filename, metadata.definition),
+            used_property_ids,
+        )
+        catalog.create(project_id, {"id": property_id, "project_id": project_id, "filename": filename, "property_type": kind, "relative_path": f"properties/{filename}", "definition": metadata.definition, "status": "queued", "created_at": now, "updated_at": now})
+        catalog_created = True
+        extraction_path = TemporaryExtractionStore(settings).save(
+            project_id,
+            job_id,
+            property_id,
+            initial_selection,
+        )
+        canonical_content = metadata.content or (
+            full_text if kind != "image" else metadata.definition
+        )
+        write_property_text(settings, project_id, property_id, canonical_content)
+        refined_selection = select_extraction_text(
+            canonical_content,
+            filename=filename,
+            definition=metadata.definition,
+            import_context=comment,
+            existing_entities=existing_entities,
+        )
+        extraction_path = TemporaryExtractionStore(settings).save(
+            project_id,
+            job_id,
+            property_id,
+            refined_selection,
+        )
     except Exception as exc:
         failed_at = datetime.now(timezone.utc).isoformat()
         with connect(settings.sqlite_path) as db:
             db.execute(
-                "UPDATE jobs SET stage='failed', status='failed', error=?, error_detail=?, heartbeat=? WHERE id=?",
-                (str(exc), traceback.format_exc(), failed_at, job_id),
+                "UPDATE jobs SET stage='failed', status='failed', error=?, error_detail=?, llm_response=?, heartbeat=? WHERE id=?",
+                (
+                    str(exc),
+                    traceback.format_exc(),
+                    extract_model_response(exc),
+                    failed_at,
+                    job_id,
+                ),
             )
-        PropertyCatalog(settings).update(
-            project_id,
-            property_id,
-            {"status": "failed", "updated_at": failed_at},
-        )
+        if catalog_created:
+            PropertyCatalog(settings).update(
+                project_id,
+                property_id,
+                {"status": "failed", "updated_at": failed_at},
+            )
+            delete_property_text(settings, project_id, property_id)
+        else:
+            path.unlink(missing_ok=True)
+        TemporaryExtractionStore(settings).delete(extraction_path)
         release_lock(settings, project_id, job_id)
         raise
-    _schedule(background_tasks, run_pipeline, settings, project_id, property_id, job_id, filename, kind, path, comment, "add", metadata.definition)
-    return {"property_id": property_id, "job_id": job_id, "status": "queued", "property_type": kind, "suggested_filename": metadata.filename_suggestion}
+    _schedule(
+        background_tasks,
+        run_pipeline,
+        settings,
+        project_id,
+        property_id,
+        job_id,
+        filename,
+        kind,
+        path,
+        comment,
+        "add",
+        metadata.definition,
+        str(extraction_path) if extraction_path else "",
+    )
+    return {"property_id": property_id, "job_id": job_id, "status": "queued", "property_type": kind, "suggested_filename": filename}
 
 
 def _stage_property_import(
@@ -115,8 +299,36 @@ def _stage_property_import(
     clean_filename, path = store.stage(project_id, import_id, filename, content)
     kind = property_type(clean_filename, content_type)
     try:
-        metadata = generate_property_metadata(settings, clean_filename, kind, path, comment)
-        suggested_filename = safe_filename(metadata.filename_suggestion or clean_filename)
+        full_text = extract_text(path, kind)
+        existing_entities = _existing_entity_inventory(settings, project_id)
+        initial_selection = select_extraction_text(
+            full_text,
+            filename=clean_filename,
+            import_context=comment,
+            existing_entities=existing_entities,
+        )
+        store.save_extraction(project_id, import_id, initial_selection)
+        metadata = _generate_metadata_compatibly(
+            settings,
+            clean_filename,
+            kind,
+            path,
+            comment,
+            full_text=full_text,
+            extraction_text=initial_selection.text,
+            existing_entities=existing_entities,
+        )
+        canonical_content = metadata.content or (
+            full_text if kind != "image" else metadata.definition
+        )
+        refined_selection = select_extraction_text(
+            canonical_content,
+            filename=clean_filename,
+            definition=metadata.definition,
+            import_context=comment,
+            existing_entities=existing_entities,
+        )
+        store.save_extraction(project_id, import_id, refined_selection)
         store.save(
             project_id,
             import_id,
@@ -128,10 +340,12 @@ def _stage_property_import(
                 "content_type": content_type,
                 "property_type": kind,
                 "definition": metadata.definition,
+                "property_id": metadata.property_id,
                 "comment": comment,
                 "created_at": datetime.now(timezone.utc).isoformat(),
             },
         )
+        store.save_content(project_id, import_id, canonical_content)
     except Exception:
         store.discard(project_id, import_id)
         raise
@@ -140,9 +354,236 @@ def _stage_property_import(
         "status": "awaiting_confirmation",
         "property_type": kind,
         "original_filename": clean_filename,
-        "suggested_filename": suggested_filename,
         "definition": metadata.definition,
+        "property_id": metadata.property_id,
+        **property_content_metrics(canonical_content),
     }
+
+
+def _add_suggested_filenames(
+    settings: Settings,
+    project_id: str,
+    items: list[dict],
+    comment: str,
+) -> list[dict]:
+    rows = PropertyCatalog(settings).list(project_id)
+    tree_context = _current_group_tree(rows) if rows else {}
+    agent = PropertyFilenameAgent(settings=settings)
+    suggestions = agent.suggest_many(
+        tree_context,
+        items,
+        comment,
+    )
+    used_property_ids = {
+        str(row.get("id") or "").casefold() for row in rows
+    }
+    store = PropertyImportStore(settings)
+    result: list[dict] = []
+    for item in items:
+        suggested_filename = safe_filename(
+            suggestions.get(item["import_id"]) or item["original_filename"]
+        )
+        property_id = unique_readable_property_identifier(
+            item.get("property_id")
+            or readable_property_identifier(
+                item.get("original_filename"),
+                item.get("definition"),
+            ),
+            used_property_ids,
+        )
+        store.update(
+            project_id,
+            item["import_id"],
+            {"property_id": property_id},
+        )
+        result.append({
+            **item,
+            "property_id": property_id,
+            "suggested_filename": suggested_filename,
+        })
+    return result
+
+
+def _stage_property_import_batch(
+    settings: Settings,
+    project_id: str,
+    files: list[UploadFile],
+    comment: str = "",
+) -> dict:
+    if is_locked(settings, project_id):
+        raise HTTPException(status_code=409, detail="Project is processing")
+    if not files:
+        raise HTTPException(status_code=422, detail="Select at least one property")
+
+    batch_id = str(uuid.uuid4())
+    store = PropertyImportStore(settings)
+    items: list[dict] = []
+    try:
+        for file in files:
+            items.append(
+                _stage_property_import(
+                    settings,
+                    project_id,
+                    file.filename or "property",
+                    file.file.read(),
+                    file.content_type,
+                    comment,
+                )
+            )
+        items = _add_suggested_filenames(settings, project_id, items, comment)
+        store.save_batch(
+            project_id,
+            batch_id,
+            [item["import_id"] for item in items],
+        )
+    except Exception:
+        for item in items:
+            store.discard(project_id, item["import_id"])
+        raise
+    return {
+        "batch_id": batch_id,
+        "status": "awaiting_confirmation",
+        "items": items,
+    }
+
+
+def _stream_property_import_batch(
+    settings: Settings,
+    project_id: str,
+    files: list[tuple[str, BinaryIO, str | None]],
+    comment: str = "",
+) -> Iterator[str]:
+    batch_id = str(uuid.uuid4())
+    language = current_display_language()
+    store = PropertyImportStore(settings)
+    items: list[dict] = []
+    total = len(files)
+
+    def event(payload: dict) -> str:
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    try:
+        yield event(
+            {"type": "batch_started", "batch_id": batch_id, "total": total}
+        )
+        with ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="property-import",
+        ) as executor:
+            for index, (filename, source, content_type) in enumerate(
+                files, start=1
+            ):
+                yield event(
+                    {
+                        "type": "file_started",
+                        "batch_id": batch_id,
+                        "index": index,
+                        "total": total,
+                        "filename": filename,
+                    }
+                )
+                future = executor.submit(
+                    run_in_display_language,
+                    language,
+                    _stage_property_import,
+                    settings,
+                    project_id,
+                    filename,
+                    source.read(),
+                    content_type,
+                    comment,
+                )
+                while True:
+                    completed, _ = wait(
+                        (future,), timeout=PROPERTY_IMPORT_KEEPALIVE_SECONDS
+                    )
+                    if not completed:
+                        yield event(
+                            {
+                                "type": "keepalive",
+                                "batch_id": batch_id,
+                                "index": index,
+                                "total": total,
+                                "filename": filename,
+                            }
+                        )
+                        continue
+                    item = future.result()
+                    break
+                items.append(item)
+                yield event(
+                    {
+                        "type": "file_analyzed",
+                        "batch_id": batch_id,
+                        "index": index,
+                        "total": total,
+                        "filename": filename,
+                        "item": item,
+                    }
+                )
+            yield event(
+                {
+                    "type": "filename_generation_started",
+                    "batch_id": batch_id,
+                    "total": total,
+                }
+            )
+            future = executor.submit(
+                run_in_display_language,
+                language,
+                _add_suggested_filenames,
+                settings,
+                project_id,
+                items,
+                comment,
+            )
+            while True:
+                completed, _ = wait(
+                    (future,), timeout=PROPERTY_IMPORT_KEEPALIVE_SECONDS
+                )
+                if not completed:
+                    yield event(
+                        {
+                            "type": "filename_generation_keepalive",
+                            "batch_id": batch_id,
+                            "total": total,
+                        }
+                    )
+                    continue
+                items = future.result()
+                break
+            for index, item in enumerate(items, start=1):
+                yield event(
+                    {
+                        "type": "file_completed",
+                        "batch_id": batch_id,
+                        "index": index,
+                        "total": total,
+                        "filename": item["original_filename"],
+                        "item": item,
+                    }
+                )
+        store.save_batch(
+            project_id,
+            batch_id,
+            [item["import_id"] for item in items],
+        )
+        yield event(
+            {
+                "type": "batch_completed",
+                "batch_id": batch_id,
+                "status": "awaiting_confirmation",
+                "total": total,
+                "items": items,
+            }
+        )
+    except Exception as exc:
+        for item in items:
+            store.discard(project_id, item["import_id"])
+        yield event({"type": "error", "batch_id": batch_id, "message": str(exc)})
+    finally:
+        for _, source, _ in files:
+            source.close()
 
 
 def _confirm_property_import(
@@ -163,12 +604,25 @@ def _confirm_property_import(
         raise HTTPException(status_code=404, detail="Property import not found")
 
     clean_filename = safe_filename(filename)
-    property_id, job_id = str(uuid.uuid4()), str(uuid.uuid4())
+    catalog = PropertyCatalog(settings)
+    used_property_ids = {
+        str(row.get("id") or "").casefold() for row in catalog.list(project_id)
+    }
+    property_id = unique_readable_property_identifier(
+        staged.get("property_id")
+        or readable_property_identifier(
+            clean_filename,
+            staged.get("definition"),
+            staged.get("original_filename"),
+        ),
+        used_property_ids,
+    )
+    job_id = str(uuid.uuid4())
     if not acquire_lock(settings, project_id, job_id):
         raise HTTPException(status_code=409, detail="Project is processing")
 
     path: Path | None = None
-    catalog = PropertyCatalog(settings)
+    extraction_path: Path | None = None
     catalog_created = False
     now = datetime.now(timezone.utc).isoformat()
     try:
@@ -194,10 +648,20 @@ def _confirm_property_import(
             },
         )
         catalog_created = True
+        write_property_text(
+            settings, project_id, property_id, staged.get("content", "")
+        )
         with connect(settings.sqlite_path) as db:
             db.execute(
                 "INSERT INTO jobs(id,project_id,stage,status,candidate_snapshot,heartbeat) VALUES (?,?,?,?,?,?)",
                 (job_id, project_id, "queued", "queued", None, now),
+            )
+        if isinstance(staged.get("extraction"), dict):
+            extraction_path = TemporaryExtractionStore(settings).save(
+                project_id,
+                job_id,
+                property_id,
+                staged["extraction"],
             )
     except Exception:
         release_lock(settings, project_id, job_id)
@@ -205,6 +669,8 @@ def _confirm_property_import(
             catalog.delete(project_id, property_id)
         if path is not None:
             path.unlink(missing_ok=True)
+        delete_property_text(settings, project_id, property_id)
+        TemporaryExtractionStore(settings).delete(extraction_path)
         raise
 
     store.discard(project_id, import_id)
@@ -221,12 +687,195 @@ def _confirm_property_import(
         staged.get("comment", ""),
         "add",
         staged.get("definition", ""),
+        str(extraction_path) if extraction_path else "",
     )
     return {
         "property_id": property_id,
         "job_id": job_id,
         "status": "queued",
         "property_type": kind,
+    }
+
+
+def _confirm_property_import_batch(
+    settings: Settings,
+    project_id: str,
+    batch_id: str,
+    confirmed_items: list[PropertyImportBatchItemConfirm],
+    background_tasks: BackgroundTasks | None = None,
+) -> dict:
+    if is_locked(settings, project_id):
+        raise HTTPException(status_code=409, detail="Project is processing")
+    store = PropertyImportStore(settings)
+    try:
+        batch = store.get_batch(project_id, batch_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=404, detail="Property import batch not found"
+        ) from exc
+    if not batch:
+        raise HTTPException(status_code=404, detail="Property import batch not found")
+
+    confirmed_by_id = {item.import_id: item for item in confirmed_items}
+    if (
+        len(confirmed_by_id) != len(confirmed_items)
+        or set(confirmed_by_id) != set(batch["import_ids"])
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Confirm every staged property exactly once",
+        )
+    clean_filenames = [
+        safe_filename(confirmed_by_id[import_id].filename)
+        for import_id in batch["import_ids"]
+    ]
+    if len({filename.casefold() for filename in clean_filenames}) != len(
+        clean_filenames
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Property filenames in one import must be unique",
+        )
+
+    catalog = PropertyCatalog(settings)
+    used_property_ids = {
+        str(row.get("id") or "").casefold() for row in catalog.list(project_id)
+    }
+    property_ids = [
+        unique_readable_property_identifier(
+            staged.get("property_id")
+            or readable_property_identifier(
+                filename,
+                staged.get("definition"),
+                staged.get("original_filename"),
+            ),
+            used_property_ids,
+        )
+        for staged, filename in zip(batch["imports"], clean_filenames)
+    ]
+    job_id = str(uuid.uuid4())
+    if not acquire_lock(settings, project_id, job_id):
+        raise HTTPException(status_code=409, detail="Project is processing")
+
+    created_property_ids: list[str] = []
+    created_paths: list[Path] = []
+    extraction_paths: list[Path] = []
+    pipeline_items: list[dict] = []
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        for property_id, staged, requested_filename in zip(
+            property_ids, batch["imports"], clean_filenames
+        ):
+            clean_filename, path = save_original(
+                settings,
+                project_id,
+                requested_filename,
+                staged["source_path"].read_bytes(),
+            )
+            created_paths.append(path)
+            kind = property_type(clean_filename, staged.get("content_type"))
+            catalog.create(
+                project_id,
+                {
+                    "id": property_id,
+                    "project_id": project_id,
+                    "filename": clean_filename,
+                    "property_type": kind,
+                    "relative_path": f"properties/{clean_filename}",
+                    "definition": staged.get("definition", ""),
+                    "status": "queued",
+                    "created_at": now,
+                    "updated_at": now,
+                },
+            )
+            created_property_ids.append(property_id)
+            write_property_text(
+                settings, project_id, property_id, staged.get("content", "")
+            )
+            extraction_path = None
+            if isinstance(staged.get("extraction"), dict):
+                extraction_path = TemporaryExtractionStore(settings).save(
+                    project_id,
+                    job_id,
+                    property_id,
+                    staged["extraction"],
+                )
+                extraction_paths.append(extraction_path)
+            pipeline_items.append(
+                {
+                    "property_id": property_id,
+                    "filename": clean_filename,
+                    "kind": kind,
+                    "path": path,
+                    "comment": staged.get("comment", ""),
+                    "definition": staged.get("definition", ""),
+                    "text": staged.get("content", ""),
+                    "extraction_path": str(extraction_path) if extraction_path else "",
+                }
+            )
+        with connect(settings.sqlite_path) as db:
+            db.execute(
+                "INSERT INTO jobs(id,project_id,stage,status,candidate_snapshot,heartbeat,input_json,progress_json) VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    job_id,
+                    project_id,
+                    "queued",
+                    "queued",
+                    None,
+                    now,
+                    json.dumps(
+                        {
+                            "operation": "batch-add",
+                            "items": [
+                                {
+                                    **item,
+                                    "path": str(item["path"]),
+                                    "text": None,
+                                }
+                                for item in pipeline_items
+                            ],
+                        },
+                        ensure_ascii=False,
+                    ),
+                    "{}",
+                ),
+            )
+    except Exception:
+        with connect(settings.sqlite_path) as db:
+            db.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+        for property_id in created_property_ids:
+            catalog.delete(project_id, property_id)
+            delete_property_text(settings, project_id, property_id)
+        for path in created_paths:
+            path.unlink(missing_ok=True)
+        extraction_store = TemporaryExtractionStore(settings)
+        for extraction_path in extraction_paths:
+            extraction_store.delete(extraction_path)
+        release_lock(settings, project_id, job_id)
+        raise
+
+    store.discard_batch(project_id, batch_id)
+    _schedule(
+        background_tasks,
+        run_batch_pipeline,
+        settings,
+        project_id,
+        job_id,
+        pipeline_items,
+    )
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "properties": [
+            {
+                "property_id": item["property_id"],
+                "job_id": job_id,
+                "status": "queued",
+                "property_type": item["kind"],
+                "filename": item["filename"],
+            }
+            for item in pipeline_items
+        ],
     }
 
 
@@ -271,7 +920,15 @@ def _enqueue_removal(settings: Settings, project_id: str, property_id: str, back
     with connect(settings.sqlite_path) as db:
         db.execute("INSERT INTO jobs(id,project_id,stage,status,candidate_snapshot,heartbeat) VALUES (?,?,?,?,?,?)", (job_id, project_id, "queued", "queued", None, now))
     path = settings.projects_dir / project_id / row["relative_path"]
-    _schedule(background_tasks, run_pipeline, settings, project_id, property_id, job_id, row["filename"], row["property_type"], path, "", "remove")
+    _schedule(
+        background_tasks,
+        run_property_removal,
+        settings,
+        project_id,
+        property_id,
+        job_id,
+        path,
+    )
     return {"property_id": property_id, "job_id": job_id, "status": "removing"}
 
 
@@ -296,13 +953,78 @@ def add_property(
 ):
     if not get_project(settings, project_id):
         raise HTTPException(status_code=404, detail="Project not found")
-    return _stage_property_import(
+    item = _stage_property_import(
         settings,
         project_id,
         file.filename or "property",
         file.file.read(),
         file.content_type,
         comment,
+    )
+    try:
+        return _add_suggested_filenames(settings, project_id, [item], comment)[0]
+    except Exception:
+        PropertyImportStore(settings).discard(project_id, item["import_id"])
+        raise
+
+
+@router.post("/{project_id}/property-import-batches", status_code=202)
+def add_property_batch(
+    project_id: str,
+    files: list[UploadFile] = File(...),
+    comment: str = Form(default=""),
+    settings: Settings = Depends(get_settings),
+    user=Depends(require_capability("property.upload")),
+):
+    if not get_project(settings, project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+    return _stage_property_import_batch(
+        settings,
+        project_id,
+        files,
+        comment,
+    )
+
+
+@router.post("/{project_id}/property-import-batches/stream")
+def stream_property_batch(
+    project_id: str,
+    files: list[UploadFile] = File(...),
+    comment: str = Form(default=""),
+    settings: Settings = Depends(get_settings),
+    user=Depends(require_capability("property.upload")),
+):
+    if not get_project(settings, project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+    if is_locked(settings, project_id):
+        raise HTTPException(status_code=409, detail="Project is processing")
+    if not files:
+        raise HTTPException(status_code=422, detail="Select at least one property")
+
+    prepared_files: list[tuple[str, BinaryIO, str | None]] = []
+    try:
+        for file in files:
+            source = tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024)
+            shutil.copyfileobj(file.file, source)
+            source.seek(0)
+            prepared_files.append(
+                (file.filename or "property", source, file.content_type)
+            )
+    except Exception:
+        for _, source, _ in prepared_files:
+            source.close()
+        raise
+
+    events = _stream_property_import_batch(
+        settings,
+        project_id,
+        prepared_files,
+        comment,
+    )
+    return StreamingResponse(
+        iterate_in_display_language(current_display_language(), events),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-store"},
     )
 
 
@@ -325,6 +1047,29 @@ def confirm_property_import(
         project_id,
         import_id,
         payload.filename,
+        background_tasks,
+    )
+
+
+@router.post(
+    "/{project_id}/property-import-batches/{batch_id}/confirm",
+    status_code=202,
+)
+def confirm_property_import_batch(
+    project_id: str,
+    batch_id: str,
+    payload: PropertyImportBatchConfirm,
+    background_tasks: BackgroundTasks,
+    settings: Settings = Depends(get_settings),
+    user=Depends(require_capability("property.upload")),
+):
+    if not get_project(settings, project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+    return _confirm_property_import_batch(
+        settings,
+        project_id,
+        batch_id,
+        payload.items,
         background_tasks,
     )
 
@@ -352,6 +1097,31 @@ def cancel_property_import(
     return Response(status_code=204)
 
 
+@router.delete(
+    "/{project_id}/property-import-batches/{batch_id}",
+    status_code=204,
+)
+def cancel_property_import_batch(
+    project_id: str,
+    batch_id: str,
+    settings: Settings = Depends(get_settings),
+    user=Depends(require_capability("property.upload")),
+):
+    if not get_project(settings, project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+    store = PropertyImportStore(settings)
+    try:
+        staged = store.get_batch(project_id, batch_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=404, detail="Property import batch not found"
+        ) from exc
+    if not staged:
+        raise HTTPException(status_code=404, detail="Property import batch not found")
+    store.discard_batch(project_id, batch_id)
+    return Response(status_code=204)
+
+
 @router.post("/{project_id}/properties/regroup")
 def regroup_properties(
     project_id: str,
@@ -366,7 +1136,7 @@ def regroup_properties(
     catalog = PropertyCatalog(settings)
     rows = catalog.list(project_id)
     if not rows:
-        return {"properties": []}
+        return {"catalog_signature": catalog_signature([]), "changes": []}
     revision_prompt = payload.revision_prompt.strip()
     if not revision_prompt:
         raise HTTPException(status_code=422, detail="Re-grouping prompt is required")
@@ -381,32 +1151,61 @@ def regroup_properties(
         )
     try:
         tree_context = _current_group_tree(rows)
-        placements = GAAgent(settings=settings).rearrange_tree(
+        proposal = GAAgent(settings=settings).propose_tree(
             tree_context,
             revision_prompt,
-        )
-        updated = apply_group_placements(
-            settings,
-            project_id,
-            rows,
-            placements,
         )
         completed_at = datetime.now(timezone.utc).isoformat()
         with connect(settings.sqlite_path) as db:
             db.execute(
-                "UPDATE jobs SET stage='active',status='completed',heartbeat=?,stage_started_at=?,stage_detail='Property tree rearranged' WHERE id=?",
+                "UPDATE jobs SET stage='proposal-ready',status='completed',heartbeat=?,stage_started_at=?,stage_detail='Property tree proposal ready' WHERE id=?",
                 (completed_at, completed_at, job_id),
             )
+        changes = []
+        for row in rows:
+            property_id = str(row.get("id") or "")
+            current_directory = _property_directory(row)
+            proposed_directory = proposal.directories.get(
+                property_id, current_directory
+            )
+            current_filename = str(row.get("filename") or "property")
+            proposed_filename = safe_filename(
+                proposal.filenames.get(property_id, current_filename)
+            )
+            changes.append(
+                {
+                    "property_id": property_id,
+                    "current_directory": current_directory,
+                    "proposed_directory": proposed_directory,
+                    "current_filename": current_filename,
+                    "proposed_filename": proposed_filename,
+                    "definition": row.get("definition") or "",
+                    "changed": current_directory != proposed_directory
+                    or current_filename != proposed_filename,
+                }
+            )
         return {
-            "properties": sorted(updated, key=lambda item: str(item.get("filename") or "").casefold()),
+            "catalog_signature": catalog_signature(rows),
+            "changes": sorted(
+                changes,
+                key=lambda item: str(item.get("current_filename") or "").casefold(),
+            ),
             "job_id": job_id,
         }
     except (ValueError, FileNotFoundError, FileExistsError) as exc:
         failed_at = datetime.now(timezone.utc).isoformat()
         with connect(settings.sqlite_path) as db:
             db.execute(
-                "UPDATE jobs SET stage='failed',status='failed',error=?,error_detail=?,heartbeat=?,stage_started_at=?,stage_detail=? WHERE id=?",
-                (str(exc), traceback.format_exc(), failed_at, failed_at, str(exc), job_id),
+                "UPDATE jobs SET stage='failed',status='failed',error=?,error_detail=?,llm_response=?,heartbeat=?,stage_started_at=?,stage_detail=? WHERE id=?",
+                (
+                    str(exc),
+                    traceback.format_exc(),
+                    extract_model_response(exc),
+                    failed_at,
+                    failed_at,
+                    str(exc),
+                    job_id,
+                ),
             )
         if isinstance(exc, FileNotFoundError):
             status_code = 404
@@ -419,10 +1218,84 @@ def regroup_properties(
         failed_at = datetime.now(timezone.utc).isoformat()
         with connect(settings.sqlite_path) as db:
             db.execute(
-                "UPDATE jobs SET stage='failed',status='failed',error=?,error_detail=?,heartbeat=?,stage_started_at=?,stage_detail=? WHERE id=?",
-                (str(exc), traceback.format_exc(), failed_at, failed_at, str(exc), job_id),
+                "UPDATE jobs SET stage='failed',status='failed',error=?,error_detail=?,llm_response=?,heartbeat=?,stage_started_at=?,stage_detail=? WHERE id=?",
+                (
+                    str(exc),
+                    traceback.format_exc(),
+                    extract_model_response(exc),
+                    failed_at,
+                    failed_at,
+                    str(exc),
+                    job_id,
+                ),
             )
         raise HTTPException(status_code=502, detail=f"Re-grouping failed: {exc}") from exc
+    finally:
+        release_lock(settings, project_id, job_id)
+
+
+def _property_directory(row: dict) -> str:
+    directory = str(row.get("directory") or "").strip("/")
+    if directory:
+        return directory
+    relative_path = Path(str(row.get("relative_path") or ""))
+    if relative_path.parts[:1] != ("properties",) or relative_path.parent == Path("properties"):
+        return ""
+    return relative_path.parent.relative_to(Path("properties")).as_posix()
+
+
+@router.post("/{project_id}/properties/regroup/confirm")
+def confirm_regroup_properties(
+    project_id: str,
+    payload: RegroupConfirmation,
+    settings: Settings = Depends(get_settings),
+    user=Depends(require_capability("property.move")),
+):
+    if not get_project(settings, project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+    if is_locked(settings, project_id):
+        raise HTTPException(status_code=409, detail="Project is processing")
+    catalog = PropertyCatalog(settings)
+    rows = catalog.list(project_id)
+    if catalog_signature(rows) != payload.catalog_signature:
+        raise HTTPException(
+            status_code=409,
+            detail="The property tree changed after this proposal was generated. Create a new proposal.",
+        )
+    row_ids = {str(row.get("id") or "") for row in rows}
+    submitted_ids = {item.property_id for item in payload.items}
+    if submitted_ids != row_ids or len(payload.items) != len(row_ids):
+        raise HTTPException(
+            status_code=422,
+            detail="The confirmation must include every property exactly once.",
+        )
+    placements = {item.property_id: item.directory for item in payload.items}
+    filenames = {
+        item.property_id: safe_filename(item.filename) for item in payload.items
+    }
+    job_id = str(uuid.uuid4())
+    if not acquire_lock(settings, project_id, job_id):
+        raise HTTPException(status_code=409, detail="Project is processing")
+    try:
+        updated = apply_group_placements(
+            settings,
+            project_id,
+            rows,
+            placements,
+            filenames,
+        )
+        return {
+            "properties": sorted(
+                updated,
+                key=lambda item: str(item.get("filename") or "").casefold(),
+            )
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Original property file not found") from exc
+    except FileExistsError as exc:
+        raise HTTPException(status_code=409, detail=f"Target property already exists: {exc}") from exc
     finally:
         release_lock(settings, project_id, job_id)
 
@@ -531,6 +1404,28 @@ def raw_property(project_id: str, property_id: str, settings: Settings = Depends
     if not path.is_file():
         raise HTTPException(status_code=404, detail="Original property file not found")
     return FileResponse(path, media_type=mimetypes.guess_type(row["filename"])[0] or "application/octet-stream", filename=row["filename"])
+
+
+@router.get("/{project_id}/properties/{property_id}/content", response_class=PlainTextResponse)
+def property_content(
+    project_id: str,
+    property_id: str,
+    settings: Settings = Depends(get_settings),
+    user=Depends(require_capability("property.view")),
+):
+    row = PropertyCatalog(settings).get(project_id, property_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Property not found")
+    content = read_property_text(settings, project_id, property_id)
+    if content is None:
+        path = settings.projects_dir / project_id / row["relative_path"]
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="Original property file not found")
+        content = extract_text(path, row["property_type"])
+        if row["property_type"] == "image" and not content:
+            content = row.get("definition") or ""
+        write_property_text(settings, project_id, property_id, content)
+    return PlainTextResponse(content, media_type="text/plain; charset=utf-8")
 
 
 @router.delete("/{project_id}/properties/{property_id}", status_code=202)

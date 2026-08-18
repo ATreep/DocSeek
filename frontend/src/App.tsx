@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { useDocSeekTranslation } from './i18n'
 import { request } from './api'
 import Login from './components/Login'
 import ProjectShell from './components/ProjectShell'
@@ -6,6 +7,7 @@ import ProjectShell from './components/ProjectShell'
 type AuthenticationState = 'checking' | 'authenticated' | 'anonymous'
 
 export default function App() {
+  const { t } = useDocSeekTranslation()
   const [authentication, setAuthentication] = useState<AuthenticationState>(
     localStorage.getItem('docseek-token') ? 'checking' : 'anonymous',
   )
@@ -31,7 +33,7 @@ export default function App() {
       <main className="login-page">
         <div className="login-form">
           <div className="brand-mark"><span>DOCSEEK</span></div>
-          <p className="muted">Checking session...</p>
+          <p className="muted">{t('Checking session...')}</p>
         </div>
       </main>
     )

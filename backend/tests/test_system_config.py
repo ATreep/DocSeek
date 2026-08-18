@@ -7,13 +7,121 @@ from backend.app.main import app
 from backend.app.config import Settings, get_settings
 from backend.app.db import connect, initialize
 from backend.app.seed import seed_defaults
-from backend.app.services.graph_store import DEFAULT_ENTITY_PROMPT, ENTITY_DEFINITION_GUIDANCE, PREVIOUS_DYNAMIC_RELATION_ENTITY_PROMPT, PREVIOUS_FIXED_RELATION_ENTITY_PROMPT
+from backend.app.services import graph_store
+from backend.app.services.graph_store import DEFAULT_ENTITY_PROMPT, PREVIOUS_CONCISE_DEFINITION_ENTITY_PROMPT, PREVIOUS_DYNAMIC_RELATION_ENTITY_PROMPT, PREVIOUS_FIXED_RELATION_ENTITY_PROMPT
 from backend.app.services.providers import chat_provider
 
 
 def _headers(client: TestClient) -> dict[str, str]:
     token = client.post("/api/auth/login", json={"username": "admin", "password": "admin"}).json()["token"]
     return {"Authorization": f"Bearer {token}"}
+
+
+def test_import_provider_readiness_reports_each_missing_import_route(tmp_path):
+    settings = Settings(data_dir=tmp_path)
+    settings.ensure_directories()
+    initialize(settings.sqlite_path)
+    seed_defaults(settings)
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        with TestClient(app) as client:
+            headers = _headers(client)
+            llm = client.post(
+                "/api/system/providers",
+                json={
+                    "name": "Import LLM",
+                    "provider_type": "llm",
+                    "model": "chat-model",
+                    "base_url": "https://provider.test/v1",
+                    "secret": "llm-secret",
+                },
+                headers=headers,
+            ).json()
+            embedding = client.post(
+                "/api/system/providers",
+                json={
+                    "name": "Import Embedding",
+                    "provider_type": "embedding",
+                    "model": "embedding-model",
+                    "base_url": "https://provider.test/v1",
+                    "secret": "embedding-secret",
+                },
+                headers=headers,
+            ).json()
+            initially_missing = client.get(
+                "/api/system/import-provider-readiness",
+                headers=headers,
+            )
+            assert [
+                route["label"]
+                for route in initially_missing.json()["missing_routes"]
+            ] == [
+                "Definition Generation Agent",
+                "Group Arrangement Agent",
+                "Property Graph Building Agent",
+                "Entity Extraction Agent",
+                "Shared Embedding Model",
+            ]
+            client.patch(
+                "/api/system/config",
+                json={
+                    "dg_agent_route": llm["id"],
+                    "ga_agent_route": llm["id"],
+                },
+                headers=headers,
+            ).raise_for_status()
+
+            incomplete = client.get(
+                "/api/system/import-provider-readiness",
+                headers=headers,
+            )
+
+            assert incomplete.status_code == 200
+            assert incomplete.json() == {
+                "ready": False,
+                "missing_routes": [
+                    {
+                        "key": "pgb_agent_route",
+                        "label": "Property Graph Building Agent",
+                        "provider_type": "llm",
+                    },
+                    {
+                        "key": "entity_agent_route",
+                        "label": "Entity Extraction Agent",
+                        "provider_type": "llm",
+                    },
+                    {
+                        "key": "shared_embedding_route",
+                        "label": "Shared Embedding Model",
+                        "provider_type": "embedding",
+                    },
+                ],
+                "can_configure": True,
+            }
+            assert "secret" not in incomplete.text
+
+            client.patch(
+                "/api/system/config",
+                json={
+                    "pgb_agent_route": llm["id"],
+                    "entity_agent_route": llm["id"],
+                    "shared_embedding_route": embedding["id"],
+                    "ai_query_route": None,
+                },
+                headers=headers,
+            ).raise_for_status()
+
+            complete = client.get(
+                "/api/system/import-provider-readiness",
+                headers=headers,
+            )
+            assert complete.json() == {
+                "ready": True,
+                "missing_routes": [],
+                "can_configure": True,
+            }
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
 
 
 def test_provider_profiles_never_return_secret_and_routes_require_existing_profile():
@@ -55,35 +163,29 @@ def test_default_entity_schema_includes_an_entity_definition_field():
         assert "definition" in config.json()["entity_schema"]
         assert "description" not in config.json()["entity_schema"]
         prompt = config.json()["entity_prompt"]
-        assert "same meaning in every context" in prompt
-        assert "identifier may differ slightly" in prompt
-        assert "notional nouns" in prompt
-        assert "specific identifiable objects" in prompt
-        assert "multiple independent subgraphs" in prompt
-        assert "Do not force relationships" in prompt
-        assert "isolated entities" in prompt
-        assert "choose the most appropriate relation type" in prompt
-        assert "not limited to a predefined relation list" in prompt
-        assert "rebuild the complete entity relationship set" in prompt
-        assert "single brief plain-language sentence" in prompt
-        assert "25 words or fewer" in prompt
-        assert "understand what the entity is at a glance" in prompt
-        assert "Do not copy, quote, or lightly rephrase" in prompt
-        assert "code snippets" in prompt
-        assert "Do not try to extract every noun" in prompt
-        assert "A small result is preferable" in prompt
-        assert "coding, network, PC, or user" in prompt
-        assert "function words, filler words, structural labels" in prompt
-        assert "people, companies, organizations, products, brands, or places" in prompt
-        assert "professional concepts, standards, laws, or regulations" in prompt
-        assert "clearly described in one short sentence" in prompt
+        assert "meaning is consistent" in prompt
+        assert "specific, identifiable entities" in prompt
+        assert "Independent subgraphs and isolated entities" in prompt
+        assert "never connect by co-occurrence" in prompt
+        assert "specific relation type" in prompt
+        assert "one plain sentence" in prompt
+        assert "under 25 words" in prompt
+        assert "Do not copy source text, code, logs, or Markdown" in prompt
+        assert "Do not extract every noun" in prompt
+        assert "generic concepts (user, code, network)" in prompt
+        assert "people, organizations, products, technologies, places, laws, standards" in prompt
+        assert "English ASCII id" in prompt
+        assert "original Unicode spelling" in prompt
+        assert "readable English word combination" in prompt
+        assert "personal-resume" in prompt
+        assert "staff-management-system" in prompt
 
 
 def test_seed_upgrades_previous_concise_definition_entity_prompt(tmp_path):
     settings = Settings(data_dir=tmp_path)
     settings.ensure_directories()
     initialize(settings.sqlite_path)
-    previous_prompt = f"{PREVIOUS_DYNAMIC_RELATION_ENTITY_PROMPT} {ENTITY_DEFINITION_GUIDANCE}"
+    previous_prompt = PREVIOUS_CONCISE_DEFINITION_ENTITY_PROMPT
     with connect(settings.sqlite_path) as db:
         db.execute(
             "INSERT INTO system_config(key,value,updated_at) VALUES ('entity_prompt',?,'now')",
@@ -97,7 +199,102 @@ def test_seed_upgrades_previous_concise_definition_entity_prompt(tmp_path):
             "SELECT value FROM system_config WHERE key='entity_prompt'",
         ).fetchone()["value"]
     assert stored == DEFAULT_ENTITY_PROMPT
-    assert "Do not try to extract every noun" in stored
+    assert "Do not extract every noun" in stored
+
+
+def test_seed_upgrades_previous_selection_entity_prompt(tmp_path):
+    from backend.app.services.graph_store import PREVIOUS_SELECTION_ENTITY_PROMPT
+
+    settings = Settings(data_dir=tmp_path)
+    settings.ensure_directories()
+    initialize(settings.sqlite_path)
+    with connect(settings.sqlite_path) as db:
+        db.execute(
+            "INSERT INTO system_config(key,value,updated_at) VALUES ('entity_prompt',?,'now')",
+            (PREVIOUS_SELECTION_ENTITY_PROMPT,),
+        )
+
+    seed_defaults(settings)
+
+    with connect(settings.sqlite_path) as db:
+        stored = db.execute(
+            "SELECT value FROM system_config WHERE key='entity_prompt'",
+        ).fetchone()["value"]
+    assert stored == DEFAULT_ENTITY_PROMPT
+    assert "English ASCII id" in stored
+    assert "original Unicode spelling" in stored
+
+
+def test_seed_upgrades_the_previous_full_default_to_the_compact_entity_prompt(tmp_path):
+    settings = Settings(data_dir=tmp_path)
+    settings.ensure_directories()
+    initialize(settings.sqlite_path)
+    previous_prompt = getattr(
+        graph_store, "PREVIOUS_DEFAULT_ENTITY_PROMPT", "missing-legacy-prompt"
+    )
+    with connect(settings.sqlite_path) as db:
+        db.execute(
+            "INSERT INTO system_config(key,value,updated_at) VALUES ('entity_prompt',?,'now')",
+            (previous_prompt,),
+        )
+
+    seed_defaults(settings)
+
+    with connect(settings.sqlite_path) as db:
+        stored = db.execute(
+            "SELECT value FROM system_config WHERE key='entity_prompt'"
+        ).fetchone()["value"]
+    assert previous_prompt != "missing-legacy-prompt"
+    assert stored == graph_store.DEFAULT_ENTITY_PROMPT
+    assert len(stored) <= 2_600
+
+
+def test_seed_upgrades_the_intermediate_compact_entity_prompt(tmp_path):
+    settings = Settings(data_dir=tmp_path)
+    settings.ensure_directories()
+    initialize(settings.sqlite_path)
+    previous_prompt = getattr(
+        graph_store, "PREVIOUS_COMPACT_ENTITY_PROMPT", "missing-compact-prompt"
+    )
+    with connect(settings.sqlite_path) as db:
+        db.execute(
+            "INSERT INTO system_config(key,value,updated_at) VALUES ('entity_prompt',?,'now')",
+            (previous_prompt,),
+        )
+
+    seed_defaults(settings)
+
+    with connect(settings.sqlite_path) as db:
+        stored = db.execute(
+            "SELECT value FROM system_config WHERE key='entity_prompt'"
+        ).fetchone()["value"]
+    assert previous_prompt != "missing-compact-prompt"
+    assert stored == graph_store.DEFAULT_ENTITY_PROMPT
+    assert "people, organizations, products, technologies" in stored
+
+
+def test_seed_upgrades_the_previous_entity_identifier_prompt(tmp_path):
+    settings = Settings(data_dir=tmp_path)
+    settings.ensure_directories()
+    initialize(settings.sqlite_path)
+    previous_prompt = getattr(
+        graph_store, "PREVIOUS_ENTITY_IDENTIFIER_PROMPT", "missing-id-prompt"
+    )
+    with connect(settings.sqlite_path) as db:
+        db.execute(
+            "INSERT INTO system_config(key,value,updated_at) VALUES ('entity_prompt',?,'now')",
+            (previous_prompt,),
+        )
+
+    seed_defaults(settings)
+
+    with connect(settings.sqlite_path) as db:
+        stored = db.execute(
+            "SELECT value FROM system_config WHERE key='entity_prompt'"
+        ).fetchone()["value"]
+    assert previous_prompt != "missing-id-prompt"
+    assert stored == graph_store.DEFAULT_ENTITY_PROMPT
+    assert "personal-resume" in stored
 
 
 def test_seed_upgrades_previous_dynamic_relation_entity_prompt(tmp_path):
@@ -124,7 +321,7 @@ def test_seed_upgrades_previous_dynamic_relation_entity_prompt(tmp_path):
             "SELECT value FROM system_config WHERE key='entity_prompt'",
         ).fetchone()["value"]
     assert stored == DEFAULT_ENTITY_PROMPT
-    assert "single brief plain-language sentence" in stored
+    assert "one plain sentence" in stored
 
 
 def test_seed_upgrades_the_previous_default_entity_prompt(tmp_path):
@@ -151,7 +348,7 @@ def test_seed_upgrades_the_previous_default_entity_prompt(tmp_path):
             "SELECT value FROM system_config WHERE key='entity_prompt'",
         ).fetchone()["value"]
     assert stored == DEFAULT_ENTITY_PROMPT
-    assert "same meaning in every context" in stored
+    assert "meaning is consistent" in stored
 
 
 def test_seed_upgrades_entity_prompt_that_forced_a_single_connected_graph(tmp_path):
@@ -182,7 +379,7 @@ def test_seed_upgrades_entity_prompt_that_forced_a_single_connected_graph(tmp_pa
             "SELECT value FROM system_config WHERE key='entity_prompt'"
         ).fetchone()["value"]
     assert stored == DEFAULT_ENTITY_PROMPT
-    assert "multiple independent subgraphs" in stored
+    assert "Independent subgraphs" in stored
 
 
 def test_seed_upgrades_previous_fixed_relation_entity_prompt(tmp_path):
@@ -217,7 +414,7 @@ def test_seed_upgrades_previous_fixed_relation_entity_prompt(tmp_path):
             "SELECT value FROM system_config WHERE key='entity_prompt'"
         ).fetchone()["value"]
     assert stored == DEFAULT_ENTITY_PROMPT
-    assert "not limited to a predefined relation list" in stored
+    assert "specific relation type" in stored
 
 
 def test_seed_removes_legacy_property_filename_suggestions(tmp_path):
@@ -311,3 +508,86 @@ def test_disabled_neo4j_reports_neutral_local_mode():
         assert result.json()["mode"] == "local-fallback"
         assert result.json()["configured"] is False
         assert result.json()["message"] == "Local graph storage active"
+
+
+def test_system_config_exposes_default_retrieval_limits(tmp_path):
+    settings = Settings(data_dir=tmp_path)
+    settings.ensure_directories()
+    initialize(settings.sqlite_path)
+    seed_defaults(settings)
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        with TestClient(app) as client:
+            response = client.get("/api/system/config", headers=_headers(client))
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
+
+    assert response.status_code == 200
+    assert response.json()["retrieval"] == {
+        "ai_query": {
+            "property_limit": 15,
+            "entity_limit": 15,
+            "total_node_limit": 30,
+        },
+        "search": {
+            "property_limit": 30,
+            "entity_limit": 30,
+        },
+    }
+
+
+def test_system_config_persists_custom_retrieval_limits(tmp_path):
+    settings = Settings(data_dir=tmp_path)
+    settings.ensure_directories()
+    initialize(settings.sqlite_path)
+    seed_defaults(settings)
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        with TestClient(app) as client:
+            headers = _headers(client)
+            response = client.patch(
+                "/api/system/config",
+                json={
+                    "ai_query_property_limit": 9,
+                    "ai_query_entity_limit": 11,
+                    "ai_query_total_node_limit": 17,
+                    "search_property_limit": 41,
+                    "search_entity_limit": 43,
+                },
+                headers=headers,
+            )
+            reloaded = client.get("/api/system/config", headers=headers)
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
+
+    assert response.status_code == 200
+    assert reloaded.json()["retrieval"] == {
+        "ai_query": {
+            "property_limit": 9,
+            "entity_limit": 11,
+            "total_node_limit": 17,
+        },
+        "search": {
+            "property_limit": 41,
+            "entity_limit": 43,
+        },
+    }
+
+
+def test_system_config_rejects_non_positive_retrieval_limits(tmp_path):
+    settings = Settings(data_dir=tmp_path)
+    settings.ensure_directories()
+    initialize(settings.sqlite_path)
+    seed_defaults(settings)
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        with TestClient(app) as client:
+            response = client.patch(
+                "/api/system/config",
+                json={"ai_query_total_node_limit": 0},
+                headers=_headers(client),
+            )
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
+
+    assert response.status_code == 422

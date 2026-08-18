@@ -10,11 +10,9 @@ from ..db import connect
 from ..security import get_current_user, require_capability
 from ..services.catalog import PropertyCatalog
 from ..services.graph_store import Neo4jGraphStore
-from ..services.llm import AnswerLLM
-from ..services.parsers import property_type
-from ..services.pipeline import run_pipeline
+from ..services.pipeline import _current_group_tree
 from ..services.retrieval import Retriever
-from ..services.storage import move_original, replace_original, save_original, safe_filename
+from ..services.storage import safe_filename
 from .projects import get_project
 
 router = APIRouter(prefix="/projects", tags=["mcp"])
@@ -25,8 +23,19 @@ TOOLS = {
     "add_property": "property.upload", "replace_property": "property.replace", "remove_property": "property.delete",
     "list_entities": "graph.entity.view", "get_entity": "graph.entity.view", "search_properties": "search.properties",
     "search_entities": "search.entities", "get_property_graph": "graph.property.view", "get_entity_graph": "graph.entity.view",
-    "ask_ai_query": "query.execute", "get_processing_status": "agent.status.view",
+    "regroup_properties": "property.move", "get_processing_status": "agent.status.view",
 }
+
+
+def _entity_belongs_to_property(entity: dict[str, Any], property_id: str) -> bool:
+    source_property_ids = entity.get("source_property_ids")
+    if isinstance(source_property_ids, list) and property_id in source_property_ids:
+        return True
+    source_contexts = entity.get("source_contexts")
+    return isinstance(source_contexts, list) and any(
+        isinstance(context, dict) and context.get("property_id") == property_id
+        for context in source_contexts
+    )
 
 
 def close_active_for_user(user_id: str) -> None:
@@ -85,7 +94,7 @@ def _execute_tool(project_id: str, tool: str, payload: dict, settings: Settings,
     catalog = PropertyCatalog(settings)
     store = Neo4jGraphStore(settings)
     if tool == "list_properties":
-        return {"properties": catalog.list(project_id)}
+        return {"property_tree": _current_group_tree(catalog.list(project_id))}
     if tool == "get_property":
         item = catalog.get(project_id, payload.get("property_id", ""))
         if not item:
@@ -101,7 +110,15 @@ def _execute_tool(project_id: str, tool: str, payload: dict, settings: Settings,
     if tool == "get_entity_graph":
         return store.graph(project_id, "entity")
     if tool == "list_entities":
-        return {"entities": store.graph(project_id, "entity")["nodes"]}
+        entities = store.graph(project_id, "entity")["nodes"]
+        property_id = payload.get("property_id")
+        if isinstance(property_id, str) and property_id.strip():
+            entities = [
+                entity
+                for entity in entities
+                if _entity_belongs_to_property(entity, property_id.strip())
+            ]
+        return {"entities": entities}
     if tool == "get_entity":
         entity_id = payload.get("entity_id", "")
         entity = next((item for item in store.graph(project_id, "entity")["nodes"] if item.get("id") == entity_id), None)
@@ -112,9 +129,48 @@ def _execute_tool(project_id: str, tool: str, payload: dict, settings: Settings,
         return {"properties": Retriever(store).search_properties(project_id, payload.get("query", ""))}
     if tool == "search_entities":
         return {"entities": store.search(project_id, payload.get("query", ""), "entities")}
-    if tool == "ask_ai_query":
-        context = Retriever(store).context(project_id, payload.get("query", ""))
-        return AnswerLLM(settings=settings).answer(payload.get("query", ""), context)
+    if tool == "regroup_properties":
+        revision_prompt = payload.get("revision_prompt")
+        if (
+            not isinstance(revision_prompt, str)
+            or not revision_prompt.strip()
+            or len(revision_prompt) > 4000
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="Re-grouping prompt must contain 1 to 4000 characters",
+            )
+        from .properties import (
+            RegroupConfirmation,
+            RegroupConfirmationItem,
+            RegroupRequest,
+            confirm_regroup_properties,
+            regroup_properties,
+        )
+
+        proposal = regroup_properties(
+            project_id,
+            RegroupRequest(revision_prompt=revision_prompt.strip()),
+            settings,
+            active,
+        )
+        confirmed = confirm_regroup_properties(
+            project_id,
+            RegroupConfirmation(
+                catalog_signature=proposal["catalog_signature"],
+                items=[
+                    RegroupConfirmationItem(
+                        property_id=change["property_id"],
+                        directory=change["proposed_directory"],
+                        filename=change["proposed_filename"],
+                    )
+                    for change in proposal["changes"]
+                ],
+            ),
+            settings,
+            active,
+        )
+        return {**confirmed, "job_id": proposal.get("job_id")}
     if tool == "get_processing_status":
         with connect(settings.sqlite_path) as db:
             lock = db.execute("SELECT * FROM project_locks WHERE project_id=?", (project_id,)).fetchone()

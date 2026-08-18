@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   processingRefreshKey,
   processingElapsedLabel,
+  processingStageDetail,
   processingStageLabel,
   shouldRefreshProjectCatalog,
 } from './processing-status'
@@ -21,6 +22,25 @@ describe('processingStageLabel', () => {
     ['graph-activate', 'Activating candidate snapshot'],
   ])('describes %s as %s', (stage, label) => {
     expect(processingStageLabel(stage)).toBe(label)
+  })
+})
+
+describe('processingStageDetail', () => {
+  it('turns dynamic backend progress into a localizable message', () => {
+    expect(processingStageDetail(
+      'graph-entity-extraction',
+      'Generating graph nodes and edges 2/5: 产品手册.md',
+    )).toEqual({
+      key: 'Generating graph nodes and edges {{current}}/{{total}}: {{filename}}',
+      values: { current: 2, total: 5, filename: '产品手册.md' },
+    })
+  })
+
+  it('keeps unknown provider errors unchanged', () => {
+    expect(processingStageDetail('failed', 'provider request timed out')).toEqual({
+      key: 'provider request timed out',
+      values: undefined,
+    })
   })
 })
 

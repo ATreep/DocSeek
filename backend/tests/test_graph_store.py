@@ -2,8 +2,68 @@ import pytest
 
 from backend.app.config import Settings
 from backend.app.db import initialize
-from backend.app.services.graph_store import GraphSnapshot, LocalGraphStore
+from backend.app.services.graph_store import GraphSnapshot, LocalGraphStore, entity_extraction_chunks, prune_property_snapshot
 from backend.app.services.graph_store import embedding
+
+
+def test_prune_property_snapshot_removes_owned_nodes_edges_and_shared_sources(tmp_path):
+    settings = Settings(data_dir=tmp_path)
+    settings.ensure_directories()
+    initialize(settings.sqlite_path)
+    store = LocalGraphStore(settings)
+    store.write_snapshot(GraphSnapshot(
+        "project",
+        "before",
+        [
+            {"id": "remove", "filename": "remove.md"},
+            {"id": "keep", "filename": "keep.md"},
+        ],
+        [
+            {"id": "owned", "source_property_ids": ["remove"], "source_contexts": [{"property_id": "remove", "text": "Owned context"}]},
+            {"id": "shared", "source_property_ids": ["remove", "keep"], "source_contexts": [{"property_id": "remove", "text": "Old"}, {"property_id": "keep", "text": "Keep"}]},
+            {"id": "unrelated", "source_property_ids": ["keep"], "source_contexts": [{"property_id": "keep", "text": "Other"}]},
+        ],
+        [
+            {"source": "remove", "target": "keep", "type": "REFERENCES"},
+        ],
+        [
+            {"source": "owned", "target": "shared", "type": "USES"},
+            {"source": "shared", "target": "unrelated", "type": "SUPPORTS"},
+        ],
+    ))
+    store.activate("project", "before")
+
+    pruned = prune_property_snapshot(store, "project", "remove", "after")
+
+    assert [node["id"] for node in pruned.properties] == ["keep"]
+    assert pruned.property_edges == []
+    assert [node["id"] for node in pruned.entities] == ["shared", "unrelated"]
+    shared = pruned.entities[0]
+    assert shared["source_property_ids"] == ["keep"]
+    assert shared["source_contexts"] == [{"property_id": "keep", "text": "Keep"}]
+    assert pruned.entity_edges == [
+        {"source": "shared", "target": "unrelated", "type": "SUPPORTS"}
+    ]
+
+
+@pytest.mark.parametrize(
+    ("length", "expected_lengths"),
+    [
+        (12_000, [12_000]),
+        (12_001, [12_000, 501]),
+        (23_500, [12_000, 12_000]),
+        (24_000, [12_000, 12_000, 1_000]),
+    ],
+)
+def test_entity_extraction_chunk_boundaries_cover_all_content(length, expected_lengths):
+    content = "".join(chr(65 + index % 26) for index in range(length))
+    chunks = entity_extraction_chunks(content)
+
+    assert [len(chunk) for chunk in chunks] == expected_lengths
+    assert chunks[0] == content[:12_000]
+    for index, chunk in enumerate(chunks[1:], start=1):
+        start = index * 11_500
+        assert chunk == content[start : start + 12_000]
 
 
 def test_long_content_embeddings_are_batched_and_combined(monkeypatch):
@@ -128,6 +188,39 @@ def test_candidate_graph_can_be_read_before_activation(tmp_path):
     assert candidate["snapshot_id"] == "candidate"
     assert candidate["nodes"] == [{"id": "new"}]
     assert candidate["edges"][0]["type"] == "RELATED"
+
+
+def test_local_graph_store_returns_only_the_requested_neighbor_frontier(tmp_path):
+    settings = type("Settings", (), {"data_dir": tmp_path})()
+    store = LocalGraphStore(settings)
+    store.write_snapshot(
+        GraphSnapshot(
+            "p",
+            "neighbors",
+            [
+                {"id": "manual", "filename": "manual.md"},
+                {"id": "architecture", "filename": "architecture.md"},
+                {"id": "finance", "filename": "finance.xlsx"},
+            ],
+            [],
+            [
+                {"source": "manual", "target": "architecture", "type": "DOCUMENTS"},
+                {"source": "finance", "target": "architecture", "type": "FUNDS"},
+            ],
+            [],
+        )
+    )
+    store.activate("p", "neighbors")
+
+    neighborhood = store.neighbors("p", "property", ["manual"])
+
+    assert [node["id"] for node in neighborhood["nodes"]] == [
+        "manual",
+        "architecture",
+    ]
+    assert neighborhood["edges"] == [
+        {"source": "manual", "target": "architecture", "type": "DOCUMENTS"}
+    ]
 
 
 def test_legacy_co_occurs_entity_edge_is_typed_from_mention_context(tmp_path):

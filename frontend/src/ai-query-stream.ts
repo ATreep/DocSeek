@@ -4,6 +4,8 @@ export type Citation = {
   kind?: 'property' | 'entity' | string
   id?: string
   label?: string
+  reason?: string
+  path?: string[]
 }
 
 export type AIQueryStreamEvent =

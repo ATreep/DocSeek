@@ -1,5 +1,6 @@
 import { ArrowDownLeft, ArrowUpRight } from 'lucide-react'
 import type { GraphRelationDetail } from '../graph-relations'
+import { useDocSeekTranslation } from '../i18n'
 
 type RelationListProps = {
   relations: GraphRelationDetail[]
@@ -7,10 +8,11 @@ type RelationListProps = {
 }
 
 export default function RelationList({ relations, onSelect }: RelationListProps) {
+  const { t } = useDocSeekTranslation()
   return <div className="attribute-block relation-section">
     <div className="relation-list-heading">
-      <span className="eyebrow">RELATIONS</span>
-      <small>{relations.length} {relations.length === 1 ? 'relation' : 'relations'}</small>
+      <span className="eyebrow">{t('RELATIONS')}</span>
+      <small>{relations.length} {t(relations.length === 1 ? 'relation' : 'relations')}</small>
     </div>
     {relations.length ? <ul className="node-relations">
       {relations.map((relation, index) => {
@@ -25,13 +27,13 @@ export default function RelationList({ relations, onSelect }: RelationListProps)
           >
             <span className={`relation-direction ${direction}`}>
               {direction === 'outgoing' ? <ArrowUpRight size={13} /> : <ArrowDownLeft size={13} />}
-              {direction}
+              {t(direction)}
             </span>
             <strong>{relation.type}</strong>
             <small>{relatedLabel}</small>
           </button>
         </li>
       })}
-    </ul> : <p className="muted">No graph relations.</p>}
+    </ul> : <p className="muted">{t('No graph relations.')}</p>}
   </div>
 }

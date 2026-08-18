@@ -25,4 +25,44 @@ describe('applyAIQueryEvent', () => {
       streaming: false,
     })
   })
+
+  it('adds detail-tool citations after streamed answer text without losing content', () => {
+    const initial: ChatMessage[] = [
+      { role: 'user', content: 'What is Atlas?' },
+      {
+        role: 'assistant',
+        content: 'Atlas is documented.',
+        citations: [{ kind: 'property', id: 'manual', label: 'manual.md' }],
+        streaming: true,
+      },
+    ]
+
+    const updated = applyAIQueryEvent(initial, {
+      type: 'sources',
+      citations: [
+        { kind: 'property', id: 'manual', label: 'manual.md' },
+        {
+          kind: 'entity',
+          id: 'atlas',
+          label: 'Atlas',
+          reason: 'Inspected by AI Query',
+        },
+      ],
+    })
+
+    expect(updated[1]).toEqual({
+      role: 'assistant',
+      content: 'Atlas is documented.',
+      citations: [
+        { kind: 'property', id: 'manual', label: 'manual.md' },
+        {
+          kind: 'entity',
+          id: 'atlas',
+          label: 'Atlas',
+          reason: 'Inspected by AI Query',
+        },
+      ],
+      streaming: true,
+    })
+  })
 })

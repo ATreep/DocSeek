@@ -10,8 +10,21 @@ from ..db import connect
 from ..security import require_capability
 from ..services.graph_store import DEFAULT_ENTITY_PROMPT, DEFAULT_ENTITY_SCHEMA, Neo4jGraphStore
 from ..services.providers import ProviderError, probe_provider_profile, save_provider_secret
+from ..services.retrieval_limits import (
+    MAX_RETRIEVAL_LIMIT_PER_KIND,
+    MAX_RETRIEVAL_TOTAL_NODE_LIMIT,
+    retrieval_limits_from_values,
+)
 
 router = APIRouter(prefix="/system", tags=["system"])
+
+IMPORT_PROVIDER_ROUTES = (
+    ("dg_agent_route", "Definition Generation Agent", "llm"),
+    ("ga_agent_route", "Group Arrangement Agent", "llm"),
+    ("pgb_agent_route", "Property Graph Building Agent", "llm"),
+    ("entity_agent_route", "Entity Extraction Agent", "llm"),
+    ("shared_embedding_route", "Shared Embedding Model", "embedding"),
+)
 
 
 class SystemConfigUpdate(BaseModel):
@@ -24,6 +37,21 @@ class SystemConfigUpdate(BaseModel):
     entity_schema: str | None = None
     entity_prompt: str | None = None
     mcp_enabled: bool | None = None
+    ai_query_property_limit: int | None = Field(
+        default=None, ge=1, le=MAX_RETRIEVAL_LIMIT_PER_KIND
+    )
+    ai_query_entity_limit: int | None = Field(
+        default=None, ge=1, le=MAX_RETRIEVAL_LIMIT_PER_KIND
+    )
+    ai_query_total_node_limit: int | None = Field(
+        default=None, ge=1, le=MAX_RETRIEVAL_TOTAL_NODE_LIMIT
+    )
+    search_property_limit: int | None = Field(
+        default=None, ge=1, le=MAX_RETRIEVAL_LIMIT_PER_KIND
+    )
+    search_entity_limit: int | None = Field(
+        default=None, ge=1, le=MAX_RETRIEVAL_LIMIT_PER_KIND
+    )
 
 
 class ProviderProfileCreate(BaseModel):
@@ -46,7 +74,55 @@ def get_config(settings: Settings = Depends(get_settings), user=Depends(require_
     with connect(settings.sqlite_path) as db:
         values = {row["key"]: row["value"] for row in db.execute("SELECT key,value FROM system_config")}
     mcp_enabled = str(values.get("mcp_enabled", "true")).lower() in {"1", "true", "yes", "on"}
-    return {"routes": {key: values.get(key) for key in ("dg_agent_route", "ga_agent_route", "pgb_agent_route", "entity_agent_route", "ai_query_route", "shared_embedding_route")}, "entity_schema": values.get("entity_schema", DEFAULT_ENTITY_SCHEMA), "entity_prompt": values.get("entity_prompt", DEFAULT_ENTITY_PROMPT), "neo4j": {"uri": settings.neo4j_uri, "property_database": settings.neo4j_property_database, "entity_database": settings.neo4j_entity_database, "use_neo4j": settings.use_neo4j}, "mcp": {"enabled": mcp_enabled}}
+    retrieval = retrieval_limits_from_values(values)
+    return {"routes": {key: values.get(key) for key in ("dg_agent_route", "ga_agent_route", "pgb_agent_route", "entity_agent_route", "ai_query_route", "shared_embedding_route")}, "entity_schema": values.get("entity_schema", DEFAULT_ENTITY_SCHEMA), "entity_prompt": values.get("entity_prompt", DEFAULT_ENTITY_PROMPT), "neo4j": {"uri": settings.neo4j_uri, "property_database": settings.neo4j_property_database, "entity_database": settings.neo4j_entity_database, "use_neo4j": settings.use_neo4j}, "mcp": {"enabled": mcp_enabled}, "retrieval": retrieval.as_system_config()}
+
+
+@router.get("/import-provider-readiness")
+def import_provider_readiness(
+    settings: Settings = Depends(get_settings),
+    user=Depends(require_capability("property.upload")),
+):
+    route_keys = tuple(key for key, _, _ in IMPORT_PROVIDER_ROUTES)
+    placeholders = ",".join("?" for _ in route_keys)
+    with connect(settings.sqlite_path) as db:
+        routes = {
+            row["key"]: row["value"]
+            for row in db.execute(
+                f"SELECT key,value FROM system_config WHERE key IN ({placeholders})",
+                route_keys,
+            )
+        }
+        profiles = {
+            row["id"]: row
+            for row in db.execute(
+                "SELECT id,provider_type,model,base_url,secret_configured FROM provider_profiles"
+            )
+        }
+
+    missing_routes = []
+    for key, label, expected_type in IMPORT_PROVIDER_ROUTES:
+        profile = profiles.get(routes.get(key))
+        configured = bool(
+            profile
+            and profile["provider_type"] == expected_type
+            and profile["model"]
+            and profile["base_url"]
+            and profile["secret_configured"]
+        )
+        if not configured:
+            missing_routes.append(
+                {"key": key, "label": label, "provider_type": expected_type}
+            )
+
+    return {
+        "ready": not missing_routes,
+        "missing_routes": missing_routes,
+        "can_configure": {
+            "system.config.view",
+            "system.config.edit",
+        }.issubset(user["capabilities"]),
+    }
 
 
 @router.patch("/config")
@@ -66,7 +142,7 @@ def update_config(payload: SystemConfigUpdate, settings: Settings = Depends(get_
                     raise HTTPException(status_code=422, detail=f"{key} must reference an existing {expected_type} provider profile")
             if value is None:
                 continue
-            db.execute("INSERT INTO system_config(key,value,updated_at) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at", (key, value, now))
+            db.execute("INSERT INTO system_config(key,value,updated_at) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at", (key, str(value), now))
     return get_config(settings, user)
 
 

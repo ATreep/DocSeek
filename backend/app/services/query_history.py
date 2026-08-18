@@ -31,7 +31,7 @@ class QueryHistoryStore:
         return self.projects_dir / project_id / "query-history" / f"{user_key}.json"
 
     @staticmethod
-    def _citations(value: object) -> list[dict[str, str]]:
+    def _citations(value: object) -> list[dict]:
         if not isinstance(value, list):
             return []
         citations = []
@@ -40,9 +40,16 @@ class QueryHistoryStore:
                 continue
             citation = {
                 key: item[key]
-                for key in ("kind", "id", "label")
+                for key in ("kind", "id", "label", "reason")
                 if isinstance(item.get(key), str) and item[key]
             }
+            path = item.get("path")
+            if (
+                isinstance(path, list)
+                and path
+                and all(isinstance(part, str) and part for part in path)
+            ):
+                citation["path"] = path
             if citation:
                 citations.append(citation)
         return citations

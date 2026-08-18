@@ -1,12 +1,24 @@
-import { describe, expect, it, vi } from 'vitest'
-import { render, screen } from '@testing-library/react'
-import SettingsPanel from './SettingsPanel'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { request } from '../api'
+import SettingsPanel, { normalizeSystemConfig } from './SettingsPanel'
 
 vi.mock('../api', () => ({
-  request: vi.fn(async (path: string) => {
+  request: vi.fn(async (path: string, _options?: RequestInit) => {
     if (path.includes('/validate')) return { ready: true, dimensions: 1024 }
     if (path === '/profile') return { username: 'admin', groups: [], roles: [], capabilities: [], preferences: {} }
-    if (path === '/system/config') return { routes: {}, entity_schema: 'DocSeekEntity', entity_prompt: 'Extract', neo4j: { property_database: 'property_graph', entity_database: 'entity_graph', use_neo4j: false }, mcp: { enabled: true } }
+    if (path === '/system/config') return {
+      routes: {},
+      entity_schema: 'DocSeekEntity',
+      entity_prompt: 'Extract',
+      neo4j: { property_database: 'property_graph', entity_database: 'entity_graph', use_neo4j: false },
+      mcp: { enabled: true },
+      retrieval: {
+        ai_query: { property_limit: 15, entity_limit: 15, total_node_limit: 30 },
+        search: { property_limit: 30, entity_limit: 30 },
+      },
+    }
     if (path === '/system/providers') return [
       { id: 'provider-1', name: 'Embedding', provider_type: 'embedding', model: 'bge-m3', base_url: 'https://provider.test/v1', secret_configured: true },
       { id: 'provider-2', name: 'LLM', provider_type: 'llm', model: 'chat-model', base_url: 'https://provider.test/v1', secret_configured: true },
@@ -20,7 +32,38 @@ vi.mock('../api', () => ({
   }),
 }))
 
+afterEach(() => {
+  cleanup()
+  vi.clearAllMocks()
+})
+
 describe('SettingsPanel', () => {
+  it('uses retrieval defaults for a response from an older backend process', () => {
+    const normalized = normalizeSystemConfig({
+      routes: {},
+      entity_schema: 'DocSeekEntity',
+      entity_prompt: 'Extract',
+      neo4j: {
+        property_database: 'property_graph',
+        entity_database: 'entity_graph',
+        use_neo4j: false,
+      },
+      mcp: { enabled: true },
+    })
+
+    expect(normalized.retrieval).toEqual({
+      ai_query: {
+        property_limit: 15,
+        entity_limit: 15,
+        total_node_limit: 30,
+      },
+      search: {
+        property_limit: 30,
+        entity_limit: 30,
+      },
+    })
+  })
+
   it('shows system, access, and profile management sections', async () => {
     render(<SettingsPanel onClose={() => undefined} />)
     expect(await screen.findByRole('dialog', { name: 'Settings' })).toBeTruthy()
@@ -30,7 +73,14 @@ describe('SettingsPanel', () => {
     expect(screen.getByRole('button', { name: 'Validate provider Embedding' })).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Edit provider Embedding' })).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Remove provider Embedding' })).toBeTruthy()
-    expect(screen.getByRole('combobox', { name: 'Entity extraction LLM' })).toBeTruthy()
+    expect(screen.getByRole('combobox', { name: 'Definition Generation Agent' })).toBeTruthy()
+    expect(screen.getByRole('combobox', { name: 'Group Arrangement Agent' })).toBeTruthy()
+    expect(screen.getByRole('combobox', { name: 'Property Graph Building Agent' })).toBeTruthy()
+    expect(screen.getByRole('combobox', { name: 'Entity Extraction Agent' })).toBeTruthy()
+    expect(screen.getByRole('combobox', { name: 'Shared Embedding Model' })).toBeTruthy()
+    expect(screen.queryByRole('combobox', { name: 'DG-Agent LLM' })).toBeNull()
+    expect(screen.queryByRole('combobox', { name: 'GA-Agent LLM' })).toBeNull()
+    expect(screen.queryByRole('combobox', { name: 'PGB-Agent LLM' })).toBeNull()
     await screen.getByRole('button', { name: 'Validate provider Embedding' }).click()
     expect(await screen.findByText(/Ready · 1024d/)).toBeTruthy()
     await screen.getByRole('button', { name: 'Access' }).click()
@@ -44,6 +94,28 @@ describe('SettingsPanel', () => {
     expect(screen.getByRole('checkbox', { name: 'Run AI Query' })).toBeTruthy()
     expect(screen.queryByPlaceholderText('project.view, property.view')).toBeNull()
     await screen.getByRole('button', { name: 'Profile' }).click()
-    expect(screen.getByRole('checkbox', { name: 'Compact density' })).toBeTruthy()
+    expect(screen.queryByRole('checkbox', { name: 'Compact density' })).toBeNull()
+  })
+
+  it('focuses a requested model route when opened from the import alert', async () => {
+    render(
+      <SettingsPanel
+        onClose={() => undefined}
+        focusRouteKey="entity_agent_route"
+      />,
+    )
+
+    const route = await screen.findByRole('combobox', {
+      name: 'Entity Extraction Agent',
+    })
+    await waitFor(() => expect(document.activeElement).toBe(route))
+  })
+
+  it('does not expose retrieval limits in Settings', async () => {
+    render(<SettingsPanel onClose={() => undefined} />)
+
+    await screen.findByRole('dialog', { name: 'Settings' })
+    expect(screen.queryByRole('spinbutton', { name: 'AI Query property limit' })).toBeNull()
+    expect(screen.queryByRole('spinbutton', { name: 'Search property limit' })).toBeNull()
   })
 })

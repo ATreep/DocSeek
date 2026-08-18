@@ -13,13 +13,19 @@ import jieba
 
 from ..config import Settings
 from .agents import normalize_relation_type, parse_json_object
+from .display_language import localized_messages
+from .model_errors import attach_model_response
 from .providers import embedding_provider
+from .retry import retry_model_call
+from .system_prompts import ENTITY_EXTRACTION_SYSTEM_PROMPT
 
 DEFAULT_ENTITY_SCHEMA = "DocSeekEntity(name, type, definition, source_property_ids)"
 EMBEDDING_CHUNK_CHARS = 12_000
 EMBEDDING_BATCH_SIZE = 64
 ENTITY_GRAPH_MAX_TOKENS = 4096
 ENTITY_CONTEXT_WORD_LIMIT = 250
+ENTITY_EXTRACTION_CHUNK_CHARS = 12_000
+ENTITY_EXTRACTION_CHUNK_OVERLAP = 500
 PREVIOUS_ENTITY_PROMPT = (
     "Only extract notional nouns that refer to specific identifiable objects, such as people, products, "
     "technology stacks, brands, companies, organizations, or places. Do not extract generic common nouns, "
@@ -45,16 +51,16 @@ PREVIOUS_DYNAMIC_RELATION_ENTITY_PROMPT = (
     "Whenever a property is added or removed, rebuild the complete entity relationship set from all current non-image "
     "properties so existing relationships and their types may change in light of the complete current graph."
 )
-ENTITY_DEFINITION_GUIDANCE = (
+PREVIOUS_ENTITY_DEFINITION_GUIDANCE = (
     "For each entity definition, write a single brief plain-language sentence that lets a user understand what the entity "
     "is at a glance. Prefer 25 words or fewer and state only the minimum necessary identity, category, purpose, or role. "
     "Do not copy, quote, or lightly rephrase original source text, code, code snippets, configuration, logs, markup, or other "
     "raw document content as the definition. Do not use Markdown, lists, headings, or multiple sentences."
 )
 PREVIOUS_CONCISE_DEFINITION_ENTITY_PROMPT = (
-    f"{PREVIOUS_DYNAMIC_RELATION_ENTITY_PROMPT} {ENTITY_DEFINITION_GUIDANCE}"
+    f"{PREVIOUS_DYNAMIC_RELATION_ENTITY_PROMPT} {PREVIOUS_ENTITY_DEFINITION_GUIDANCE}"
 )
-ENTITY_SELECTION_GUIDANCE = (
+PREVIOUS_ENTITY_SELECTION_GUIDANCE = (
     "Do not try to extract every noun. A small result is preferable to a large list of weak entities. Extract a candidate "
     "only when it is meaningful enough to be clearly described in one short sentence without copying the source or inventing "
     "details. Exclude overly common concepts such as coding, network, PC, or user unless the text names a specific product, "
@@ -64,7 +70,94 @@ ENTITY_SELECTION_GUIDANCE = (
     "and established real-world or professional concepts, standards, laws, or regulations. Rarity alone is not enough: each "
     "entity must have a stable, specific identity outside its sentence."
 )
-DEFAULT_ENTITY_PROMPT = f"{PREVIOUS_CONCISE_DEFINITION_ENTITY_PROMPT} {ENTITY_SELECTION_GUIDANCE}"
+PREVIOUS_SELECTION_ENTITY_PROMPT = (
+    f"{PREVIOUS_CONCISE_DEFINITION_ENTITY_PROMPT} {PREVIOUS_ENTITY_SELECTION_GUIDANCE}"
+)
+PREVIOUS_ENTITY_IDENTIFIER_GUIDANCE = (
+    "For every newly generated entity, use an English ASCII identifier containing English letters and optionally "
+    "numbers, with multi-word identifiers separated only by hyphens or underscores. The identifier may contain only "
+    "letters, numbers, hyphens, or underscores; do not use spaces, punctuation, or non-English characters. Prefer "
+    "lowercase identifiers such as `peking-university` or `neo4j`. Keep the entity name separate from its identifier: "
+    "preserve the original Unicode spelling and script in the name, including Chinese or other non-English characters. "
+    "Do not translate, romanize, or replace the display name merely to make the identifier ASCII."
+)
+PREVIOUS_DEFAULT_ENTITY_PROMPT = (
+    f"{PREVIOUS_SELECTION_ENTITY_PROMPT} {PREVIOUS_ENTITY_IDENTIFIER_GUIDANCE}"
+)
+
+ENTITY_EXTRACTION_GUIDANCE = (
+    "Extract a small set of specific, identifiable entities from the supplied property text. "
+    "Prefer people, organizations, products, technologies, places, laws, standards, and rare professional concepts. "
+    "Count repeated terms only when their meaning is consistent. Reuse matching IDs from this inventory: "
+    "{current_entities}. Independent subgraphs and isolated entities are valid. Add an edge only when the text supports "
+    "a clear directed relation; never connect by co-occurrence. Choose a concise, specific relation type."
+)
+ENTITY_DEFINITION_GUIDANCE = (
+    "Definitions must be one plain sentence, preferably under 25 words, identifying what the entity is. "
+    "Do not copy source text, code, logs, or Markdown. Example: `Neo4j` — a graph database platform."
+)
+PREVIOUS_COMPACT_ENTITY_SELECTION_GUIDANCE = (
+    "Do not extract every noun. Exclude generic concepts (user, code, network), headings, filler, numbers, hashes, "
+    "variables, functions, classes, and arbitrary tokens. Keep only entities meaningful enough for a short definition."
+)
+ENTITY_SELECTION_GUIDANCE = (
+    "Do not extract every noun. Exclude generic concepts (user, code, network), headings, filler, numbers, hashes, "
+    "variables, functions, classes, and arbitrary tokens. Prefer people, organizations, products, technologies, "
+    "places, laws, standards, and rare professional concepts. Keep only entities meaningful enough for a short definition."
+)
+PREVIOUS_COMPACT_ENTITY_IDENTIFIER_GUIDANCE = (
+    "Use a stable lowercase English ASCII id with letters/numbers joined by `-` or `_` (example: `peking-university`). "
+    "Keep the original Unicode spelling in name; do not translate or romanize the display name."
+)
+PREVIOUS_COMPACT_ENTITY_PROMPT = (
+    f"{ENTITY_EXTRACTION_GUIDANCE} {ENTITY_DEFINITION_GUIDANCE} "
+    f"{PREVIOUS_COMPACT_ENTITY_SELECTION_GUIDANCE} {PREVIOUS_COMPACT_ENTITY_IDENTIFIER_GUIDANCE}"
+)
+PREVIOUS_ENTITY_IDENTIFIER_PROMPT = (
+    f"{ENTITY_EXTRACTION_GUIDANCE} {ENTITY_DEFINITION_GUIDANCE} "
+    f"{ENTITY_SELECTION_GUIDANCE} {PREVIOUS_COMPACT_ENTITY_IDENTIFIER_GUIDANCE}"
+)
+PREVIOUS_READABLE_ENTITY_IDENTIFIER_PROMPT = (
+    f"{ENTITY_EXTRACTION_GUIDANCE} {ENTITY_DEFINITION_GUIDANCE} "
+    f"{ENTITY_SELECTION_GUIDANCE} "
+    "Use a short, readable English word combination as id, usually 2-5 meaningful words joined by `-` or `_` "
+    "(examples: `personal-resume`, `staff-management-system`). A single established name such as `neo4j` is allowed. "
+    "Keep the original Unicode spelling in name; do not translate or romanize the display name."
+)
+PREVIOUS_ASCII_READABLE_ENTITY_IDENTIFIER_PROMPT = (
+    f"{ENTITY_EXTRACTION_GUIDANCE} {ENTITY_DEFINITION_GUIDANCE} "
+    f"{ENTITY_SELECTION_GUIDANCE} "
+    "Use a short, readable English ASCII id, usually a 2-5 word combination joined by `-` or `_` "
+    "(examples: `personal-resume`, `staff-management-system`). A single established name such as `neo4j` is allowed. "
+    "Keep the original Unicode spelling in name; do not translate or romanize the display name."
+)
+PREVIOUS_SHORT_ASCII_ENTITY_IDENTIFIER_PROMPT = (
+    f"{ENTITY_EXTRACTION_GUIDANCE} {ENTITY_DEFINITION_GUIDANCE} "
+    f"{ENTITY_SELECTION_GUIDANCE} "
+    "Use a short English ASCII id made from a readable English word combination, usually 2-5 words joined by `-` or `_` "
+    "(examples: `personal-resume`, `staff-management-system`). A single established name such as `neo4j` is allowed. "
+    "Keep the original Unicode spelling in name; do not translate or romanize the display name."
+)
+PREVIOUS_LOWERCASE_READABLE_ENTITY_IDENTIFIER_PROMPT = (
+    f"{ENTITY_EXTRACTION_GUIDANCE} {ENTITY_DEFINITION_GUIDANCE} "
+    f"{ENTITY_SELECTION_GUIDANCE} "
+    "Use a short lowercase English ASCII id made from a readable English word combination, usually 2-5 words joined by `-` or `_` "
+    "(examples: `personal-resume`, `staff-management-system`). A single established name such as `neo4j` is allowed. "
+    "Keep the original Unicode spelling in name; do not translate or romanize the display name."
+)
+ENTITY_IDENTIFIER_GUIDANCE = (
+    "Use a short lowercase English ASCII id made from a readable English word combination, usually 2-5 meaningful words; "
+    "use letters/numbers joined by `-` or `_` "
+    "(examples: `personal-resume`, `staff-management-system`). A single established name such as `neo4j` is allowed. "
+    "Keep the original Unicode spelling in name; do not translate or romanize the display name."
+)
+DEFAULT_ENTITY_PROMPT = (
+    f"{ENTITY_EXTRACTION_GUIDANCE} {ENTITY_DEFINITION_GUIDANCE} "
+    f"{ENTITY_SELECTION_GUIDANCE} {ENTITY_IDENTIFIER_GUIDANCE}"
+)
+ENTITY_IDENTIFIER_PATTERN = re.compile(
+    r"^(?=.*[A-Za-z])[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)*$"
+)
 
 try:
     from neo4j_graphrag.experimental.pipeline.kg_builder import SimpleKGPipeline as Neo4jSimpleKGPipeline
@@ -114,7 +207,8 @@ def embeddings_for_texts(
 
     flat_vectors: list[list[float]] = []
     for start in range(0, len(flat_chunks), EMBEDDING_BATCH_SIZE):
-        flat_vectors.extend(embedder.embed(flat_chunks[start : start + EMBEDDING_BATCH_SIZE]))
+        batch = flat_chunks[start : start + EMBEDDING_BATCH_SIZE]
+        flat_vectors.extend(retry_model_call(lambda: embedder.embed(batch)))
     return [
         _combine_embedding_vectors(flat_vectors[start:end]) for start, end in spans
     ]
@@ -149,6 +243,44 @@ def entity_embedding_text(entity: dict[str, Any]) -> str:
     return "\n".join(part.strip() for part in parts if part.strip())
 
 
+def entity_extraction_chunks(text: str) -> list[str]:
+    content = str(text or "")
+    if not content:
+        return []
+    chunks: list[str] = []
+    start = 0
+    while start < len(content):
+        end = min(start + ENTITY_EXTRACTION_CHUNK_CHARS, len(content))
+        chunks.append(content[start:end])
+        if end == len(content):
+            break
+        start = end - ENTITY_EXTRACTION_CHUNK_OVERLAP
+    return chunks
+
+
+def _neighbor_subgraph(
+    graph: dict[str, Any], node_ids: list[str]
+) -> dict[str, list[dict[str, Any]]]:
+    frontier = {str(node_id) for node_id in node_ids if node_id}
+    edges = [
+        edge
+        for edge in graph.get("edges", [])
+        if str(edge.get("source")) in frontier
+        or str(edge.get("target")) in frontier
+    ]
+    included_ids = set(frontier)
+    for edge in edges:
+        included_ids.update((str(edge.get("source")), str(edge.get("target"))))
+    return {
+        "nodes": [
+            node
+            for node in graph.get("nodes", [])
+            if str(node.get("id")) in included_ids
+        ],
+        "edges": edges,
+    }
+
+
 @dataclass
 class GraphSnapshot:
     project_id: str
@@ -157,6 +289,80 @@ class GraphSnapshot:
     entities: list[dict[str, Any]]
     property_edges: list[dict[str, Any]]
     entity_edges: list[dict[str, Any]]
+
+
+def prune_property_snapshot(
+    store: Any,
+    project_id: str,
+    property_id: str,
+    snapshot_id: str,
+) -> GraphSnapshot:
+    property_graph = store.graph(project_id, "property")
+    entity_graph = store.graph(project_id, "entity")
+    properties = [
+        dict(node)
+        for node in property_graph.get("nodes", [])
+        if str(node.get("id") or "") != property_id
+    ]
+    property_ids = {str(node.get("id") or "") for node in properties}
+    property_edges = [
+        dict(edge)
+        for edge in property_graph.get("edges", [])
+        if str(edge.get("source") or "") in property_ids
+        and str(edge.get("target") or "") in property_ids
+    ]
+
+    entities: list[dict[str, Any]] = []
+    removed_entity_ids: set[str] = set()
+    for node in entity_graph.get("nodes", []):
+        entity = dict(node)
+        entity_id = str(entity.get("id") or "")
+        original_sources = [
+            str(source_id)
+            for source_id in entity.get("source_property_ids", [])
+            if source_id
+        ]
+        original_contexts = [
+            dict(context)
+            for context in entity.get("source_contexts", [])
+            if isinstance(context, dict)
+        ]
+        owned_by_property = property_id in original_sources or any(
+            str(context.get("property_id") or "") == property_id
+            for context in original_contexts
+        )
+        remaining_sources = [
+            source_id for source_id in original_sources if source_id != property_id
+        ]
+        remaining_contexts = [
+            context
+            for context in original_contexts
+            if str(context.get("property_id") or "") != property_id
+        ]
+        if owned_by_property and not remaining_sources and not remaining_contexts:
+            removed_entity_ids.add(entity_id)
+            continue
+        entity["source_property_ids"] = remaining_sources
+        entity["source_contexts"] = remaining_contexts
+        entities.append(entity)
+
+    entity_ids = {str(node.get("id") or "") for node in entities}
+    entity_edges = [
+        dict(edge)
+        for edge in entity_graph.get("edges", [])
+        if str(edge.get("source") or "") in entity_ids
+        and str(edge.get("target") or "") in entity_ids
+        and str(edge.get("source") or "") not in removed_entity_ids
+        and str(edge.get("target") or "") not in removed_entity_ids
+    ]
+    return GraphSnapshot(
+        project_id=project_id,
+        snapshot_id=snapshot_id,
+        properties=properties,
+        entities=entities,
+        property_edges=property_edges,
+        entity_edges=entity_edges,
+    )
 
 
 class LocalGraphStore:
@@ -216,6 +422,11 @@ class LocalGraphStore:
         if kind == "property":
             return {"nodes": snapshot.properties, "edges": snapshot.property_edges, "snapshot_id": snapshot.snapshot_id}
         return {"nodes": snapshot.entities, "edges": normalize_entity_edges(snapshot.entities, snapshot.entity_edges), "snapshot_id": snapshot.snapshot_id}
+
+    def neighbors(
+        self, project_id: str, kind: str, node_ids: list[str]
+    ) -> dict[str, list[dict[str, Any]]]:
+        return _neighbor_subgraph(self.graph(project_id, kind), node_ids)
 
 
 class Neo4jGraphStore:
@@ -323,6 +534,52 @@ class Neo4jGraphStore:
             edges = normalize_entity_edges(nodes, edges)
         return {"nodes": nodes, "edges": edges, "snapshot_id": snapshot_id or "neo4j-active"}
 
+    def neighbors(
+        self, project_id: str, kind: str, node_ids: list[str]
+    ) -> dict[str, list[dict[str, Any]]]:
+        if not node_ids:
+            return {"nodes": [], "edges": []}
+        if not self.driver:
+            return self.local.neighbors(project_id, kind, node_ids)
+        label = "Property" if kind == "property" else "Entity"
+        database = (
+            self.settings.neo4j_property_database
+            if kind == "property"
+            else self.settings.neo4j_entity_database
+        )
+        query = (
+            f"MATCH (seed:{label} {{project_id:$project}})-[r]-(neighbor:{label} {{project_id:$project}}) "
+            "WHERE seed.id IN $node_ids "
+            "RETURN seed, neighbor, startNode(r).id AS source, "
+            "endNode(r).id AS target, coalesce(r.type, type(r)) AS type"
+        )
+        nodes_by_id: dict[str, dict[str, Any]] = {}
+        edges: list[dict[str, Any]] = []
+        seen_edges: set[tuple[str, str, str]] = set()
+        with self.driver.session(database=database) as session:
+            rows = session.run(
+                query,
+                project=project_id,
+                node_ids=[str(node_id) for node_id in node_ids],
+            )
+            for row in rows:
+                for key in ("seed", "neighbor"):
+                    node = dict(row[key])
+                    nodes_by_id[str(node.get("id"))] = node
+                edge = {
+                    "source": str(row["source"]),
+                    "target": str(row["target"]),
+                    "type": str(row["type"]),
+                }
+                edge_key = (edge["source"], edge["target"], edge["type"])
+                if edge_key not in seen_edges:
+                    seen_edges.add(edge_key)
+                    edges.append(edge)
+        nodes = list(nodes_by_id.values())
+        if kind == "entity":
+            edges = normalize_entity_edges(nodes, edges)
+        return {"nodes": nodes, "edges": edges}
+
 
 def extract_entities(documents: list[dict[str, str]], current_entities: list[dict[str, Any]] | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """A deterministic local GraphRAG-compatible result; replaceable with KG Builder in production."""
@@ -331,17 +588,32 @@ def extract_entities(documents: list[dict[str, str]], current_entities: list[dic
     for document in documents:
         for name in _candidate_entity_terms(document["text"], current_by_id):
             existing = current_by_id.get(name.lower(), {})
-            entity_names.setdefault(name, {"id": name.lower(), "name": name, "project_id": document["project_id"], "source_property_ids": [], **({"definition": existing["definition"]} if existing.get("definition") else {})})
+            entity_names.setdefault(name, {"id": _local_entity_identifier(name), "name": name, "project_id": document["project_id"], "source_property_ids": [], **({"definition": existing["definition"]} if existing.get("definition") else {})})
             entity = entity_names[name]
             if document["property_id"] not in entity["source_property_ids"]:
                 entity["source_property_ids"].append(document["property_id"])
-            _append_entity_contexts(entity, document, name)
+            context_document = {
+                **document,
+                "text": str(
+                    document.get("original_text") or document.get("text") or ""
+                ),
+            }
+            _append_entity_contexts(entity, context_document, name)
     entities = [
         {**item, "embedding": embedding(entity_embedding_text(item))}
         for item in entity_names.values()
     ]
     edges = _typed_entity_edges(documents, list(entity_names))
     return entities, edges
+
+
+def _local_entity_identifier(name: str) -> str:
+    words = re.findall(r"[A-Za-z0-9]+", str(name or "").casefold())
+    candidate = "-".join(words)
+    if candidate and ENTITY_IDENTIFIER_PATTERN.fullmatch(candidate):
+        return candidate
+    digest = hashlib.sha256(str(name or "entity").encode("utf-8")).hexdigest()[:12]
+    return f"entity-{digest}"
 
 
 _ENTITY_STOPWORDS = {"the", "and", "for", "from", "with", "this", "that", "file", "document", "content", "property", "uses", "using", "owns", "has", "have", "into", "will", "should", "about", "when", "where", "which"}
@@ -529,6 +801,85 @@ def _append_entity_contexts(
             return
 
 
+def _merge_extracted_entity_graph(
+    current_entities: list[dict[str, Any]],
+    current_edges: list[dict[str, Any]],
+    incoming_entities: list[dict[str, Any]],
+    incoming_edges: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    entities_by_id = {
+        str(entity.get("id") or ""): dict(entity)
+        for entity in current_entities
+        if entity.get("id")
+    }
+    entity_order = list(entities_by_id)
+    for incoming in incoming_entities:
+        entity_id = str(incoming.get("id") or "")
+        if not entity_id:
+            continue
+        current = entities_by_id.get(entity_id, {})
+        merged = {**current, **incoming, "id": entity_id}
+        for field in ("name", "definition", "project_id"):
+            if current.get(field):
+                merged[field] = current[field]
+        merged["source_property_ids"] = list(
+            dict.fromkeys(
+                [
+                    *(current.get("source_property_ids") or []),
+                    *(incoming.get("source_property_ids") or []),
+                ]
+            )
+        )
+        contexts: list[dict[str, str]] = []
+        seen_contexts: set[tuple[str, str]] = set()
+        used_words = 0
+        for context in [
+            *(current.get("source_contexts") or []),
+            *(incoming.get("source_contexts") or []),
+        ]:
+            if not isinstance(context, dict):
+                continue
+            property_id = str(context.get("property_id") or "")
+            text = str(context.get("text") or "").strip()
+            key = (property_id, text)
+            word_count = _context_word_count(text)
+            if (
+                not property_id
+                or not text
+                or key in seen_contexts
+                or used_words + word_count > ENTITY_CONTEXT_WORD_LIMIT
+            ):
+                continue
+            contexts.append({"property_id": property_id, "text": text})
+            seen_contexts.add(key)
+            used_words += word_count
+        merged["source_contexts"] = contexts
+        merged["embedding"] = embedding(entity_embedding_text(merged))
+        entities_by_id[entity_id] = merged
+        if entity_id not in entity_order:
+            entity_order.append(entity_id)
+
+    edges_by_endpoints = {
+        (str(edge.get("source") or ""), str(edge.get("target") or "")): dict(edge)
+        for edge in current_edges
+        if edge.get("source") and edge.get("target")
+    }
+    edge_order = list(edges_by_endpoints)
+    for edge in incoming_edges:
+        source = str(edge.get("source") or "")
+        target = str(edge.get("target") or "")
+        if not source or not target:
+            continue
+        key = (source, target)
+        edges_by_endpoints[key] = dict(edge)
+        if key not in edge_order:
+            edge_order.append(key)
+    return (
+        [entities_by_id[entity_id] for entity_id in entity_order],
+        [edges_by_endpoints[key] for key in edge_order],
+    )
+
+
 class GraphRAGBuilder:
     """GraphRAG contract with a local deterministic mode and an optional Neo4j KG Builder backend."""
 
@@ -552,7 +903,7 @@ class GraphRAGBuilder:
         current_entities: list[dict[str, Any]] | None = None,
         incremental: bool = False,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        text_documents = [document for document in documents if document.get("property_type") != "image"]
+        text_documents = [document for document in documents if document.get("text")]
         self.last_documents = [document["property_id"] for document in text_documents]
         self.last_entity_inventory = [
             {
@@ -568,28 +919,89 @@ class GraphRAGBuilder:
             if item.get("id")
         ]
         if self.llm and text_documents:
-            entities, edges = self._build_with_llm(
-                text_documents, incremental=incremental
-            )
+            if any(
+                len(document["text"]) > ENTITY_EXTRACTION_CHUNK_CHARS
+                for document in text_documents
+            ):
+                original_inventory = list(self.last_entity_inventory)
+                try:
+                    entities, edges = self._build_chunked_with_llm(
+                        text_documents,
+                        incremental=incremental,
+                        original_inventory=original_inventory,
+                    )
+                finally:
+                    self.last_entity_inventory = original_inventory
+            else:
+                entities, edges = self._build_with_llm(
+                    text_documents, incremental=incremental
+                )
         else:
             entities, edges = extract_entities(text_documents, self.last_entity_inventory)
         if embedder and entities:
-            vectors = embedder.embed(
-                [entity_embedding_text(entity) for entity in entities]
-            )
+            entity_texts = [entity_embedding_text(entity) for entity in entities]
+            vectors = retry_model_call(lambda: embedder.embed(entity_texts))
             entities = [{**entity, "embedding": vector} for entity, vector in zip(entities, vectors)]
+        return entities, edges
+
+    def _build_chunked_with_llm(
+        self,
+        documents: list[dict[str, str]],
+        *,
+        incremental: bool,
+        original_inventory: list[dict[str, str]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        entities: list[dict[str, Any]] = []
+        edges: list[dict[str, Any]] = []
+        first_call = True
+        for document in documents:
+            for chunk in entity_extraction_chunks(document["text"]):
+                inventory_by_id = {
+                    str(item.get("id") or ""): dict(item)
+                    for item in original_inventory
+                    if item.get("id")
+                }
+                for entity in entities:
+                    entity_id = str(entity.get("id") or "")
+                    if entity_id:
+                        inventory_by_id[entity_id] = {
+                            "id": entity_id,
+                            "name": str(entity.get("name") or ""),
+                            "definition": str(entity.get("definition") or ""),
+                        }
+                self.last_entity_inventory = list(inventory_by_id.values())
+                chunk_document = {**document, "text": chunk}
+                delta_entities, delta_edges = self._build_with_llm(
+                    [chunk_document],
+                    incremental=incremental or not first_call,
+                )
+                entities, edges = _merge_extracted_entity_graph(
+                    entities,
+                    edges,
+                    delta_entities,
+                    delta_edges,
+                )
+                first_call = False
         return entities, edges
 
     def _build_with_llm(
         self, documents: list[dict[str, str]], incremental: bool = False
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        return retry_model_call(
+            lambda: self._build_with_llm_once(documents, incremental)
+        )
+
+    def _build_with_llm_once(
+        self, documents: list[dict[str, str]], incremental: bool = False
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         inventory = self.last_entity_inventory or []
         definition_guidance = "" if ENTITY_DEFINITION_GUIDANCE in self.prompt else f"{ENTITY_DEFINITION_GUIDANCE} "
         selection_guidance = "" if ENTITY_SELECTION_GUIDANCE in self.prompt else f"{ENTITY_SELECTION_GUIDANCE} "
+        identifier_guidance = "" if ENTITY_IDENTIFIER_GUIDANCE in self.prompt else f"{ENTITY_IDENTIFIER_GUIDANCE} "
         document_payload = [
             {
                 "i": index,
-                "text": document["text"][:12000],
+                "text": document["text"],
             }
             for index, document in enumerate(documents)
         ]
@@ -606,55 +1018,55 @@ class GraphRAGBuilder:
         )
         if incremental:
             scope_guidance = (
-                "For this incremental new-property call, override any earlier requirement to rebuild the complete graph. "
-                "Inspect only the supplied new property documents. Treat the current entity inventory as entities already "
-                "stored in the graph, not as source documents. Reuse an existing ID when the new documents mention the same "
-                "entity. Do not re-extract unrelated existing entities and do not echo inventory entries that the new "
-                "documents do not mention. Return only entities supported by the new documents and relationships newly "
-                "supported or changed by them. "
+                "Incremental call: inspect only supplied new text; inventory is reference data. Reuse matching IDs and "
+                "return only mentioned entities and newly supported or changed relations. "
             )
             endpoint_guidance = (
-                "Edge endpoints may use returned entity IDs or IDs from the current entity inventory. "
+                "Edges may reference returned or inventory IDs. "
             )
         else:
             scope_guidance = (
-                "Extract the complete entity graph from all current property documents below. "
-                "Always rebuild the complete entity relationship set on every call, so previous relations may be removed "
-                "or assigned a different type when the current documents support it. "
+                "Full call: rebuild entities and relations from all supplied current text; omit unsupported old relations. "
             )
-            endpoint_guidance = "Edge endpoints must use returned entity IDs. "
+            endpoint_guidance = "Edges must use returned IDs. "
         prompt = (
             f"{configured_prompt}\n\n"
             f"{scope_guidance}"
             f"{definition_guidance}"
             f"{selection_guidance}"
-            "For every supported edge, choose the most appropriate relation type for its actual meaning and direction. "
-            "Relation types are not limited to a predefined relation list. "
-            "Return compact JSON with arrays named entities and edges. Encode each entity as "
-            '["id","name","definition",[0]] where the final array contains document i values. '
-            'Encode each edge as ["source","target","type"]. '
+            f"{identifier_guidance}"
+            "Use only evidence-backed directed relations with a specific type; do not force connectivity. "
+            "Return compact JSON: entities as [\"id\",\"name\",\"definition\",[document_i]] and edges as "
+            "[\"source\",\"target\",\"type\"]. "
             f"{endpoint_guidance}"
-            "Do not return Markdown or explanatory text.\n"
+            "No Markdown or commentary.\n"
             f"{inventory_section}"
             "Current property documents:\n"
             f"{json.dumps(document_payload, ensure_ascii=False, separators=(',', ':'))}"
         )
         raw = self.llm.complete(
-            [
-                {"role": "system", "content": "You are DocSeek Entity Extraction Agent."},
+            localized_messages([
+                {"role": "system", "content": ENTITY_EXTRACTION_SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
-            ],
+            ]),
             temperature=0.1,
             max_tokens=ENTITY_GRAPH_MAX_TOKENS,
         )
         try:
             parsed = parse_json_object(raw)
         except ValueError as exc:
-            raise ValueError("entity extraction provider returned invalid JSON") from exc
+            raise attach_model_response(
+                ValueError("entity extraction provider returned invalid JSON"), raw
+            ) from exc
         raw_entities = parsed.get("entities", []) if isinstance(parsed, dict) else []
         raw_edges = parsed.get("edges", []) if isinstance(parsed, dict) else []
         if not isinstance(raw_entities, list) or not isinstance(raw_edges, list):
-            raise ValueError("entity extraction provider returned invalid graph arrays")
+            raise attach_model_response(
+                ValueError(
+                    "entity extraction provider returned invalid graph arrays"
+                ),
+                raw,
+            )
 
         project_id = documents[0]["project_id"]
         property_ids = {document["property_id"] for document in documents}
@@ -674,6 +1086,13 @@ class GraphRAGBuilder:
             name = str(raw_name or "").strip()
             if not entity_id or not name:
                 continue
+            if not ENTITY_IDENTIFIER_PATTERN.fullmatch(entity_id):
+                raise attach_model_response(
+                    ValueError(
+                        "entity extraction provider returned an invalid entity id"
+                    ),
+                    raw,
+                )
             source_ids = []
             if isinstance(raw_source_ids, list):
                 for source_id in raw_source_ids:
@@ -693,7 +1112,13 @@ class GraphRAGBuilder:
             }
             for document in documents:
                 if document["property_id"] in source_ids:
-                    _append_entity_contexts(entity, document, name)
+                    context_document = {
+                        **document,
+                        "text": str(
+                            document.get("original_text") or document.get("text") or ""
+                        ),
+                    }
+                    _append_entity_contexts(entity, context_document, name)
             entities.append(
                 {
                     **entity,
@@ -723,7 +1148,10 @@ class GraphRAGBuilder:
             target = str(raw_target or "")
             relation_type = normalize_relation_type(raw_type)
             if source not in valid_edge_ids or target not in valid_edge_ids or source == target or not relation_type:
-                raise ValueError("entity extraction provider returned an invalid edge")
+                raise attach_model_response(
+                    ValueError("entity extraction provider returned an invalid edge"),
+                    raw,
+                )
             edge = {"source": source, "target": target, "type": relation_type}
             if edge not in edges:
                 edges.append(edge)
@@ -738,7 +1166,7 @@ class GraphRAGBuilder:
         """
         if Neo4jSimpleKGPipeline is None:
             raise RuntimeError("neo4j-graphrag is not installed")
-        text_documents = [document for document in documents if document.get("property_type") != "image"]
+        text_documents = [document for document in documents if document.get("text")]
         self.last_documents = [document["property_id"] for document in text_documents]
         self.last_entity_inventory = [{"id": str(item.get("id", "")), "definition": str(item.get("definition", ""))} for item in current_entities or [] if item.get("id")]
         inventory = "\n".join(f"- {item['id']}: {item['definition']}" for item in self.last_entity_inventory) or "(none)"

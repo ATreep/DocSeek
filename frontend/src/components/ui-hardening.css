@@ -62,13 +62,6 @@
   background: #1e7a5a;
 }
 
-.top-create-button {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  white-space: nowrap;
-}
-
 .workspace {
   transition: grid-template-columns 160ms ease;
 }
@@ -90,15 +83,6 @@
 }
 
 @media (max-width: 800px) {
-  .top-create-button {
-    font-size: 0;
-    padding-inline: 4px;
-  }
-
-  .top-create-button svg {
-    margin: 0;
-  }
-
   .workspace,
   .workspace-sidebar-collapsed {
     grid-template-columns: 1fr;
