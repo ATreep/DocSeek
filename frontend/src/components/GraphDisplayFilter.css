@@ -1,0 +1,49 @@
+.graph-filter-badge {
+  box-sizing: border-box !important;
+  display: grid !important;
+  place-items: center !important;
+  width: 18px !important;
+  min-width: 18px !important;
+  height: 18px !important;
+  padding: 0 !important;
+  border: 2px solid #fff !important;
+  border-radius: 50% !important;
+  font: 700 8px/1 var(--sans) !important;
+  white-space: nowrap !important;
+}
+
+.graph-filter-badge.large {
+  width: 22px !important;
+  min-width: 22px !important;
+  border-radius: 9px !important;
+}
+
+.graph-filter-importance {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 7px 12px 9px;
+  color: #4f626c;
+  font-size: 11px;
+  font-weight: 650;
+  text-align: left;
+}
+
+.graph-filter-importance select {
+  min-width: 112px;
+  height: 30px;
+  border: 1px solid #d8e1e3;
+  border-radius: 4px;
+  background: #fbfcfc;
+  color: #52656e;
+  padding: 0 24px 0 8px;
+  font: 650 10px var(--sans);
+  outline-color: #1e7a5a;
+  cursor: pointer;
+}
+
+.graph-filter-importance select:hover {
+  border-color: #b6c8c2;
+  background: #f3f8f6;
+}

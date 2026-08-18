@@ -6,7 +6,23 @@ from .config import Settings
 from .db import connect
 from .security import CAPABILITIES, hash_password
 from .services.catalog import PropertyCatalog
-from .services.graph_store import DEFAULT_ENTITY_PROMPT, DEFAULT_ENTITY_SCHEMA, PREVIOUS_CONCISE_DEFINITION_ENTITY_PROMPT, PREVIOUS_DYNAMIC_RELATION_ENTITY_PROMPT, PREVIOUS_ENTITY_PROMPT, PREVIOUS_FIXED_RELATION_ENTITY_PROMPT
+from .services.graph_store import (
+    DEFAULT_ENTITY_PROMPT,
+    DEFAULT_ENTITY_SCHEMA,
+    PREVIOUS_ASCII_READABLE_ENTITY_IDENTIFIER_PROMPT,
+    PREVIOUS_COMPACT_ENTITY_PROMPT,
+    PREVIOUS_CONCISE_DEFINITION_ENTITY_PROMPT,
+    PREVIOUS_DEFAULT_ENTITY_PROMPT,
+    PREVIOUS_DYNAMIC_RELATION_ENTITY_PROMPT,
+    PREVIOUS_ENTITY_IDENTIFIER_PROMPT,
+    PREVIOUS_ENTITY_PROMPT,
+    PREVIOUS_FIXED_RELATION_ENTITY_PROMPT,
+    PREVIOUS_LOWERCASE_READABLE_ENTITY_IDENTIFIER_PROMPT,
+    PREVIOUS_READABLE_ENTITY_IDENTIFIER_PROMPT,
+    PREVIOUS_SELECTION_ENTITY_PROMPT,
+    PREVIOUS_SHORT_ASCII_ENTITY_IDENTIFIER_PROMPT,
+)
+from .services.retrieval_limits import RETRIEVAL_LIMIT_DEFAULTS
 
 
 def seed_defaults(settings: Settings) -> None:
@@ -41,6 +57,14 @@ def seed_defaults(settings: Settings) -> None:
                 PREVIOUS_FIXED_RELATION_ENTITY_PROMPT,
                 PREVIOUS_DYNAMIC_RELATION_ENTITY_PROMPT,
                 PREVIOUS_CONCISE_DEFINITION_ENTITY_PROMPT,
+                PREVIOUS_SELECTION_ENTITY_PROMPT,
+                PREVIOUS_DEFAULT_ENTITY_PROMPT,
+                PREVIOUS_COMPACT_ENTITY_PROMPT,
+                PREVIOUS_ENTITY_IDENTIFIER_PROMPT,
+                PREVIOUS_READABLE_ENTITY_IDENTIFIER_PROMPT,
+                PREVIOUS_ASCII_READABLE_ENTITY_IDENTIFIER_PROMPT,
+                PREVIOUS_SHORT_ASCII_ENTITY_IDENTIFIER_PROMPT,
+                PREVIOUS_LOWERCASE_READABLE_ENTITY_IDENTIFIER_PROMPT,
                 (
                     "Only extract key nouns from the property content, such as human names, product names, "
                     "technology stacks, brand names, and company names. Prioritize nouns mentioned many times. "
@@ -54,6 +78,12 @@ def seed_defaults(settings: Settings) -> None:
             existing = db.execute("SELECT value FROM system_config WHERE key=?", (key,)).fetchone()
             if not existing or existing["value"] in legacy_values[key]:
                 db.execute("INSERT INTO system_config(key,value,updated_at) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at", (key, value, now))
+        for key, value in RETRIEVAL_LIMIT_DEFAULTS.items():
+            db.execute(
+                "INSERT INTO system_config(key,value,updated_at) VALUES (?,?,?) "
+                "ON CONFLICT(key) DO NOTHING",
+                (key, str(value), now),
+            )
     catalog = PropertyCatalog(settings)
     for catalog_path in settings.projects_dir.glob("*/jobs/property-catalog.json"):
         catalog.list(catalog_path.parent.parent.name)

@@ -7,36 +7,52 @@ afterEach(cleanup)
 
 describe('PropertyOverlay preview', () => {
   it('renders an uploaded image from the authenticated raw endpoint', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, blob: async () => new Blob(['image']) }))
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (url: string) => (
+      url.endsWith('/content')
+        ? { ok: true, text: async () => 'A system architecture diagram.' }
+        : { ok: true, blob: async () => new Blob(['image']) }
+    )))
     vi.stubGlobal('URL', { ...URL, createObjectURL: vi.fn(() => 'blob:image-preview'), revokeObjectURL: vi.fn() })
     render(<PropertyOverlay property={{ id: 'p1', project_id: 'project-1', filename: 'diagram.png', property_type: 'image', relative_path: 'properties/diagram.png', status: 'active' }} onClose={() => undefined} />)
     await waitFor(() => expect(screen.getByRole('img', { name: 'diagram.png' }).getAttribute('src')).toBe('blob:image-preview'))
+    expect(await screen.findByText('A system architecture diagram.')).toBeTruthy()
+  })
+
+  it('shows converted pure text instead of raw bytes for a non-Markdown property', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      text: async () => 'Product | Revenue\nAtlas | 125',
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    render(<PropertyOverlay property={{ id: 'sheet', project_id: 'project-1', filename: 'revenue.xlsx', property_type: 'spreadsheet', relative_path: 'properties/revenue.xlsx', status: 'active' }} onClose={() => undefined} />)
+
+    expect(await screen.findByText(/Product \| Revenue/)).toBeTruthy()
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/projects/project-1/properties/sheet/content',
+      expect.objectContaining({ headers: expect.any(Object) }),
+    )
   })
 
   it('exposes lock-aware property mutation actions', () => {
-    const onReplace = vi.fn()
-    const view = render(<PropertyOverlay property={{ id: 'p1', project_id: 'project-1', filename: 'diagram.png', property_type: 'image', relative_path: 'properties/diagram.png', status: 'active' }} locked={false} onClose={() => undefined} onRename={() => undefined} onReplace={onReplace} onRemove={() => undefined} />)
+    const view = render(<PropertyOverlay property={{ id: 'p1', project_id: 'project-1', filename: 'diagram.png', property_type: 'image', relative_path: 'properties/diagram.png', status: 'active' }} locked={false} onClose={() => undefined} onRename={() => undefined} onRemove={() => undefined} />)
     const actions = within(view.container.querySelector('.overlay-actions') as HTMLElement)
     expect(actions.getAllByRole('button').map(button => button.getAttribute('aria-label'))).toEqual([
       'Rename property',
-      'Replace property',
       'Remove property',
     ])
     expect(screen.getByRole('button', { name: 'Rename property' }).hasAttribute('disabled')).toBe(false)
-    expect(screen.getByRole('button', { name: 'Replace property' }).hasAttribute('disabled')).toBe(false)
+    expect(screen.queryByRole('button', { name: 'Replace property' })).toBeNull()
     expect(screen.getByRole('button', { name: 'Remove property' }).hasAttribute('disabled')).toBe(false)
-    render(<PropertyOverlay property={{ id: 'p2', project_id: 'project-1', filename: 'locked.txt', property_type: 'text', relative_path: 'properties/locked.txt', status: 'queued' }} locked onClose={() => undefined} onRename={() => undefined} onReplace={() => undefined} onRemove={() => undefined} />)
+    render(<PropertyOverlay property={{ id: 'p2', project_id: 'project-1', filename: 'locked.txt', property_type: 'text', relative_path: 'properties/locked.txt', status: 'queued' }} locked onClose={() => undefined} onRename={() => undefined} onRemove={() => undefined} />)
     expect(screen.getAllByRole('button', { name: 'Rename property' })[1].hasAttribute('disabled')).toBe(true)
-    expect(screen.getAllByRole('button', { name: 'Replace property' })[1].hasAttribute('disabled')).toBe(true)
+    expect(screen.queryByRole('button', { name: 'Replace property' })).toBeNull()
   })
 
-  it('opens property replacement from the preview action row', async () => {
-    const onReplace = vi.fn()
-    render(<PropertyOverlay property={{ id: 'p1', project_id: 'project-1', filename: 'notes.md', property_type: 'markdown', relative_path: 'properties/notes.md', status: 'active' }} onClose={() => undefined} onRename={() => undefined} onReplace={onReplace} />)
+  it('does not expose property replacement from the preview action row', () => {
+    render(<PropertyOverlay property={{ id: 'p1', project_id: 'project-1', filename: 'notes.md', property_type: 'markdown', relative_path: 'properties/notes.md', status: 'active' }} onClose={() => undefined} onRename={() => undefined} />)
 
-    await userEvent.click(screen.getByRole('button', { name: 'Replace property' }))
-
-    expect(onReplace).toHaveBeenCalledTimes(1)
+    expect(screen.queryByRole('button', { name: 'Replace property' })).toBeNull()
   })
 
   it('does not render generated filename suggestions as property attributes', () => {

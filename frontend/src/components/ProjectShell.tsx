@@ -1,5 +1,4 @@
 import {
-  ChangeEvent,
   FormEvent,
   lazy,
   Suspense,
@@ -8,6 +7,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { useDocSeekTranslation } from "../i18n";
 import {
   BrainCircuit,
   Bug,
@@ -27,17 +27,22 @@ import {
   Upload,
   X,
 } from "lucide-react";
-import { Project, Property, PropertyImportConfirmResult, PropertyUploadResult, request, streamRequest, logout } from "../api";
+import { ConfirmedPropertyImport, Project, Property, PropertyImportBatchConfirmResult, PropertyImportBatchItem, PropertyImportBatchResult, type PropertyImportBatchStreamEvent, type RegroupConfirmationItem, type RegroupProposal, request, streamRequest, logout } from "../api";
 import GraphCanvas from "./GraphCanvas";
 import PropertyOverlay from "./PropertyOverlay";
 import PropertyRenameDialog from "./PropertyRenameDialog";
 import RegroupPropertiesDialog from "./RegroupPropertiesDialog";
+import RegroupConfirmationDialog from "./RegroupConfirmationDialog";
 import ImportPropertyDialog from "./ImportPropertyDialog";
+import ProviderConfigurationAlert, {
+  type MissingProviderRoute,
+} from "./ProviderConfigurationAlert";
 import ProcessingErrorDialog from "./ProcessingErrorDialog";
 import RelationOverlay from "./RelationOverlay";
 import ProjectEmptyState from "./ProjectEmptyState";
 import EntityOverlay, { type Entity } from "./EntityOverlay";
 import AccountMenu from "./AccountMenu";
+import LanguageSwitcher from "./LanguageSwitcher";
 import type { ChatCitation, ChatMessage } from "./AIQueryChat";
 import PropertyTree from "./PropertyTree";
 import SettingsPanel from "./SettingsPanel";
@@ -50,6 +55,7 @@ import { resolveAIQueryCitation } from "../ai-query-citation";
 import {
   processingElapsedLabel,
   processingRefreshKey,
+  processingStageDetail,
   processingStageLabel,
   shouldRefreshProjectCatalog,
 } from "../processing-status";
@@ -63,8 +69,22 @@ import {
   type GraphData,
   type GraphRelationDetail,
 } from "../graph-relations";
+import type { GraphDisplaySelection } from "../graph-display-filter";
 
 const AIQueryChat = lazy(() => import("./AIQueryChat"));
+
+function droppedPropertyFiles(dataTransfer: DataTransfer): File[] {
+  const items = Array.from(dataTransfer.items || []);
+  if (!items.length) return Array.from(dataTransfer.files || []);
+
+  return items.flatMap((item) => {
+    if (item.kind !== "file") return [];
+    const entry = item.webkitGetAsEntry?.();
+    if (entry?.isDirectory) return [];
+    const file = item.getAsFile();
+    return file ? [file] : [];
+  });
+}
 
 type Graph = GraphData;
 type ProcessingStatus = {
@@ -76,6 +96,7 @@ type ProcessingStatus = {
   timings?: Record<string, number>;
   error?: string | null;
   error_detail?: string | null;
+  llm_response?: string | null;
   job_id?: string | null;
   candidate_snapshot?: string | null;
   active_snapshot?: string | null;
@@ -88,12 +109,23 @@ type PropertyRenameTarget = {
 };
 type PropertyImportTarget = {
   projectId: string;
-  importId: string;
-  originalFilename: string;
-  defaultFilename: string;
+  batchId: string;
+  items: PropertyImportBatchItem[];
+};
+type ImportPreparationProgress = {
+  phase: "uploading" | "generating" | "naming";
+  index: number;
+  total: number;
+  filename: string;
+};
+type ImportProviderReadiness = {
+  ready: boolean;
+  missing_routes: MissingProviderRoute[];
+  can_configure: boolean;
 };
 
 export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
+  const { t } = useDocSeekTranslation();
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectCatalogLoaded, setProjectCatalogLoaded] = useState(false);
   const [project, setProject] = useState<Project | null>(null);
@@ -103,6 +135,10 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
     nodes: [],
     edges: [],
   });
+  const [propertyGraphDisplaySelection, setPropertyGraphDisplaySelection] =
+    useState<GraphDisplaySelection>({ groupPaths: [], propertyIds: [] });
+  const [entityGraphDisplaySelection, setEntityGraphDisplaySelection] =
+    useState<GraphDisplaySelection>({ groupPaths: [], propertyIds: [] });
   const [tab, setTab] = useState<"property" | "entity" | "query">("property");
   const [selected, setSelected] = useState<Property | null>(null);
   const [selectedEntity, setSelectedEntity] = useState<Entity | null>(null);
@@ -118,9 +154,18 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
   const [mcpOpen, setMcpOpen] = useState(false);
   const [mcpEndpoint, setMcpEndpoint] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsFocusRoute, setSettingsFocusRoute] = useState<string | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [uploadOpen, setUploadOpen] = useState(false);
+  const [uploadFiles, setUploadFiles] = useState<File[]>([]);
+  const [uploadDragActive, setUploadDragActive] = useState(false);
+  const [providerReadiness, setProviderReadiness] =
+    useState<ImportProviderReadiness | null>(null);
+  const [checkingProviders, setCheckingProviders] = useState(false);
   const [importTarget, setImportTarget] = useState<PropertyImportTarget | null>(null);
+  const [regroupProposal, setRegroupProposal] = useState<RegroupProposal | null>(null);
+  const [importPreparation, setImportPreparation] =
+    useState<ImportPreparationProgress | null>(null);
   const [renameTarget, setRenameTarget] = useState<PropertyRenameTarget | null>(null);
   const [regroupOpen, setRegroupOpen] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -129,7 +174,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
   const [processingStatus, setProcessingStatus] =
     useState<ProcessingStatus | null>(null);
   const processingViewRef = useRef<string | null>(null);
-  const replacementInput = useRef<HTMLInputElement>(null);
+  const uploadInput = useRef<HTMLInputElement>(null);
 
   async function refreshProjects() {
     const data = await request<Project[]>("/projects");
@@ -175,7 +220,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
       .catch((err) => {
         if (disposed) return;
         setChatHistoryProjectId(projectId);
-        setError(err instanceof Error ? err.message : "Unable to load AI Query history");
+        setError(err instanceof Error ? err.message : t("Unable to load AI Query history"));
       });
     return () => {
       disposed = true;
@@ -186,6 +231,10 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
     if (tab !== "property") setSelected(null);
     setSelectedRelation(null);
   }, [tab]);
+  useEffect(() => {
+    setPropertyGraphDisplaySelection({ groupPaths: [], propertyIds: [] });
+    setEntityGraphDisplaySelection({ groupPaths: [], propertyIds: [] });
+  }, [project?.id]);
   useEffect(() => {
     if (!project) {
       setProcessingStatus(null);
@@ -235,6 +284,9 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
   const processingElapsed = processingElapsedLabel(
     processingStatus?.stage_started_at,
   );
+  const processingDetail = processingStatus?.stage_detail
+    ? processingStageDetail(processingStatus.stage, processingStatus.stage_detail)
+    : null;
   const selectedPropertyEntities = useMemo(() => {
     if (!selected) return [];
     return entitiesOwnedByProperty(selected.id, entityGraph.nodes as Entity[]);
@@ -250,10 +302,10 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
 
   async function createProject(providedName?: string) {
     if (!canLeaveProject(processing)) {
-      setError("Project navigation is locked while the candidate build is processing.");
+      setError(t("Project navigation is locked while the candidate build is processing."));
       return false;
     }
-    const name = providedName ?? window.prompt("Project name");
+    const name = providedName ?? window.prompt(t("Project name"));
     if (!name?.trim()) return false;
     try {
       const created = await request<Project>("/projects", {
@@ -264,13 +316,43 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
       setProject(created);
       return true;
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Unable to create project");
+      setError(err instanceof Error ? err.message : t("Unable to create project"));
       return false;
     }
   }
   async function signOut() {
     await logout();
     onLogout();
+  }
+  async function beginPropertyImport() {
+    setCheckingProviders(true);
+    setError("");
+    try {
+      const readiness = await request<ImportProviderReadiness>(
+        "/system/import-provider-readiness",
+      );
+      if (!readiness.ready) {
+        setProviderReadiness(readiness);
+        return;
+      }
+      setUploadFiles([]);
+      setUploadDragActive(false);
+      setUploadOpen(true);
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : t("Unable to check model provider configuration"),
+      );
+    } finally {
+      setCheckingProviders(false);
+    }
+  }
+
+  function openProviderSettings() {
+    setSettingsFocusRoute(providerReadiness?.missing_routes[0]?.key || null);
+    setProviderReadiness(null);
+    setSettingsOpen(true);
   }
   async function runSearch(event: FormEvent) {
     event.preventDefault();
@@ -284,7 +366,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
         }),
       );
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Search failed");
+      setError(err instanceof Error ? err.message : t("Search failed"));
     } finally {
       setBusy(false);
     }
@@ -314,7 +396,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
           if (streamEvent.type === "error") setError(streamEvent.message);
         });
     } catch (err) {
-      const message = err instanceof Error ? err.message : "AI Query failed";
+      const message = err instanceof Error ? err.message : t("AI Query failed");
       setChatMessages((current) =>
         applyAIQueryEvent(current, { type: "error", message }),
       );
@@ -332,7 +414,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
       });
       setChatMessages([]);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Unable to clear AI Query history");
+      setError(err instanceof Error ? err.message : t("Unable to clear AI Query history"));
     } finally {
       setBusy(false);
     }
@@ -340,25 +422,72 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
   async function submitUpload(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!project) return;
-    const form = new FormData(event.currentTarget);
-    const uploadedFile = form.get("file");
-    const currentFilename = uploadedFile instanceof File ? uploadedFile.name : "property";
+    const selectedFiles = uploadFiles;
+    if (!selectedFiles.length) return;
+    const formValues = new FormData(event.currentTarget);
+    const form = new FormData();
+    selectedFiles.forEach((file) => form.append("files", file));
+    form.append("comment", String(formValues.get("comment") || ""));
     setBusy(true);
+    setImportPreparation({
+      phase: "uploading",
+      index: 0,
+      total: selectedFiles.length,
+      filename: "",
+    });
     try {
-      const result = await request<PropertyUploadResult>(`/projects/${project.id}/properties`, {
-        method: "POST",
-        body: form,
-      });
+      const completedResults: PropertyImportBatchResult[] = [];
+      let streamError = "";
+      await streamRequest<PropertyImportBatchStreamEvent>(
+        `/projects/${project.id}/property-import-batches/stream`,
+        { method: "POST", body: form },
+        (streamEvent) => {
+          if (streamEvent.type === "batch_started") {
+            setImportPreparation((current) => ({
+              phase: current?.phase || "uploading",
+              index: current?.index || 0,
+              filename: current?.filename || "",
+              total: streamEvent.total,
+            }));
+          } else if (streamEvent.type === "file_started") {
+            setImportPreparation({
+              phase: "generating",
+              index: streamEvent.index,
+              total: streamEvent.total,
+              filename: streamEvent.filename,
+            });
+          } else if (streamEvent.type === "filename_generation_started") {
+            setImportPreparation({
+              phase: "naming",
+              index: streamEvent.total,
+              total: streamEvent.total,
+              filename: "",
+            });
+          } else if (streamEvent.type === "batch_completed") {
+            completedResults.push({
+              batch_id: streamEvent.batch_id,
+              status: streamEvent.status,
+              items: streamEvent.items,
+            });
+          } else if (streamEvent.type === "error") {
+            streamError = streamEvent.message;
+          }
+        },
+      );
+      if (streamError) throw new Error(streamError);
+      const result = completedResults[0];
+      if (!result) throw new Error(t("Property preparation ended without a result"));
       setUploadOpen(false);
+      setUploadFiles([]);
       setImportTarget({
         projectId: project.id,
-        importId: result.import_id,
-        originalFilename: result.original_filename || currentFilename,
-        defaultFilename: result.suggested_filename || currentFilename,
+        batchId: result.batch_id,
+        items: result.items,
       });
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Upload failed");
+      setError(err instanceof Error ? err.message : t("Upload failed"));
     } finally {
+      setImportPreparation(null);
       setBusy(false);
     }
   }
@@ -367,30 +496,30 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
     setBusy(true);
     try {
       await request(
-        `/projects/${importTarget.projectId}/property-imports/${importTarget.importId}`,
+        `/projects/${importTarget.projectId}/property-import-batches/${importTarget.batchId}`,
         { method: "DELETE" },
       );
       setImportTarget(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Unable to cancel property import");
+      setError(err instanceof Error ? err.message : t("Unable to cancel property import"));
     } finally {
       setBusy(false);
     }
   }
-  async function confirmPropertyImport(filename: string) {
+  async function confirmPropertyImport(items: ConfirmedPropertyImport[]) {
     if (!importTarget) return;
     setBusy(true);
     try {
-      await request<PropertyImportConfirmResult>(
-        `/projects/${importTarget.projectId}/property-imports/${importTarget.importId}/confirm`,
-        { method: "POST", body: JSON.stringify({ filename }) },
+      await request<PropertyImportBatchConfirmResult>(
+        `/projects/${importTarget.projectId}/property-import-batches/${importTarget.batchId}/confirm`,
+        { method: "POST", body: JSON.stringify({ items }) },
       );
       setImportTarget(null);
       await refreshProject();
       await refreshProjects();
       await refreshProcessingState();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Property import failed");
+      setError(err instanceof Error ? err.message : t("Property import failed"));
     } finally {
       setBusy(false);
     }
@@ -405,16 +534,16 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
       setMcpOpen(!mcpOpen);
       setMcpEndpoint(result.endpoint || "");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "MCP action failed");
+      setError(err instanceof Error ? err.message : t("MCP action failed"));
     }
   }
   async function switchProject(nextProject: Project | null) {
     if (importTarget) {
-      setError("Confirm or cancel the pending property import before switching projects.");
+      setError(t("Confirm or cancel the pending property import before switching projects."));
       return;
     }
     if (!canLeaveProject(processing)) {
-      setError("Project switching is locked while the candidate build is processing.");
+      setError(t("Project switching is locked while the candidate build is processing."));
       return;
     }
     try {
@@ -426,7 +555,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
       setRegroupOpen(false);
       setProject(nextProject);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Unable to switch project");
+      setError(err instanceof Error ? err.message : t("Unable to switch project"));
     }
   }
   async function cancelJob() {
@@ -436,7 +565,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
       await refreshProcessingState();
     } catch (err) {
       setError(
-        err instanceof Error ? err.message : "Unable to cancel processing",
+        err instanceof Error ? err.message : t("Unable to cancel processing"),
       );
     }
   }
@@ -448,7 +577,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
       await refreshProcessingState();
     } catch (err) {
       setError(
-        err instanceof Error ? err.message : "Unable to retry processing",
+        err instanceof Error ? err.message : t("Unable to retry processing"),
       );
     }
   }
@@ -464,7 +593,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
   }
   async function renameProject() {
     if (!project) return;
-    const name = window.prompt("Project name", project.name);
+    const name = window.prompt(t("Project name"), project.name);
     if (!name?.trim()) return;
     try {
       const updated = await request<Project>(`/projects/${project.id}`, {
@@ -474,16 +603,16 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
       setProject(updated);
       await refreshProjects();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Project rename failed");
+      setError(err instanceof Error ? err.message : t("Project rename failed"));
     }
   }
   async function deleteProject() {
     if (importTarget) {
-      setError("Confirm or cancel the pending property import before closing this project.");
+      setError(t("Confirm or cancel the pending property import before closing this project."));
       return;
     }
     if (!canLeaveProject(processing)) {
-      setError("Project closing is locked while the candidate build is processing.");
+      setError(t("Project closing is locked while the candidate build is processing."));
       return;
     }
     if (
@@ -502,7 +631,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
       setMcpEndpoint("");
       await refreshProjects();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Project delete failed");
+      setError(err instanceof Error ? err.message : t("Project delete failed"));
     }
   }
   function openPropertyRename() {
@@ -527,7 +656,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
       setRenameTarget(null);
       await refreshProject();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Property rename failed");
+      setError(err instanceof Error ? err.message : t("Property rename failed"));
     } finally {
       setBusy(false);
     }
@@ -536,18 +665,37 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
     if (!project) return;
     setBusy(true);
     try {
-      await request(
+      const proposal = await request<RegroupProposal>(
         `/projects/${project.id}/properties/regroup`,
         {
           method: "POST",
           body: JSON.stringify({ revision_prompt: revisionPrompt }),
         },
       );
-      setSelected(null);
       setRegroupOpen(false);
+      setRegroupProposal(proposal);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t("Property re-grouping failed"));
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function confirmRegroupProperties(items: RegroupConfirmationItem[]) {
+    if (!project || !regroupProposal) return;
+    setBusy(true);
+    try {
+      await request(
+        `/projects/${project.id}/properties/regroup/confirm`,
+        {
+          method: "POST",
+          body: JSON.stringify({ catalog_signature: regroupProposal.catalog_signature, items }),
+        },
+      );
+      setSelected(null);
+      setRegroupProposal(null);
       await Promise.all([refreshProject(), refreshProjects()]);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Property re-grouping failed");
+      setError(err instanceof Error ? err.message : t("Property re-grouping failed"));
     } finally {
       setBusy(false);
     }
@@ -566,31 +714,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
       setSelected(null);
       await refreshProject();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Property removal failed");
-    }
-  }
-  function openReplacement() {
-    replacementInput.current?.click();
-  }
-  async function replaceProperty(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0];
-    if (!file || !selected) return;
-    const form = new FormData();
-    form.append("file", file);
-    setBusy(true);
-    try {
-      await request(
-        `/projects/${selected.project_id}/properties/${selected.id}/content`,
-        { method: "PUT", body: form },
-      );
-      await refreshProject();
-    } catch (err) {
-      setError(
-        err instanceof Error ? err.message : "Property replacement failed",
-      );
-    } finally {
-      setBusy(false);
-      event.target.value = "";
+      setError(err instanceof Error ? err.message : t("Property removal failed"));
     }
   }
   function selectProperty(property: Property | null) {
@@ -651,14 +775,14 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
           <select
             value={project?.id || ""}
             disabled={processing}
-            title={processing ? "Project navigation is locked while processing" : "Select project"}
+            title={t(processing ? "Project navigation is locked while processing" : "Select project")}
             onChange={(event) =>
               switchProject(
                 projects.find((item) => item.id === event.target.value) || null,
               )
             }
           >
-            <option value="">Select project</option>
+            <option value="">{t('Select project')}</option>
             {projects.map((item) => (
               <option key={item.id} value={item.id}>
                 {item.name}
@@ -666,51 +790,61 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
             ))}
           </select>
           <ChevronDown size={14} />
-        </div>
-        <form className="global-search" onSubmit={runSearch}>
-          <Search size={16} />
-          <input
-            value={search}
-            onChange={(event) => setSearch(event.target.value)}
-            placeholder="Search properties and entities"
-          />
-          <kbd>⌘ K</kbd>
-        </form>
-        <div className="top-actions">
           <button
             type="button"
-            className="text-button top-create-button"
-            aria-label="Create project"
-            title="Create project"
+            className="project-create-button"
+            aria-label={t('Create project')}
+            title={t('Create project')}
             disabled={processing}
             onClick={() => void createProject()}
           >
-            <FolderPlus size={15} /> New project
+            <FolderPlus size={15} />
           </button>
+        </div>
+        <form className="global-search" onSubmit={runSearch}>
+          <button
+            type="submit"
+            className="global-search-submit"
+            aria-label={t('Search project')}
+            title={t('Search project')}
+          >
+            <Search size={16} />
+          </button>
+          <input
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+            placeholder={t('Search properties and entities')}
+          />
+        </form>
+        <div className="top-actions">
           <button
             type="button"
             className={`mcp-button ${mcpOpen ? "active" : ""}`}
             onClick={toggleMcp}
           >
-            <Network size={15} /> MCP {mcpOpen ? "open" : "closed"}
+            <Network size={15} /> MCP {t(mcpOpen ? "open" : "closed")}
           </button>
           <button
             type="button"
             className="icon-button"
-            title="Settings"
-            aria-label="Settings"
-            onClick={() => setSettingsOpen(true)}
+            title={t('Settings')}
+            aria-label={t('Settings')}
+            onClick={() => {
+              setSettingsFocusRoute(null);
+              setSettingsOpen(true);
+            }}
           >
             <Settings2 size={17} />
           </button>
+          <LanguageSwitcher />
           <AccountMenu onSignOut={signOut} />
         </div>
       </header>
       {mcpOpen && (
         <div className="mcp-warning">
-          <strong>MCP endpoint is publicly callable.</strong>
+          <strong>{t('MCP endpoint is publicly callable.')}</strong>
           <span>
-            It inherits this user&apos;s current capabilities until closed.
+            {t("It inherits this user's current capabilities until closed.")}
           </span>
           {mcpEndpoint && <code>{mcpEndpoint}</code>}
         </div>
@@ -724,13 +858,15 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
           >
             <div>
               <strong>
-                {processingStageLabel(processingStatus.stage || processingStatus.status)}
+                {t(processingStageLabel(processingStatus.stage || processingStatus.status))}
               </strong>
               <span>
-                {processingStatus.stage_detail ||
+                {processingDetail ? (processingDetail.values
+                  ? t(processingDetail.key, processingDetail.values)
+                  : t(processingDetail.key)) :
                   (processingStatus.locked
-                    ? "Project actions are locked until this stage completes."
-                    : "Build finished.")}
+                    ? t('Project actions are locked until this stage completes.')
+                    : t('Build finished.'))}
                 {processingStatus.locked && processingElapsed
                   ? ` · ${processingElapsed}`
                   : ""}
@@ -742,10 +878,10 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
                 <button
                   type="button"
                   className="text-button"
-                  aria-label="Show error detail"
+                  aria-label={t('Show error detail')}
                   onClick={() => setProcessingErrorOpen(true)}
                 >
-                  <Bug size={14} /> Show error detail
+                  <Bug size={14} /> {t('Show error detail')}
                 </button>
               )}
               {processingStatus.locked && (
@@ -754,7 +890,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
                   className="text-button"
                   onClick={cancelJob}
                 >
-                  Cancel
+                  {t('Cancel')}
                 </button>
               )}
               {failedProperty && (
@@ -763,7 +899,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
                   className="text-button"
                   onClick={() => retryJob(failedProperty.id)}
                 >
-                  Retry
+                  {t('Retry')}
                 </button>
               )}
             </div>
@@ -772,15 +908,40 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
       <div className={`workspace ${sidebarCollapsed ? "workspace-sidebar-collapsed" : ""}`}>
         <aside className={`property-sidebar ${sidebarCollapsed ? "collapsed" : ""}`}>
           <div className="sidebar-heading">
-            <div>
-              <span className="eyebrow">PROJECT PROPERTIES</span>
-              <h2>{project?.name || "No project selected"}</h2>
+            <div className="project-title-row">
+              <div className="project-title-copy">
+                <span className="eyebrow">{t('PROJECT PROPERTIES')}</span>
+                <h2>{project?.name || t('No project selected')}</h2>
+              </div>
+              {project && (
+                <div className="project-title-actions">
+                  <button
+                    type="button"
+                    className="icon-button"
+                    aria-label={t('Rename project')}
+                    title={t('Rename project')}
+                    onClick={renameProject}
+                  >
+                    <Pencil size={15} />
+                  </button>
+                  <button
+                    type="button"
+                    className="icon-button danger"
+                    aria-label={t('Delete project')}
+                    title={t('Delete project')}
+                    onClick={deleteProject}
+                    disabled={processing}
+                  >
+                    <Trash2 size={15} />
+                  </button>
+                </div>
+              )}
             </div>
             <button
               type="button"
               className="icon-button"
-              title={sidebarCollapsed ? "Expand panel" : "Collapse panel"}
-              aria-label={sidebarCollapsed ? "Expand panel" : "Collapse panel"}
+              title={t(sidebarCollapsed ? "Expand panel" : "Collapse panel")}
+              aria-label={t(sidebarCollapsed ? "Expand panel" : "Collapse panel")}
               aria-expanded={!sidebarCollapsed}
               onClick={() => setSidebarCollapsed((current) => !current)}
             >
@@ -790,39 +951,24 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
           <div className="tree-actions">
             <button
               className="primary-button compact"
-              disabled={!project || processing}
-              onClick={() => setUploadOpen(true)}
+              disabled={!project || processing || checkingProviders}
+              aria-busy={checkingProviders}
+              onClick={() => void beginPropertyImport()}
             >
-              <FilePlus2 size={15} /> Add property
+              <FilePlus2 size={15} /> {t('Add property')}
             </button>
             {project && (
-              <>
-                <button
-                  type="button"
-                  className="icon-button"
-                  title="Re-group properties"
-                  aria-label="Re-group properties"
-                  disabled={processing || busy || properties.length === 0}
-                  onClick={() => setRegroupOpen(true)}
-                >
-                  <FolderTree size={16} />
-                </button>
-                <button
-                  className="icon-button"
-                  title="Rename project"
-                  onClick={renameProject}
-                >
-                  <Pencil size={16} />
-                </button>
-                <button
-                  className="icon-button danger"
-                  title="Delete project"
-                  onClick={deleteProject}
-                  disabled={processing}
-                >
-                  <Trash2 size={16} />
-                </button>
-              </>
+              <button
+                type="button"
+                className="regroup-properties-button"
+                title={t('Revise Project Tree')}
+                aria-label={t('Revise Project Tree')}
+                disabled={processing || busy || properties.length === 0}
+                onClick={() => setRegroupOpen(true)}
+              >
+                <FolderTree size={15} />
+                <span>{t('Revise Project Tree')}</span>
+              </button>
             )}
           </div>
           <div className="property-tree">
@@ -830,17 +976,17 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
               <PropertyTree properties={properties} onSelect={selectProperty} />
             ) : (
               <div className="tree-empty">
-                No properties yet.
+                {t('No properties yet.')}
                 <br />
-                Add a file to begin.
+                {t('Add a file to begin.')}
               </div>
             )}
           </div>
           <div className="sidebar-footer">
             <span className={`connection-dot ${processing ? "busy" : ""}`} />{" "}
             {processing
-              ? processingStageLabel(processingStatus?.stage || "queued")
-              : "Active snapshot ready"}
+              ? t(processingStageLabel(processingStatus?.stage || "queued"))
+              : t('Active snapshot ready')}
           </div>
         </aside>
         <main className="center-workspace">
@@ -851,27 +997,27 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
                 className={tab === "entity" ? "active" : ""}
                 onClick={() => setTab("entity")}
               >
-                <Network size={15} /> Entity Graph
+                <Network size={15} /> {t('Entity Graph')}
               </button>
               <button
                 type="button"
                 className={tab === "property" ? "active" : ""}
                 onClick={() => setTab("property")}
               >
-                <FolderOpen size={15} /> Property Graph
+                <FolderOpen size={15} /> {t('Property Graph')}
               </button>
               <button
                 type="button"
                 className={tab === "query" ? "active" : ""}
                 onClick={() => setTab("query")}
               >
-                <MessageSquareText size={15} /> AI Query
+                <MessageSquareText size={15} /> {t('AI Query')}
               </button>
             </div>
             <div className="tab-status">
               {processing && (
                 <>
-                  <span className="spinner" /> {processingStageLabel(processingStatus?.stage || "queued")}
+                  <span className="spinner" /> {t(processingStageLabel(processingStatus?.stage || "queued"))}
                 </>
               )}
             </div>
@@ -888,6 +1034,9 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
             <GraphCanvas
               graph={graph}
               kind="property"
+              properties={properties}
+              displaySelection={propertyGraphDisplaySelection}
+              onDisplaySelectionChange={setPropertyGraphDisplaySelection}
               onRelationSelect={selectRelation}
               onSelect={(node) => {
                 selectProperty(
@@ -900,6 +1049,9 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
             <GraphCanvas
               graph={entityGraph}
               kind="entity"
+              properties={properties}
+              displaySelection={entityGraphDisplaySelection}
+              onDisplaySelectionChange={setEntityGraphDisplaySelection}
               onSelect={selectEntity}
               onRelationSelect={selectRelation}
             />
@@ -918,7 +1070,6 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
         locked={processing}
         onClose={() => setSelected(null)}
         onRename={openPropertyRename}
-        onReplace={openReplacement}
         onRemove={removeProperty}
         onEntitySelect={selectEntity}
         onRelationSelect={selectRelation}
@@ -933,17 +1084,24 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
       />
       <ImportPropertyDialog
         open={Boolean(importTarget)}
-        originalFilename={importTarget?.originalFilename || ""}
-        defaultFilename={importTarget?.defaultFilename || ""}
+        items={importTarget?.items || []}
         busy={busy}
         onCancel={cancelPropertyImport}
         onConfirm={confirmPropertyImport}
       />
       <RegroupPropertiesDialog
         open={regroupOpen}
+        projectName={project?.name || ''}
         busy={busy || processing}
         onClose={() => setRegroupOpen(false)}
         onSubmit={regroupProperties}
+      />
+      <RegroupConfirmationDialog
+        open={Boolean(regroupProposal)}
+        proposal={regroupProposal}
+        busy={busy || processing}
+        onClose={() => setRegroupProposal(null)}
+        onConfirm={confirmRegroupProperties}
       />
       <EntityOverlay
         entity={selectedEntity}
@@ -959,19 +1117,14 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
         open={processingErrorOpen && processingStatus?.status === "failed"}
         summary={processingStatus?.error}
         detail={processingStatus?.error_detail}
+        llmResponse={processingStatus?.llm_response}
         onClose={() => setProcessingErrorOpen(false)}
-      />
-      <input
-        ref={replacementInput}
-        type="file"
-        hidden
-        onChange={replaceProperty}
       />
       {results && (
         <div className="search-drawer">
           <div className="overlay-header">
             <div>
-              <span className="eyebrow">SEARCH RESULTS</span>
+              <span className="eyebrow">{t('SEARCH RESULTS')}</span>
               <h2>{search}</h2>
             </div>
             <button
@@ -984,7 +1137,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
           </div>
           <section>
             <h3>
-              Properties <span>{results.properties.length}</span>
+              {t('Properties')} <span>{results.properties.length}</span>
             </h3>
             {results.properties.map((item) => (
               <button
@@ -1000,13 +1153,15 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
                 }}
               >
                 {item.filename}
-                <small>{item.score}</small>
+                <small title={item.retrieval_path?.join(" -> ")}>
+                  {item.retrieval_reason ? t(item.retrieval_reason) : t('Direct match')}
+                </small>
               </button>
             ))}
           </section>
           <section>
             <h3>
-              Entities <span>{results.entities.length}</span>
+              {t('Entities')} <span>{results.entities.length}</span>
             </h3>
             {results.entities.map((item) => (
               <button
@@ -1019,7 +1174,9 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
                 }}
               >
                 {item.name}
-                <small>{item.score}</small>
+                <small title={item.retrieval_path?.join(" -> ")}>
+                  {item.retrieval_reason ? t(item.retrieval_reason) : t('Direct match')}
+                </small>
               </button>
             ))}
           </section>
@@ -1027,41 +1184,170 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
       )}
       {uploadOpen && (
         <div className="modal-backdrop">
-          <form className="upload-modal" onSubmit={submitUpload}>
+          <form className="upload-modal property-upload-modal" onSubmit={submitUpload}>
             <div className="overlay-header">
               <div>
-                <span className="eyebrow">INGEST PROPERTY</span>
-                <h2>Add to {project?.name}</h2>
+                <span className="eyebrow">{t('INGEST PROPERTY')}</span>
+                <h2>{t('Add to')} {project?.name}</h2>
               </div>
               <button
                 type="button"
                 className="icon-button"
-                onClick={() => setUploadOpen(false)}
+                aria-label={t('Close property upload')}
+                disabled={busy}
+                onClick={() => {
+                  setUploadOpen(false);
+                  setUploadFiles([]);
+                  setUploadDragActive(false);
+                }}
               >
                 <X size={16} />
               </button>
             </div>
-            <label className="dropzone">
+            <input
+              ref={uploadInput}
+              className="visually-hidden"
+              type="file"
+              aria-label={t('Property files')}
+              multiple
+              disabled={busy}
+              onChange={(event) => setUploadFiles(Array.from(event.target.files || []))}
+            />
+            <button
+              type="button"
+              className={`dropzone ${uploadDragActive ? "drag-active" : ""}`}
+              aria-label={t('Choose property files')}
+              disabled={busy}
+              onClick={() => uploadInput.current?.click()}
+              onDragEnter={(event) => {
+                event.preventDefault();
+                setUploadDragActive(true);
+              }}
+              onDragOver={(event) => {
+                event.preventDefault();
+                event.dataTransfer.dropEffect = "copy";
+              }}
+              onDragLeave={(event) => {
+                if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+                  setUploadDragActive(false);
+                }
+              }}
+              onDrop={(event) => {
+                event.preventDefault();
+                setUploadDragActive(false);
+                setUploadFiles(droppedPropertyFiles(event.dataTransfer));
+              }}
+            >
               <Upload size={24} />
-              <strong>Choose a file</strong>
-              <span>Text, code, documents, or images</span>
-              <input type="file" name="file" required />
-            </label>
+              <strong>{t('Choose files')}</strong>
+              <span>{t('Text, documents, or images')}</span>
+              <span className="dropzone-count">
+                {uploadFiles.length
+                  ? `${uploadFiles.length} ${t(uploadFiles.length === 1 ? "file" : "files")} ${t('selected')}`
+                  : t('No files selected')}
+              </span>
+            </button>
+            {uploadFiles.length > 0 ? (
+              <section className="upload-file-selection">
+                <div className="upload-file-selection-header">
+                  <span>{t('Selected files')}</span>
+                  <strong>{uploadFiles.length}</strong>
+                </div>
+                <ul aria-label={t('Selected files')}>
+                  {uploadFiles.map((file, index) => (
+                    <li
+                      key={`${file.name}-${file.size}-${file.lastModified}-${index}`}
+                      title={file.name}
+                    >
+                      <FilePlus2 size={14} aria-hidden="true" />
+                      <span>{file.name}</span>
+                      <button
+                        type="button"
+                        className="upload-file-remove"
+                        aria-label={`${t('Remove')} ${file.name}`}
+                        title={`${t('Remove')} ${file.name}`}
+                        disabled={busy}
+                        onClick={() => {
+                          setUploadFiles((current) =>
+                            current.filter((_, currentIndex) => currentIndex !== index),
+                          );
+                          if (uploadInput.current) uploadInput.current.value = "";
+                        }}
+                      >
+                        <X size={13} aria-hidden="true" />
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            ) : null}
             <label>
-              Optional context
+              {t('Optional context')}
               <textarea
                 name="comment"
                 rows={3}
-                placeholder="Add document details or grouping context"
+                disabled={busy}
+                placeholder={t('Add document details or grouping context')}
               />
             </label>
-            <button className="primary-button" disabled={busy}>
-              <Upload size={15} /> Prepare import
+            {importPreparation && (
+              <section
+                className="import-preparation"
+                role="status"
+                aria-live="polite"
+              >
+                <div className="import-preparation-header">
+                  <div>
+                    <span className="eyebrow">{t(importPreparation.phase === "naming" ? "Group Arrangement Agent" : "Definition Generation Agent")}</span>
+                    <strong>
+                      {importPreparation.phase === "uploading"
+                        ? `${t('Uploading')} ${importPreparation.total} ${t(importPreparation.total === 1 ? "property" : "properties")}`
+                        : importPreparation.phase === "naming"
+                          ? `${t('Generating')} ${t(importPreparation.total === 1 ? "a suggested filename" : "suggested filenames")}`
+                          : `${t('Preparing')} ${importPreparation.index} ${t('of')} ${importPreparation.total} ${t(importPreparation.total === 1 ? "property" : "properties")}`}
+                    </strong>
+                  </div>
+                  <span className="spinner" aria-hidden="true" />
+                </div>
+                {importPreparation.filename && (
+                  <div className="import-preparation-file">
+                    <FilePlus2 size={16} aria-hidden="true" />
+                    <span>
+                      <strong>{importPreparation.filename}</strong>
+                      <small>{t('Generating a concise property definition')}</small>
+                    </span>
+                  </div>
+                )}
+                <progress
+                  aria-label={t('Definition Generation Agent preparation progress')}
+                  max={Math.max(importPreparation.total, 1)}
+                  value={importPreparation.index}
+                />
+              </section>
+            )}
+            <button type="submit" className="primary-button" disabled={busy || uploadFiles.length === 0}>
+              {busy ? <span className="spinner" aria-hidden="true" /> : <Upload size={15} />}
+              {t(busy ? "Preparing properties" : "Prepare import")}
             </button>
           </form>
         </div>
       )}
-      {settingsOpen && <SettingsPanel onClose={() => setSettingsOpen(false)} />}
+      <ProviderConfigurationAlert
+        open={Boolean(providerReadiness)}
+        missingRoutes={providerReadiness?.missing_routes || []}
+        canConfigure={providerReadiness?.can_configure ?? false}
+        onClose={() => setProviderReadiness(null)}
+        onConfigure={openProviderSettings}
+      />
+      {settingsOpen && (
+        <SettingsPanel
+          focusRouteKey={settingsFocusRoute}
+          onClose={() => {
+            setSettingsOpen(false);
+            setSettingsFocusRoute(null);
+          }}
+        />
+      )}
     </div>
   );
 }

@@ -8,11 +8,15 @@ from pydantic import BaseModel, Field
 
 from ..config import Settings, get_settings
 from ..security import get_current_user, require_capability
+from ..services.ai_query_tools import AIQueryTools
+from ..services.catalog import PropertyCatalog
+from ..services.display_language import current_display_language, iterate_in_display_language
 from ..services.graph_store import Neo4jGraphStore
 from ..services.llm import AnswerLLM
 from ..services.providers import ProviderError
 from ..services.query_history import QueryHistoryStore
-from ..services.retrieval import Retriever
+from ..services.retrieval import GraphRetriever
+from ..services.retrieval_limits import load_retrieval_limits
 from .projects import get_project
 
 router = APIRouter(prefix="/projects", tags=["query"])
@@ -37,6 +41,9 @@ def ai_query_events(
     on_complete: Callable[[str, list[dict]], None] | None = None,
 ):
     result = answer_llm.stream_answer(question, context, history=history)
+    initial_citations = json.dumps(
+        result["citations"], ensure_ascii=False, sort_keys=True
+    )
     yield json.dumps(
         {
             "type": "sources",
@@ -44,6 +51,8 @@ def ai_query_events(
             "retrieved": {
                 "properties": len(context.get("properties", [])),
                 "entities": len(context.get("entities", [])),
+                "relations": len(context.get("relations", [])),
+                "retrieval_paths": len(context.get("retrieval_paths", [])),
                 "databases": databases,
             },
         }
@@ -56,6 +65,13 @@ def ai_query_events(
     except ProviderError as exc:
         yield json.dumps({"type": "error", "message": str(exc)}) + "\n"
         return
+    if (
+        json.dumps(result["citations"], ensure_ascii=False, sort_keys=True)
+        != initial_citations
+    ):
+        yield json.dumps(
+            {"type": "sources", "citations": result["citations"]}
+        ) + "\n"
     if on_complete:
         on_complete("".join(answer_chunks), result["citations"])
     yield json.dumps({"type": "done"}) + "\n"
@@ -101,7 +117,22 @@ def search(project_id: str, payload: QueryRequest, settings: Settings = Depends(
     if not ({"search.properties", "search.entities"} & user["capabilities"]):
         raise HTTPException(status_code=403, detail="Missing search capability")
     store = Neo4jGraphStore(settings)
-    grouped = Retriever(store).search(project_id, payload.query)
+    allowed_kinds = set()
+    if "search.properties" in user["capabilities"]:
+        allowed_kinds.add("property")
+    if "search.entities" in user["capabilities"]:
+        allowed_kinds.add("entity")
+    limits = load_retrieval_limits(settings)
+    grouped = GraphRetriever(store).search(
+        project_id,
+        payload.query,
+        allowed_kinds=allowed_kinds,
+        property_limit=limits.search_property_limit,
+        entity_limit=limits.search_entity_limit,
+        total_limit=(
+            limits.search_property_limit + limits.search_entity_limit
+        ),
+    )
     result = {}
     if "search.properties" in user["capabilities"]:
         result["properties"] = grouped["properties"]
@@ -114,14 +145,16 @@ def search(project_id: str, payload: QueryRequest, settings: Settings = Depends(
 def search_properties(project_id: str, payload: QueryRequest, settings: Settings = Depends(get_settings), user=Depends(require_capability("search.properties"))):
     if not get_project(settings, project_id):
         raise HTTPException(status_code=404, detail="Project not found")
-    return {"properties": Retriever(Neo4jGraphStore(settings)).search_properties(project_id, payload.query)}
+    limits = load_retrieval_limits(settings)
+    return {"properties": GraphRetriever(Neo4jGraphStore(settings)).search_properties(project_id, payload.query, limit=limits.search_property_limit)}
 
 
 @router.post("/{project_id}/search/entities")
 def search_entities(project_id: str, payload: QueryRequest, settings: Settings = Depends(get_settings), user=Depends(require_capability("search.entities"))):
     if not get_project(settings, project_id):
         raise HTTPException(status_code=404, detail="Project not found")
-    return {"entities": Neo4jGraphStore(settings).search(project_id, payload.query, "entities")}
+    limits = load_retrieval_limits(settings)
+    return {"entities": GraphRetriever(Neo4jGraphStore(settings)).search_entities(project_id, payload.query, limit=limits.search_entity_limit)}
 
 
 @router.post("/{project_id}/ai-query")
@@ -129,12 +162,26 @@ def ai_query(project_id: str, payload: QueryRequest, settings: Settings = Depend
     if not get_project(settings, project_id):
         raise HTTPException(status_code=404, detail="Project not found")
     store = Neo4jGraphStore(settings)
-    context = Retriever(store).context(project_id, payload.query)
+    limits = load_retrieval_limits(settings)
+    context = GraphRetriever(store).context(
+        project_id,
+        payload.query,
+        property_limit=limits.ai_query_property_limit,
+        entity_limit=limits.ai_query_entity_limit,
+        total_limit=limits.ai_query_total_node_limit,
+    )
     history_store = QueryHistoryStore(settings)
     saved_history = history_store.list(project_id, user["id"])
     client_history = [message.model_dump() for message in payload.history]
     history = _llm_history(saved_history or client_history)
-    result = AnswerLLM(settings=settings).answer(payload.query, context, history=history)
+    toolbox = AIQueryTools(
+        project_id,
+        store,
+        PropertyCatalog(settings),
+    )
+    result = AnswerLLM(settings=settings, toolbox=toolbox).answer(
+        payload.query, context, history=history
+    )
     history_store.append_exchange(
         project_id,
         user["id"],
@@ -143,22 +190,47 @@ def ai_query(project_id: str, payload: QueryRequest, settings: Settings = Depend
         result["citations"],
         initial_history=client_history,
     )
-    return {**result, "retrieved": {"properties": len(context["properties"]), "entities": len(context["entities"]), "databases": [settings.neo4j_property_database, settings.neo4j_entity_database]}}
+    return {
+        **result,
+        "retrieved": {
+            "properties": len(context["properties"]),
+            "entities": len(context["entities"]),
+            "relations": len(context["relations"]),
+            "retrieval_paths": len(context["retrieval_paths"]),
+            "databases": [
+                settings.neo4j_property_database,
+                settings.neo4j_entity_database,
+            ],
+        },
+    }
 
 
 @router.post("/{project_id}/ai-query/stream")
 def ai_query_stream(project_id: str, payload: QueryRequest, settings: Settings = Depends(get_settings), user=Depends(require_capability("query.execute"))):
     if not get_project(settings, project_id):
         raise HTTPException(status_code=404, detail="Project not found")
-    context = Retriever(Neo4jGraphStore(settings)).context(project_id, payload.query)
+    limits = load_retrieval_limits(settings)
+    store = Neo4jGraphStore(settings)
+    context = GraphRetriever(store).context(
+        project_id,
+        payload.query,
+        property_limit=limits.ai_query_property_limit,
+        entity_limit=limits.ai_query_entity_limit,
+        total_limit=limits.ai_query_total_node_limit,
+    )
     history_store = QueryHistoryStore(settings)
     saved_history = history_store.list(project_id, user["id"])
     client_history = [message.model_dump() for message in payload.history]
     history = _llm_history(saved_history or client_history)
+    toolbox = AIQueryTools(
+        project_id,
+        store,
+        PropertyCatalog(settings),
+    )
     events = ai_query_events(
         payload.query,
         context,
-        AnswerLLM(settings=settings),
+        AnswerLLM(settings=settings, toolbox=toolbox),
         [settings.neo4j_property_database, settings.neo4j_entity_database],
         history,
         on_complete=lambda answer, citations: history_store.append_exchange(
@@ -171,7 +243,7 @@ def ai_query_stream(project_id: str, payload: QueryRequest, settings: Settings =
         ),
     )
     return StreamingResponse(
-        events,
+        iterate_in_display_language(current_display_language(), events),
         media_type="application/x-ndjson",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

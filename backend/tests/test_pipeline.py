@@ -10,10 +10,50 @@ from backend.app.services.graph_store import GraphSnapshot, LocalGraphStore, ext
 from backend.app.services.pipeline import (
     _job_heartbeat,
     _merge_entity_delta,
+    _prepare_entity_document,
     _should_extract_entities_incrementally,
     run_pipeline,
+    run_property_removal,
 )
 from backend.app.services.storage import safe_directory
+
+
+def test_prepare_entity_document_selects_bounded_text_and_keeps_full_source():
+    full_text = (
+        "PORTAL HEADER\nPage 1 of 2\n\n"
+        "# Architecture\nAtlas uses Neo4j for relation-aware retrieval.\n\n"
+        "# Migration\nLegacy Meridian depends on Atlas during migration.\n\n"
+        "PORTAL HEADER\nPage 2 of 2\n"
+    )
+    document = {
+        "project_id": "project",
+        "property_id": "property",
+        "property_type": "text",
+        "filename": "atlas.md",
+        "definition": "Atlas architecture and migration notes.",
+        "import_context": "Focus on product relationships.",
+        "text": full_text,
+    }
+
+    prepared, selection = _prepare_entity_document(
+        document,
+        [
+            {
+                "id": "meridian",
+                "name": "Meridian Platform",
+                "aliases": ["Legacy Meridian"],
+                "definition": "A migration platform.",
+            }
+        ],
+        max_chars=180,
+    )
+
+    assert prepared["original_text"] == full_text
+    assert prepared["text"] == selection.text
+    assert "Atlas uses Neo4j" in prepared["text"]
+    assert "Legacy Meridian" in prepared["text"]
+    assert "Page 1 of 2" not in prepared["text"]
+    assert prepared["extraction_chunks"][0]["start"] >= 0
 
 
 def test_entity_extraction_excludes_image_documents_by_contract(tmp_path):
@@ -80,6 +120,10 @@ def test_group_directories_accept_semantic_names_with_spaces():
     assert safe_directory("Corporate Administration/HR") == Path(
         "Corporate Administration/HR"
     )
+
+
+def test_group_directories_accept_chinese_names():
+    assert safe_directory("人力资源/人员简历") == Path("人力资源/人员简历")
 
 
 def test_incremental_entity_extraction_is_only_used_for_new_properties():
@@ -309,7 +353,7 @@ def test_pipeline_passes_property_metadata_and_current_tree_to_ga_agent(
     )
 
 
-def test_add_extracts_only_new_property_and_remove_rebuilds_complete_graphs(
+def test_add_extracts_only_new_property_and_remove_prunes_graphs_without_models(
     tmp_path, monkeypatch
 ):
     settings = Settings(data_dir=tmp_path)
@@ -548,24 +592,26 @@ def test_add_extracts_only_new_property_and_remove_rebuilds_complete_graphs(
     )
     after_add = LocalGraphStore(settings).read(project_id)
 
-    run_pipeline(
+    counts_before_remove = {
+        "pgb": len(pgb_inventories),
+        "entity": len(entity_document_sets),
+        "embedding": len(embedding_batches),
+        **agent_calls,
+    }
+    run_property_removal(
         settings,
         project_id,
         "beta",
         "remove-job",
-        "beta.txt",
-        "text",
         second_path,
-        operation="remove",
     )
     after_remove = LocalGraphStore(settings).read(project_id)
 
-    assert pgb_inventories == [["alpha", "beta"], ["alpha"]]
-    assert entity_document_sets == [["beta"], ["alpha"]]
-    assert entity_build_modes == [True, False]
+    assert pgb_inventories == [["alpha", "beta"]]
+    assert entity_document_sets == [["beta"]]
+    assert entity_build_modes == [True]
     assert entity_inventories == [
         ["alpha-system", "coredb"],
-        ["alpha-system", "coredb", "beta-service"],
     ]
     assert after_add.property_edges == [
         {"source": "beta", "target": "alpha", "type": "EXTENDS_DESIGN"}
@@ -585,11 +631,24 @@ def test_add_extracts_only_new_property_and_remove_rebuilds_complete_graphs(
     ]
     assert any("Beta extends Alpha." in batch for batch in embedding_batches)
     assert agent_calls == {"dg": 0, "ga": 1}
+    assert counts_before_remove == {
+        "pgb": len(pgb_inventories),
+        "entity": len(entity_document_sets),
+        "embedding": len(embedding_batches),
+        **agent_calls,
+    }
     assert extracted_paths == ["beta.txt"]
+    assert [item["id"] for item in after_remove.properties] == ["alpha"]
     assert after_remove.property_edges == []
     assert after_remove.entity_edges == [
         {"source": "alpha-system", "target": "coredb", "type": "STORES_DATA_IN"}
     ]
+    assert [item["id"] for item in after_remove.entities] == [
+        "alpha-system",
+        "coredb",
+    ]
+    assert catalog.get(project_id, "beta") is None
+    assert not second_path.exists()
 
 
 def test_rebuild_reuses_unchanged_property_content_and_embedding(
@@ -826,6 +885,333 @@ def test_pipeline_records_granular_graph_stage_timings(tmp_path, monkeypatch):
     assert job["stage"] == "active"
     assert job["stage_detail"] == "Candidate snapshot active"
     assert entity_provider_calls == [("entity_agent_route", 300)]
+
+
+def test_batch_pipeline_groups_once_and_extracts_new_properties_one_by_one(
+    tmp_path, monkeypatch
+):
+    import backend.app.services.pipeline as pipeline_service
+
+    settings = Settings(data_dir=tmp_path)
+    settings.ensure_directories()
+    initialize(settings.sqlite_path)
+    project_id, job_id = "batch-project", "batch-job"
+    property_root = settings.projects_dir / project_id / "properties"
+    existing_path = property_root / "Existing" / "core.md"
+    first_path = property_root / "atlas.md"
+    second_path = property_root / "nova.md"
+    existing_path.parent.mkdir(parents=True)
+    existing_path.write_text("CoreDB stores project data.", encoding="utf-8")
+    first_path.write_text("Atlas uses CoreDB.", encoding="utf-8")
+    second_path.write_text("Nova integrates with Atlas.", encoding="utf-8")
+    with connect(settings.sqlite_path) as db:
+        db.execute(
+            "INSERT INTO projects(id,name,created_at,updated_at) VALUES (?,?,?,?)",
+            (project_id, "Batch project", "now", "now"),
+        )
+        db.execute(
+            "INSERT INTO jobs(id,project_id,stage,status,heartbeat) VALUES (?,?,?,?,?)",
+            (job_id, project_id, "queued", "queued", "now"),
+        )
+        db.execute(
+            "INSERT INTO project_locks(project_id,job_id,acquired_at) VALUES (?,?,?)",
+            (project_id, job_id, "now"),
+        )
+    catalog = PropertyCatalog(settings)
+    rows = [
+        {
+            "id": "core",
+            "project_id": project_id,
+            "filename": "core.md",
+            "property_type": "markdown",
+            "relative_path": "properties/Existing/core.md",
+            "directory": "Existing",
+            "definition": "The CoreDB storage guide.",
+            "status": "active",
+            "created_at": "now",
+            "updated_at": "now",
+        },
+        {
+            "id": "atlas",
+            "project_id": project_id,
+            "filename": "atlas.md",
+            "property_type": "markdown",
+            "relative_path": "properties/atlas.md",
+            "definition": "The Atlas product guide.",
+            "status": "queued",
+            "created_at": "now",
+            "updated_at": "now",
+        },
+        {
+            "id": "nova",
+            "project_id": project_id,
+            "filename": "nova.md",
+            "property_type": "markdown",
+            "relative_path": "properties/nova.md",
+            "definition": "The Nova integration guide.",
+            "status": "queued",
+            "created_at": "now",
+            "updated_at": "now",
+        },
+    ]
+    for row in rows:
+        catalog.create(project_id, row)
+
+    active_store = LocalGraphStore(settings)
+    active_store.write_snapshot(
+        GraphSnapshot(
+            project_id,
+            "before-batch",
+            [
+                {
+                    "id": "core",
+                    "project_id": project_id,
+                    "filename": "core.md",
+                    "property_type": "markdown",
+                    "definition": "The CoreDB storage guide.",
+                    "content": "CoreDB stores project data.",
+                    "relative_path": "properties/Existing/core.md",
+                    "directory": "Existing",
+                    "embedding": [0.5],
+                }
+            ],
+            [
+                {
+                    "id": "coredb",
+                    "name": "CoreDB",
+                    "definition": "A project data store.",
+                    "project_id": project_id,
+                    "source_property_ids": ["core"],
+                    "source_contexts": [
+                        {
+                            "property_id": "core",
+                            "text": "CoreDB stores project data.",
+                        }
+                    ],
+                    "embedding": [0.5],
+                }
+            ],
+            [],
+            [],
+        )
+    )
+    active_store.activate(project_id, "before-batch")
+
+    ga_calls = []
+    entity_calls = []
+    entity_progress_details = []
+    original_transition_job = pipeline_service._transition_job
+
+    def recording_transition_job(*args, **kwargs):
+        stage = args[2] if len(args) > 2 else kwargs.get("stage")
+        detail = kwargs.get("detail")
+        if stage == "graph-entity-extraction" and str(detail).startswith(
+            "Generating graph nodes and edges"
+        ):
+            entity_progress_details.append(detail)
+        return original_transition_job(*args, **kwargs)
+
+    class RecordingGAAgent:
+        def __init__(self, settings):
+            self.settings = settings
+
+        def organize_tree(self, tree_context, import_contexts):
+            ga_calls.append((tree_context, import_contexts))
+            return {
+                "core": "Existing",
+                "atlas": "Products/Atlas",
+                "nova": "Products/Nova",
+            }
+
+    class RecordingEntityBuilder:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def build(self, documents, **kwargs):
+            property_id = documents[0]["property_id"]
+            entity_calls.append(
+                {
+                    "documents": [item["property_id"] for item in documents],
+                    "text": documents[0]["text"],
+                    "original_text": documents[0].get("original_text"),
+                    "has_offsets": bool(documents[0].get("extraction_chunks")),
+                    "inventory": [
+                        item["id"] for item in kwargs.get("current_entities", [])
+                    ],
+                    "incremental": kwargs.get("incremental"),
+                }
+            )
+            if property_id == "atlas":
+                return (
+                    [
+                        {
+                            "id": "atlas-product",
+                            "name": "Atlas",
+                            "definition": "A product that uses CoreDB.",
+                            "project_id": project_id,
+                            "source_property_ids": ["atlas"],
+                            "source_contexts": [
+                                {
+                                    "property_id": "atlas",
+                                    "text": "Atlas uses CoreDB.",
+                                }
+                            ],
+                        }
+                    ],
+                    [
+                        {
+                            "source": "atlas-product",
+                            "target": "coredb",
+                            "type": "USES",
+                        }
+                    ],
+                )
+            return (
+                [
+                    {
+                        "id": "nova-product",
+                        "name": "Nova",
+                        "definition": "An integration for Atlas.",
+                        "project_id": project_id,
+                        "source_property_ids": ["nova"],
+                        "source_contexts": [
+                            {
+                                "property_id": "nova",
+                                "text": "Nova integrates with Atlas.",
+                            }
+                        ],
+                    }
+                ],
+                [
+                    {
+                        "source": "nova-product",
+                        "target": "atlas-product",
+                        "type": "INTEGRATES_WITH",
+                    }
+                ],
+            )
+
+    class EmptyPGBAgent:
+        def __init__(self, settings):
+            self.provider = None
+
+        def propose(self, inventory):
+            return []
+
+    class RecordingEmbedder:
+        def embed(self, texts):
+            return [[1.0] for _ in texts]
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(pipeline_service, "GAAgent", RecordingGAAgent)
+    monkeypatch.setattr(pipeline_service, "GraphRAGBuilder", RecordingEntityBuilder)
+    monkeypatch.setattr(pipeline_service, "PGBAgent", EmptyPGBAgent)
+    monkeypatch.setattr(
+        pipeline_service, "_transition_job", recording_transition_job
+    )
+    monkeypatch.setattr(
+        pipeline_service,
+        "embedding_provider",
+        lambda *_args, **_kwargs: RecordingEmbedder(),
+    )
+    monkeypatch.setattr(
+        pipeline_service,
+        "chat_provider",
+        lambda *_args, **_kwargs: None,
+    )
+
+    pipeline_service.run_batch_pipeline(
+        settings,
+        project_id,
+        job_id,
+        [
+            {
+                "property_id": "atlas",
+                "filename": "atlas.md",
+                "kind": "markdown",
+                "path": first_path,
+                "definition": "The Atlas product guide.",
+                "comment": "Product documentation",
+            },
+            {
+                "property_id": "nova",
+                "filename": "nova.md",
+                "kind": "markdown",
+                "path": second_path,
+                "definition": "The Nova integration guide.",
+                "comment": "Integration documentation",
+            },
+        ],
+    )
+
+    assert len(ga_calls) == 1
+    tree_context, import_contexts = ga_calls[0]
+    serialized_tree = json.dumps(tree_context, ensure_ascii=False)
+    assert "core.md" in serialized_tree
+    assert "The CoreDB storage guide." in serialized_tree
+    assert "atlas.md" in serialized_tree
+    assert "The Atlas product guide." in serialized_tree
+    assert "nova.md" in serialized_tree
+    assert "The Nova integration guide." in serialized_tree
+    assert import_contexts == {
+        "atlas": "Product documentation",
+        "nova": "Integration documentation",
+    }
+    assert entity_calls == [
+        {
+            "documents": ["atlas"],
+            "text": "Atlas uses CoreDB.",
+            "original_text": "Atlas uses CoreDB.",
+            "has_offsets": True,
+            "inventory": ["coredb"],
+            "incremental": True,
+        },
+        {
+            "documents": ["nova"],
+            "text": "Nova integrates with Atlas.",
+            "original_text": "Nova integrates with Atlas.",
+            "has_offsets": True,
+            "inventory": ["coredb", "atlas-product"],
+            "incremental": True,
+        },
+    ]
+    assert entity_progress_details == [
+        "Generating graph nodes and edges 1/2: atlas.md",
+        "Generating graph nodes and edges 2/2: nova.md",
+    ]
+    assert not (
+        settings.projects_dir
+        / project_id
+        / "jobs"
+        / "extraction-text"
+    ).exists()
+    snapshot = LocalGraphStore(settings).read(project_id)
+    assert [item["id"] for item in snapshot.entities] == [
+        "coredb",
+        "atlas-product",
+        "nova-product",
+    ]
+    active_rows = {row["id"]: row for row in catalog.list(project_id)}
+    assert active_rows["atlas"]["relative_path"] == (
+        "properties/Products/Atlas/atlas.md"
+    )
+    assert active_rows["nova"]["relative_path"] == (
+        "properties/Products/Nova/nova.md"
+    )
+    assert active_rows["atlas"]["status"] == "active"
+    assert active_rows["nova"]["status"] == "active"
+    with connect(settings.sqlite_path) as db:
+        job = db.execute("SELECT status,progress_json FROM jobs WHERE id=?", (job_id,)).fetchone()
+        assert job["status"] == "completed"
+        assert json.loads(job["progress_json"])["completed_property_ids"] == [
+            "atlas",
+            "nova",
+        ]
+        assert db.execute(
+            "SELECT COUNT(*) FROM project_locks WHERE project_id=?", (project_id,)
+        ).fetchone()[0] == 0
 
 
 def test_job_heartbeat_stays_fresh_during_blocking_provider_call(

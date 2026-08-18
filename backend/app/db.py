@@ -52,10 +52,13 @@ CREATE TABLE IF NOT EXISTS jobs (
   candidate_snapshot TEXT,
   error TEXT,
   error_detail TEXT,
+  llm_response TEXT,
   routes_json TEXT NOT NULL DEFAULT '{}',
   stage_started_at TEXT,
   stage_detail TEXT,
   timings_json TEXT NOT NULL DEFAULT '{}',
+  input_json TEXT NOT NULL DEFAULT '{}',
+  progress_json TEXT NOT NULL DEFAULT '{}',
   heartbeat TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS project_locks (
@@ -107,6 +110,8 @@ def initialize(path: Path) -> None:
             connection.execute("ALTER TABLE jobs ADD COLUMN routes_json TEXT NOT NULL DEFAULT '{}'")
         if "error_detail" not in columns:
             connection.execute("ALTER TABLE jobs ADD COLUMN error_detail TEXT")
+        if "llm_response" not in columns:
+            connection.execute("ALTER TABLE jobs ADD COLUMN llm_response TEXT")
         if "stage_started_at" not in columns:
             connection.execute("ALTER TABLE jobs ADD COLUMN stage_started_at TEXT")
         if "stage_detail" not in columns:
@@ -114,6 +119,14 @@ def initialize(path: Path) -> None:
         if "timings_json" not in columns:
             connection.execute(
                 "ALTER TABLE jobs ADD COLUMN timings_json TEXT NOT NULL DEFAULT '{}'"
+            )
+        if "input_json" not in columns:
+            connection.execute(
+                "ALTER TABLE jobs ADD COLUMN input_json TEXT NOT NULL DEFAULT '{}'"
+            )
+        if "progress_json" not in columns:
+            connection.execute(
+                "ALTER TABLE jobs ADD COLUMN progress_json TEXT NOT NULL DEFAULT '{}'"
             )
         # Remove the prototype-only SQLite property table from databases created
         # before the graph/catalog boundary was enforced.

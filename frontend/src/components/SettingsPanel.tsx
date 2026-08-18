@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   CheckCircle2,
   KeyRound,
@@ -13,6 +13,7 @@ import {
   X,
 } from "lucide-react";
 import { request } from "../api";
+import { useDocSeekTranslation } from "../i18n";
 import CapabilityPicker from "./CapabilityPicker";
 import FloatingWindow from "./FloatingWindow";
 
@@ -29,7 +30,17 @@ type Profile = {
   groups: Array<{ name: string }>;
   roles: Array<{ name: string }>;
   capabilities: string[];
-  preferences: Record<string, unknown>;
+};
+type RetrievalSettings = {
+  ai_query: {
+    property_limit: number;
+    entity_limit: number;
+    total_node_limit: number;
+  };
+  search: {
+    property_limit: number;
+    entity_limit: number;
+  };
 };
 type SystemConfig = {
   routes: Record<string, string | null>;
@@ -41,6 +52,13 @@ type SystemConfig = {
     use_neo4j: boolean;
   };
   mcp: { enabled: boolean };
+  retrieval: RetrievalSettings;
+};
+type SystemConfigResponse = Omit<SystemConfig, "retrieval"> & {
+  retrieval?: {
+    ai_query?: Partial<RetrievalSettings["ai_query"]>;
+    search?: Partial<RetrievalSettings["search"]>;
+  };
 };
 type AccessUser = { id: string; username: string; disabled: boolean };
 type AccessGroup = { id: string; name: string };
@@ -51,13 +69,46 @@ type AccessRole = {
   capabilities: string[];
 };
 
+const DEFAULT_RETRIEVAL_SETTINGS: RetrievalSettings = {
+  ai_query: {
+    property_limit: 15,
+    entity_limit: 15,
+    total_node_limit: 30,
+  },
+  search: {
+    property_limit: 30,
+    entity_limit: 30,
+  },
+};
+
+export function normalizeSystemConfig(
+  config: SystemConfigResponse,
+): SystemConfig {
+  return {
+    ...config,
+    retrieval: {
+      ai_query: {
+        ...DEFAULT_RETRIEVAL_SETTINGS.ai_query,
+        ...config.retrieval?.ai_query,
+      },
+      search: {
+        ...DEFAULT_RETRIEVAL_SETTINGS.search,
+        ...config.retrieval?.search,
+      },
+    },
+  };
+}
+
 export default function SettingsPanel({
   onClose,
   open = true,
+  focusRouteKey = null,
 }: {
   onClose: () => void;
   open?: boolean;
+  focusRouteKey?: string | null;
 }) {
+  const { t } = useDocSeekTranslation();
   const [dismissed, setDismissed] = useState(false);
   const [tab, setTab] = useState<"system" | "access" | "profile">("system");
   const [profile, setProfile] = useState<Profile | null>(null);
@@ -66,6 +117,7 @@ export default function SettingsPanel({
   const [providerChecks, setProviderChecks] = useState<Record<string, string>>(
     {},
   );
+  const [providerDialogOpen, setProviderDialogOpen] = useState(false);
   const [editingProvider, setEditingProvider] = useState<Provider | null>(null);
   const [users, setUsers] = useState<AccessUser[]>([]);
   const [groups, setGroups] = useState<AccessGroup[]>([]);
@@ -104,8 +156,10 @@ export default function SettingsPanel({
   });
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const routeSectionRef = useRef<HTMLFormElement>(null);
 
   function requestClose() {
+    setProviderDialogOpen(false);
     setDismissed(true);
     window.setTimeout(onClose, 160);
   }
@@ -129,7 +183,7 @@ export default function SettingsPanel({
       nextRoles,
     ] = await Promise.all([
       safe<Profile>("/profile"),
-      safe<SystemConfig>("/system/config"),
+      safe<SystemConfigResponse>("/system/config"),
       safe<Provider[]>("/system/providers"),
       safe<{ ready: boolean; message: string; configured?: boolean; mode?: string }>("/system/neo4j/check"),
       safe<{ writable: boolean; data_dir: string }>("/system/storage/check"),
@@ -138,7 +192,7 @@ export default function SettingsPanel({
       safe<AccessRole[]>("/admin/roles"),
     ]);
     setProfile(nextProfile);
-    setConfig(nextConfig);
+    setConfig(nextConfig ? normalizeSystemConfig(nextConfig) : null);
     setProviders(nextProviders || []);
     setNeo4jStatus(nextNeo4j);
     setStorageStatus(nextStorage);
@@ -148,9 +202,18 @@ export default function SettingsPanel({
   }
   useEffect(() => {
     load().catch((err) =>
-      setError(err instanceof Error ? err.message : "Unable to load settings"),
+      setError(err instanceof Error ? err.message : t("Unable to load settings")),
     );
   }, []);
+  useEffect(() => {
+    if (!config || !focusRouteKey || tab !== "system") return;
+    const routeSelect = routeSectionRef.current?.querySelector<HTMLSelectElement>(
+      `[data-route-key="${focusRouteKey}"]`,
+    );
+    if (!routeSelect) return;
+    routeSelect.scrollIntoView?.({ behavior: "smooth", block: "center" });
+    routeSelect.focus({ preventScroll: true });
+  }, [config, focusRouteKey, tab]);
 
   const llmProviders = useMemo(
     () => providers.filter((item) => item.provider_type === "llm"),
@@ -175,16 +238,14 @@ export default function SettingsPanel({
         method: "PATCH",
         body: JSON.stringify({
           ...config.routes,
-          entity_schema: config.entity_schema,
-          entity_prompt: config.entity_prompt,
           mcp_enabled: config.mcp.enabled,
         }),
       });
-      setNotice("System configuration saved");
+      setNotice(t("System configuration saved"));
       await load();
     } catch (err) {
       setError(
-        err instanceof Error ? err.message : "Unable to save configuration",
+        err instanceof Error ? err.message : t("Unable to save configuration"),
       );
     }
   }
@@ -198,6 +259,16 @@ export default function SettingsPanel({
       secret: "",
     });
   }
+  function closeProviderDialog() {
+    setProviderDialogOpen(false);
+    resetProviderForm();
+  }
+  function beginProviderAdd() {
+    resetProviderForm();
+    setError("");
+    setNotice("");
+    setProviderDialogOpen(true);
+  }
   function beginProviderEdit(provider: Provider) {
     setEditingProvider(provider);
     setProviderForm({
@@ -209,6 +280,7 @@ export default function SettingsPanel({
     });
     setError("");
     setNotice("");
+    setProviderDialogOpen(true);
   }
   async function saveProvider(event: FormEvent) {
     event.preventDefault();
@@ -226,13 +298,13 @@ export default function SettingsPanel({
         body: JSON.stringify(body),
       });
       setNotice(
-        editingProvider ? "Provider profile updated" : "Provider profile created",
+        t(editingProvider ? "Provider profile updated" : "Provider profile created"),
       );
-      resetProviderForm();
+      closeProviderDialog();
       await load();
     } catch (err) {
       setError(
-        err instanceof Error ? err.message : "Unable to save provider",
+        err instanceof Error ? err.message : t("Unable to save provider"),
       );
     }
   }
@@ -246,16 +318,16 @@ export default function SettingsPanel({
         return next;
       });
       if (editingProvider?.id === provider.id) resetProviderForm();
-      setNotice("Provider profile removed");
+      setNotice(t("Provider profile removed"));
       await load();
     } catch (err) {
       setError(
-        err instanceof Error ? err.message : "Unable to remove provider",
+        err instanceof Error ? err.message : t("Unable to remove provider"),
       );
     }
   }
   async function validateProvider(provider: Provider) {
-    setProviderChecks((current) => ({ ...current, [provider.id]: "Checking..." }));
+    setProviderChecks((current) => ({ ...current, [provider.id]: t("Checking...") }));
     try {
       const result = await request<{ ready: boolean; dimensions?: number }>(
         `/system/providers/${provider.id}/validate`,
@@ -264,7 +336,7 @@ export default function SettingsPanel({
       if (!result.ready) {
         setProviderChecks((current) => ({
           ...current,
-          [provider.id]: "Unavailable",
+          [provider.id]: t("Unavailable"),
         }));
         setError(`Provider ${provider.name} is unavailable`);
         return;
@@ -273,15 +345,15 @@ export default function SettingsPanel({
         ...current,
         [provider.id]: result.dimensions
           ? `Ready · ${result.dimensions}d`
-          : "Ready",
+          : t("Ready"),
       }));
     } catch (err) {
       setProviderChecks((current) => ({
         ...current,
-        [provider.id]: "Unavailable",
+        [provider.id]: t("Unavailable"),
       }));
       setError(
-        err instanceof Error ? err.message : "Provider validation failed",
+        err instanceof Error ? err.message : t("Provider validation failed"),
       );
     }
   }
@@ -293,10 +365,10 @@ export default function SettingsPanel({
         body: JSON.stringify(userForm),
       });
       setUserForm({ username: "", password: "" });
-      setNotice("User created");
+      setNotice(t("User created"));
       await load();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Unable to create user");
+      setError(err instanceof Error ? err.message : t("Unable to create user"));
     }
   }
   async function createGroup(event: FormEvent) {
@@ -307,10 +379,10 @@ export default function SettingsPanel({
         body: JSON.stringify({ name: groupName }),
       });
       setGroupName("");
-      setNotice("Group created");
+      setNotice(t("Group created"));
       await load();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Unable to create group");
+      setError(err instanceof Error ? err.message : t("Unable to create group"));
     }
   }
   async function addMember(event: FormEvent) {
@@ -320,10 +392,10 @@ export default function SettingsPanel({
         method: "POST",
         body: JSON.stringify({ user_id: memberForm.user_id }),
       });
-      setNotice("Member added");
+      setNotice(t("Member added"));
       await load();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Unable to add member");
+      setError(err instanceof Error ? err.message : t("Unable to add member"));
     }
   }
   async function addGroupRole(event: FormEvent) {
@@ -333,10 +405,10 @@ export default function SettingsPanel({
         method: "POST",
         body: JSON.stringify({ role_id: roleGroupForm.role_id }),
       });
-      setNotice("Role assigned");
+      setNotice(t("Role assigned"));
       await load();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Unable to assign role");
+      setError(err instanceof Error ? err.message : t("Unable to assign role"));
     }
   }
   async function createRole(event: FormEvent) {
@@ -347,10 +419,10 @@ export default function SettingsPanel({
         body: JSON.stringify(roleForm),
       });
       setRoleForm({ name: "", capabilities: [] });
-      setNotice("Role created");
+      setNotice(t("Role created"));
       await load();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Unable to create role");
+      setError(err instanceof Error ? err.message : t("Unable to create role"));
     }
   }
   async function disableUser(user: AccessUser) {
@@ -361,7 +433,7 @@ export default function SettingsPanel({
       });
       await load();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Unable to update user");
+      setError(err instanceof Error ? err.message : t("Unable to update user"));
     }
   }
   async function changePassword(event: FormEvent) {
@@ -372,48 +444,32 @@ export default function SettingsPanel({
         body: JSON.stringify(passwordForm),
       });
       setPasswordForm({ current_password: "", new_password: "" });
-      setNotice("Password changed");
+      setNotice(t("Password changed"));
     } catch (err) {
       setError(
-        err instanceof Error ? err.message : "Unable to change password",
+        err instanceof Error ? err.message : t("Unable to change password"),
       );
     }
   }
-  async function updatePreference(key: string, value: boolean) {
-    if (!profile) return;
-    const preferences = { ...profile.preferences, [key]: value };
-    setProfile({ ...profile, preferences });
-    try {
-      await request("/profile/preferences", {
-        method: "PATCH",
-        body: JSON.stringify(preferences),
-      });
-      setNotice("Preference saved");
-    } catch (err) {
-      setError(
-        err instanceof Error ? err.message : "Unable to save preference",
-      );
-    }
-  }
-
   return (
-    <FloatingWindow
-      open={open && !dismissed}
-      as="aside"
-      className="settings-panel"
-      role="dialog"
-      aria-label="Settings"
-    >
+    <>
+      <FloatingWindow
+        open={open && !dismissed}
+        as="aside"
+        className="settings-panel"
+        role="dialog"
+        aria-label={t('Settings')}
+      >
       <header className="settings-header">
         <div>
-          <span className="eyebrow">DOCSEEK CONTROL PLANE</span>
-          <h2>Settings</h2>
+          <span className="eyebrow">{t('DOCSEEK CONTROL PLANE')}</span>
+          <h2>{t('Settings')}</h2>
         </div>
         <button
           type="button"
           className="icon-button"
-          aria-label="Close settings"
-          title="Close settings"
+          aria-label={t('Close settings')}
+          title={t('Close settings')}
           onClick={requestClose}
         >
           <X size={17} />
@@ -425,21 +481,21 @@ export default function SettingsPanel({
           className={tab === "system" ? "active" : ""}
           onClick={() => setTab("system")}
         >
-          <ServerCog size={15} /> System
+          <ServerCog size={15} /> {t('System')}
         </button>
         <button
           type="button"
           className={tab === "access" ? "active" : ""}
           onClick={() => setTab("access")}
         >
-          <Shield size={15} /> Access
+          <Shield size={15} /> {t('Access')}
         </button>
         <button
           type="button"
           className={tab === "profile" ? "active" : ""}
           onClick={() => setTab("profile")}
         >
-          <UserRound size={15} /> Profile
+          <UserRound size={15} /> {t('Profile')}
         </button>
       </nav>
       {error && (
@@ -447,7 +503,7 @@ export default function SettingsPanel({
           {error}
           <button
             type="button"
-            aria-label="Dismiss error"
+            aria-label={t('Dismiss error')}
             onClick={() => setError("")}
           >
             <X size={14} />
@@ -459,7 +515,7 @@ export default function SettingsPanel({
           {notice}
           <button
             type="button"
-            aria-label="Dismiss notice"
+            aria-label={t('Dismiss notice')}
             onClick={() => setNotice("")}
           >
             <X size={14} />
@@ -471,10 +527,19 @@ export default function SettingsPanel({
           <section className="settings-section">
             <div className="section-heading">
               <div>
-                <span className="eyebrow">PROVIDERS</span>
-                <h3>Provider profiles</h3>
+                <span className="eyebrow">{t('PROVIDERS')}</span>
+                <h3>{t('Provider profiles')}</h3>
               </div>
-              <span>{providers.length}</span>
+              <div className="provider-section-actions">
+                <span>{providers.length}</span>
+                <button
+                  type="button"
+                  className="primary-button compact"
+                  onClick={beginProviderAdd}
+                >
+                  <Plus size={14} /> {t('Add provider')}
+                </button>
+              </div>
             </div>
             <div className="settings-list">
               {providers.map((provider) => (
@@ -490,13 +555,13 @@ export default function SettingsPanel({
                   </span>
                   <span className="provider-actions">
                     <small>
-                      {provider.secret_configured ? "Configured" : "No secret"}
+                      {t(provider.secret_configured ? "Configured" : "No secret")}
                     </small>
                     <button
                       type="button"
                       className="icon-button"
-                      aria-label={`Validate provider ${provider.name}`}
-                      title={`Validate provider ${provider.name}`}
+                      aria-label={`${t('Validate provider')} ${provider.name}`}
+                      title={`${t('Validate provider')} ${provider.name}`}
                       onClick={() => validateProvider(provider)}
                     >
                       <CheckCircle2 size={15} />
@@ -504,8 +569,8 @@ export default function SettingsPanel({
                     <button
                       type="button"
                       className="icon-button"
-                      aria-label={`Edit provider ${provider.name}`}
-                      title={`Edit provider ${provider.name}`}
+                      aria-label={`${t('Edit provider')} ${provider.name}`}
+                      title={`${t('Edit provider')} ${provider.name}`}
                       onClick={() => beginProviderEdit(provider)}
                     >
                       <Pencil size={15} />
@@ -513,8 +578,8 @@ export default function SettingsPanel({
                     <button
                       type="button"
                       className="icon-button danger"
-                      aria-label={`Remove provider ${provider.name}`}
-                      title={`Remove provider ${provider.name}`}
+                      aria-label={`${t('Remove provider')} ${provider.name}`}
+                      title={`${t('Remove provider')} ${provider.name}`}
                       onClick={() => void removeProvider(provider)}
                     >
                       <Trash2 size={15} />
@@ -523,118 +588,40 @@ export default function SettingsPanel({
                 </div>
               ))}
               {!providers.length && (
-                <p className="muted">No provider profiles configured.</p>
+                <p className="muted">{t('No provider profiles configured.')}</p>
               )}
             </div>
-            <form className="settings-form" onSubmit={saveProvider}>
-              <div className="provider-form-heading">
-                <strong>{editingProvider ? "Edit provider" : "Add provider"}</strong>
-                {editingProvider && (
-                  <button type="button" className="text-button" onClick={resetProviderForm}>
-                    Cancel
-                  </button>
-                )}
-              </div>
-              <label>
-                Name
-                <input
-                  value={providerForm.name}
-                  onChange={(event) =>
-                    setProviderForm({
-                      ...providerForm,
-                      name: event.target.value,
-                    })
-                  }
-                  required
-                />
-              </label>
-              <label>
-                Type
-                <select
-                  value={providerForm.provider_type}
-                  disabled={Boolean(editingProvider)}
-                  onChange={(event) =>
-                    setProviderForm({
-                      ...providerForm,
-                      provider_type: event.target.value,
-                    })
-                  }
-                >
-                  <option value="llm">LLM</option>
-                  <option value="embedding">Embedding</option>
-                </select>
-              </label>
-              <label>
-                Model
-                <input
-                  value={providerForm.model}
-                  onChange={(event) =>
-                    setProviderForm({
-                      ...providerForm,
-                      model: event.target.value,
-                    })
-                  }
-                  required
-                />
-              </label>
-              <label>
-                Base URL
-                <input
-                  value={providerForm.base_url}
-                  onChange={(event) =>
-                    setProviderForm({
-                      ...providerForm,
-                      base_url: event.target.value,
-                    })
-                  }
-                  placeholder="Optional provider endpoint"
-                />
-              </label>
-              <label>
-                Secret
-                <input
-                  type="password"
-                  value={providerForm.secret}
-                  onChange={(event) =>
-                    setProviderForm({
-                      ...providerForm,
-                      secret: event.target.value,
-                    })
-                  }
-                  placeholder="Stored in local protected config"
-                />
-              </label>
-              <button className="primary-button compact" type="submit">
-                {editingProvider ? <Save size={14} /> : <Plus size={14} />}
-                {editingProvider ? "Save provider" : "Add provider"}
-              </button>
-            </form>
           </section>
           {config && (
-            <form className="settings-section" onSubmit={saveConfig}>
+            <form
+              className="settings-section"
+              ref={routeSectionRef}
+              onSubmit={saveConfig}
+            >
               <div className="section-heading">
                 <div>
-                  <span className="eyebrow">ROUTES AND SCHEMA</span>
-                  <h3>System configuration</h3>
+                  <span className="eyebrow">{t('MODEL ROUTES')}</span>
+                  <h3>{t('System configuration')}</h3>
                 </div>
                 <button
                   className="icon-button"
                   type="submit"
-                  aria-label="Save system configuration"
-                  title="Save system configuration"
+                  aria-label={t('Save system configuration')}
+                  title={t('Save system configuration')}
                 >
                   <Save size={15} />
                 </button>
               </div>
               <label>
-                DG-Agent LLM
+                {t('Definition Generation Agent')}
                 <select
+                  data-route-key="dg_agent_route"
                   value={config.routes.dg_agent_route || ""}
                   onChange={(event) =>
                     setRoute("dg_agent_route", event.target.value)
                   }
                 >
-                  <option value="">Select profile</option>
+                  <option value="">{t('Select profile')}</option>
                   {llmProviders.map((item) => (
                     <option key={item.id} value={item.id}>
                       {item.name}
@@ -643,14 +630,15 @@ export default function SettingsPanel({
                 </select>
               </label>
               <label>
-                GA-Agent LLM
+                {t('Group Arrangement Agent')}
                 <select
+                  data-route-key="ga_agent_route"
                   value={config.routes.ga_agent_route || ""}
                   onChange={(event) =>
                     setRoute("ga_agent_route", event.target.value)
                   }
                 >
-                  <option value="">Select profile</option>
+                  <option value="">{t('Select profile')}</option>
                   {llmProviders.map((item) => (
                     <option key={item.id} value={item.id}>
                       {item.name}
@@ -659,14 +647,15 @@ export default function SettingsPanel({
                 </select>
               </label>
               <label>
-                PGB-Agent LLM
+                {t('Property Graph Building Agent')}
                 <select
+                  data-route-key="pgb_agent_route"
                   value={config.routes.pgb_agent_route || ""}
                   onChange={(event) =>
                     setRoute("pgb_agent_route", event.target.value)
                   }
                 >
-                  <option value="">Select profile</option>
+                  <option value="">{t('Select profile')}</option>
                   {llmProviders.map((item) => (
                     <option key={item.id} value={item.id}>
                       {item.name}
@@ -675,14 +664,15 @@ export default function SettingsPanel({
                 </select>
               </label>
               <label>
-                Entity extraction LLM
+                {t('Entity Extraction Agent')}
                 <select
+                  data-route-key="entity_agent_route"
                   value={config.routes.entity_agent_route || ""}
                   onChange={(event) =>
                     setRoute("entity_agent_route", event.target.value)
                   }
                 >
-                  <option value="">Select profile</option>
+                  <option value="">{t('Select profile')}</option>
                   {llmProviders.map((item) => (
                     <option key={item.id} value={item.id}>
                       {item.name}
@@ -691,14 +681,15 @@ export default function SettingsPanel({
                 </select>
               </label>
               <label>
-                AI Query LLM
+                {t('AI Query LLM')}
                 <select
+                  data-route-key="ai_query_route"
                   value={config.routes.ai_query_route || ""}
                   onChange={(event) =>
                     setRoute("ai_query_route", event.target.value)
                   }
                 >
-                  <option value="">Select profile</option>
+                  <option value="">{t('Select profile')}</option>
                   {llmProviders.map((item) => (
                     <option key={item.id} value={item.id}>
                       {item.name}
@@ -707,40 +698,21 @@ export default function SettingsPanel({
                 </select>
               </label>
               <label>
-                Shared embedding
+                {t('Shared Embedding Model')}
                 <select
+                  data-route-key="shared_embedding_route"
                   value={config.routes.shared_embedding_route || ""}
                   onChange={(event) =>
                     setRoute("shared_embedding_route", event.target.value)
                   }
                 >
-                  <option value="">Select profile</option>
+                  <option value="">{t('Select profile')}</option>
                   {embeddingProviders.map((item) => (
                     <option key={item.id} value={item.id}>
                       {item.name}
                     </option>
                   ))}
                 </select>
-              </label>
-              <label>
-                Entity schema
-                <textarea
-                  value={config.entity_schema}
-                  onChange={(event) =>
-                    setConfig({ ...config, entity_schema: event.target.value })
-                  }
-                  rows={2}
-                />
-              </label>
-              <label>
-                Entity extraction prompt
-                <textarea
-                  value={config.entity_prompt}
-                  onChange={(event) =>
-                    setConfig({ ...config, entity_prompt: event.target.value })
-                  }
-                  rows={3}
-                />
               </label>
               <label className="toggle-row">
                 <input
@@ -753,7 +725,7 @@ export default function SettingsPanel({
                     })
                   }
                 />{" "}
-                Enable project MCP endpoints
+                {t('Enable project MCP endpoints')}
               </label>
               <div className="settings-checks">
                 <span
@@ -765,7 +737,7 @@ export default function SettingsPanel({
                         : "check-info"
                   }
                 >
-                  {neo4jStatus?.message || "Neo4j status unavailable"}
+                  {neo4jStatus?.message ? t(neo4jStatus.message) : t('Neo4j status unavailable')}
                 </span>
                 <span
                   className={
@@ -773,8 +745,8 @@ export default function SettingsPanel({
                   }
                 >
                   {storageStatus?.writable
-                    ? "Storage writable"
-                    : "Storage check unavailable"}
+                    ? t('Storage writable')
+                    : t('Storage check unavailable')}
                 </span>
               </div>
             </form>
@@ -786,8 +758,8 @@ export default function SettingsPanel({
           <section className="settings-section">
             <div className="section-heading">
               <div>
-                <span className="eyebrow">USERS</span>
-                <h3>User accounts</h3>
+                <span className="eyebrow">{t('USERS')}</span>
+                <h3>{t('User accounts')}</h3>
               </div>
               <UsersRound size={16} />
             </div>
@@ -796,21 +768,21 @@ export default function SettingsPanel({
                 <div className="settings-list-row" key={item.id}>
                   <span>
                     {item.username}
-                    <small>{item.disabled ? "Disabled" : "Active"}</small>
+                    <small>{t(item.disabled ? "Disabled" : "Active")}</small>
                   </span>
                   <button
                     type="button"
                     className="text-button"
                     onClick={() => disableUser(item)}
                   >
-                    {item.disabled ? "Enable" : "Disable"}
+                    {t(item.disabled ? "Enable" : "Disable")}
                   </button>
                 </div>
               ))}
             </div>
             <form className="settings-form" onSubmit={createUser}>
               <label>
-                Username
+                {t('Username')}
                 <input
                   value={userForm.username}
                   onChange={(event) =>
@@ -820,7 +792,7 @@ export default function SettingsPanel({
                 />
               </label>
               <label>
-                Temporary password
+                {t('Temporary password')}
                 <input
                   type="password"
                   minLength={8}
@@ -832,15 +804,15 @@ export default function SettingsPanel({
                 />
               </label>
               <button className="primary-button compact" type="submit">
-                <Plus size={14} /> Add user
+                <Plus size={14} /> {t('Add user')}
               </button>
             </form>
           </section>
           <section className="settings-section">
             <div className="section-heading">
               <div>
-                <span className="eyebrow">GROUPS</span>
-                <h3>Group membership</h3>
+                <span className="eyebrow">{t('GROUPS')}</span>
+                <h3>{t('Group membership')}</h3>
               </div>
               <UsersRound size={16} />
             </div>
@@ -853,7 +825,7 @@ export default function SettingsPanel({
             </div>
             <form className="settings-form" onSubmit={createGroup}>
               <label>
-                Group name
+                {t('Group name')}
                 <input
                   value={groupName}
                   onChange={(event) => setGroupName(event.target.value)}
@@ -861,7 +833,7 @@ export default function SettingsPanel({
                 />
               </label>
               <button className="primary-button compact" type="submit">
-                <Plus size={14} /> Add group
+                <Plus size={14} /> {t('Add group')}
               </button>
             </form>
             <form
@@ -869,9 +841,9 @@ export default function SettingsPanel({
               onSubmit={addMember}
             >
               <label>
-                Member user
+                {t('Member user')}
                 <select
-                  aria-label="Member user"
+                  aria-label={t('Member user')}
                   value={memberForm.user_id}
                   onChange={(event) =>
                     setMemberForm({
@@ -881,7 +853,7 @@ export default function SettingsPanel({
                   }
                   required
                 >
-                  <option value="">Select user</option>
+                  <option value="">{t('Select user')}</option>
                   {users.map((item) => (
                     <option key={item.id} value={item.id}>
                       {item.username}
@@ -890,9 +862,9 @@ export default function SettingsPanel({
                 </select>
               </label>
               <label>
-                Member group
+                {t('Member group')}
                 <select
-                  aria-label="Member group"
+                  aria-label={t('Member group')}
                   value={memberForm.group_id}
                   onChange={(event) =>
                     setMemberForm({
@@ -902,7 +874,7 @@ export default function SettingsPanel({
                   }
                   required
                 >
-                  <option value="">Select group</option>
+                  <option value="">{t('Select group')}</option>
                   {groups.map((item) => (
                     <option key={item.id} value={item.id}>
                       {item.name}
@@ -911,15 +883,15 @@ export default function SettingsPanel({
                 </select>
               </label>
               <button className="primary-button compact" type="submit">
-                <Plus size={14} /> Add member
+                <Plus size={14} /> {t('Add member')}
               </button>
             </form>
           </section>
           <section className="settings-section roles-section">
             <div className="section-heading">
               <div>
-                <span className="eyebrow">ROLES</span>
-                <h3>Capability grants</h3>
+                <span className="eyebrow">{t('ROLES')}</span>
+                <h3>{t('Capability grants')}</h3>
               </div>
               <Shield size={16} />
             </div>
@@ -930,8 +902,8 @@ export default function SettingsPanel({
                     {item.name}
                     <small>
                       {item.immutable
-                        ? "Built-in"
-                        : item.capabilities.join(", ") || "No capabilities"}
+                        ? t('Built-in')
+                        : item.capabilities.join(", ") || t('No capabilities')}
                     </small>
                   </span>
                 </div>
@@ -939,7 +911,7 @@ export default function SettingsPanel({
             </div>
             <form className="settings-form role-editor" onSubmit={createRole}>
               <label>
-                Role name
+                {t('Role name')}
                 <input
                   value={roleForm.name}
                   onChange={(event) =>
@@ -955,7 +927,7 @@ export default function SettingsPanel({
                 }
               />
               <button className="primary-button compact" type="submit">
-                <Plus size={14} /> Add role
+                <Plus size={14} /> {t('Add role')}
               </button>
             </form>
             <form
@@ -963,9 +935,9 @@ export default function SettingsPanel({
               onSubmit={addGroupRole}
             >
               <label>
-                Role group
+                {t('Role group')}
                 <select
-                  aria-label="Role group"
+                  aria-label={t('Role group')}
                   value={roleGroupForm.group_id}
                   onChange={(event) =>
                     setRoleGroupForm({
@@ -975,7 +947,7 @@ export default function SettingsPanel({
                   }
                   required
                 >
-                  <option value="">Select group</option>
+                  <option value="">{t('Select group')}</option>
                   {groups.map((item) => (
                     <option key={item.id} value={item.id}>
                       {item.name}
@@ -984,9 +956,9 @@ export default function SettingsPanel({
                 </select>
               </label>
               <label>
-                Role
+                {t('Role')}
                 <select
-                  aria-label="Role"
+                  aria-label={t('Role')}
                   value={roleGroupForm.role_id}
                   onChange={(event) =>
                     setRoleGroupForm({
@@ -996,7 +968,7 @@ export default function SettingsPanel({
                   }
                   required
                 >
-                  <option value="">Select role</option>
+                  <option value="">{t('Select role')}</option>
                   {roles.map((item) => (
                     <option key={item.id} value={item.id}>
                       {item.name}
@@ -1005,7 +977,7 @@ export default function SettingsPanel({
                 </select>
               </label>
               <button className="primary-button compact" type="submit">
-                <Plus size={14} /> Assign role
+                <Plus size={14} /> {t('Assign role')}
               </button>
             </form>
           </section>
@@ -1014,32 +986,21 @@ export default function SettingsPanel({
       {tab === "profile" && (
         <div className="settings-content">
           <section className="settings-section">
-            <span className="eyebrow">ACCOUNT</span>
-            <h3>{profile?.username || "Current user"}</h3>
+            <span className="eyebrow">{t('ACCOUNT')}</span>
+            <h3>{profile?.username || t('Current user')}</h3>
             <p className="muted">
-              Groups:{" "}
-              {profile?.groups.map((group) => group.name).join(", ") || "None"}
+              {t('Groups')}: {" "}
+              {profile?.groups.map((group) => group.name).join(", ") || t('None')}
             </p>
             <p className="muted">
-              Roles:{" "}
-              {profile?.roles.map((role) => role.name).join(", ") || "None"}
+              {t('Roles')}: {" "}
+              {profile?.roles.map((role) => role.name).join(", ") || t('None')}
             </p>
             <div className="capability-cloud">
               {(profile?.capabilities || []).map((capability) => (
                 <span key={capability}>{capability}</span>
               ))}
             </div>
-            <label className="toggle-row">
-              <input
-                type="checkbox"
-                aria-label="Compact density"
-                checked={profile?.preferences.compact_mode === true}
-                onChange={(event) =>
-                  updatePreference("compact_mode", event.target.checked)
-                }
-              />{" "}
-              Compact density
-            </label>
           </section>
           <form
             className="settings-section settings-form"
@@ -1047,13 +1008,13 @@ export default function SettingsPanel({
           >
             <div className="section-heading">
               <div>
-                <span className="eyebrow">SECURITY</span>
-                <h3>Change password</h3>
+                <span className="eyebrow">{t('SECURITY')}</span>
+                <h3>{t('Change password')}</h3>
               </div>
               <KeyRound size={16} />
             </div>
             <label>
-              Current password
+              {t('Current password')}
               <input
                 type="password"
                 value={passwordForm.current_password}
@@ -1067,7 +1028,7 @@ export default function SettingsPanel({
               />
             </label>
             <label>
-              New password
+              {t('New password')}
               <input
                 type="password"
                 minLength={8}
@@ -1082,11 +1043,141 @@ export default function SettingsPanel({
               />
             </label>
             <button className="primary-button compact" type="submit">
-              <KeyRound size={14} /> Change password
+              <KeyRound size={14} /> {t('Change password')}
             </button>
           </form>
         </div>
       )}
-    </FloatingWindow>
+      </FloatingWindow>
+      <FloatingWindow
+        open={providerDialogOpen && open && !dismissed}
+        className="modal-backdrop provider-editor-backdrop"
+        role="presentation"
+      >
+        <section
+          className="upload-modal provider-editor-modal"
+          role="dialog"
+          aria-modal="true"
+          aria-label={t(editingProvider ? "Edit model provider" : "Add model provider")}
+        >
+          <header className="provider-editor-header">
+            <div>
+              <span className="eyebrow">{t('MODEL PROVIDER')}</span>
+              <h2>{t(editingProvider ? "Edit provider" : "Add provider")}</h2>
+            </div>
+            <button
+              type="button"
+              className="icon-button"
+              aria-label={t('Close provider dialog')}
+              title={t('Close provider dialog')}
+              onClick={closeProviderDialog}
+            >
+              <X size={17} />
+            </button>
+          </header>
+          {error && (
+            <div className="error-banner provider-editor-error">
+              {error}
+              <button
+                type="button"
+                aria-label={t('Dismiss provider error')}
+                onClick={() => setError("")}
+              >
+                <X size={14} />
+              </button>
+            </div>
+          )}
+          <form className="settings-form provider-editor-form" onSubmit={saveProvider}>
+            <label>
+              {t('Name')}
+              <input
+                autoFocus
+                value={providerForm.name}
+                onChange={(event) =>
+                  setProviderForm((current) => ({
+                    ...current,
+                    name: event.target.value,
+                  }))
+                }
+                required
+              />
+            </label>
+            <label>
+              {t('Type')}
+              <select
+                value={providerForm.provider_type}
+                disabled={Boolean(editingProvider)}
+                onChange={(event) =>
+                  setProviderForm((current) => ({
+                    ...current,
+                    provider_type: event.target.value,
+                  }))
+                }
+              >
+                <option value="llm">{t('LLM')}</option>
+                <option value="embedding">{t('Embedding')}</option>
+              </select>
+            </label>
+            <label>
+              {t('Model')}
+              <input
+                value={providerForm.model}
+                onChange={(event) =>
+                  setProviderForm((current) => ({
+                    ...current,
+                    model: event.target.value,
+                  }))
+                }
+                required
+              />
+            </label>
+            <label>
+              {t('Base URL')}
+              <input
+                value={providerForm.base_url}
+                onChange={(event) =>
+                  setProviderForm((current) => ({
+                    ...current,
+                    base_url: event.target.value,
+                  }))
+                }
+                placeholder={t('Optional provider endpoint')}
+              />
+            </label>
+            <label>
+              {t('Secret')}
+              <input
+                type="password"
+                value={providerForm.secret}
+                onChange={(event) =>
+                  setProviderForm((current) => ({
+                    ...current,
+                    secret: event.target.value,
+                  }))
+                }
+                placeholder={
+                  editingProvider
+                    ? t('Leave blank to keep the current secret')
+                    : t('Stored in local protected config')
+                }
+              />
+            </label>
+            <div className="modal-actions provider-editor-actions">
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={closeProviderDialog}
+              >
+                {t('Cancel')}
+              </button>
+              <button className="primary-button" type="submit">
+                {editingProvider ? <Save size={14} /> : <Plus size={14} />}
+                {t(editingProvider ? "Save provider" : "Add provider")}
+              </button>
+            </div>
+          </form>
+        </section>
+      </FloatingWindow>
+    </>
   );
 }

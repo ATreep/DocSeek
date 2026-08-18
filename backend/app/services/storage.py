@@ -1,12 +1,21 @@
 import re
+import unicodedata
 from pathlib import Path
 
 from ..config import Settings
 
 
 def safe_filename(filename: str) -> str:
-    name = Path(filename or "property").name
-    name = re.sub(r"[^A-Za-z0-9._ -]+", "_", name).strip(" .")
+    normalized = unicodedata.normalize("NFC", filename or "property")
+    name = Path(normalized.replace("\\", "/")).name
+    name = "".join(
+        "_"
+        if character in '<>:"|?*' or unicodedata.category(character).startswith("C")
+        else character
+        for character in name
+    )
+    name = re.sub(r"_+", "_", name)
+    name = re.sub(r"\s+", " ", name).strip(" .")
     return name or "property"
 
 
@@ -16,6 +25,42 @@ def property_dir(settings: Settings, project_id: str) -> Path:
     return path
 
 
+def extracted_text_dir(settings: Settings, project_id: str) -> Path:
+    path = settings.projects_dir / project_id / "extracted-text"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def property_text_path(settings: Settings, project_id: str, property_id: str) -> Path:
+    if not property_id or Path(property_id).name != property_id:
+        raise ValueError("Invalid property id")
+    return extracted_text_dir(settings, project_id) / f"{property_id}.txt"
+
+
+def write_property_text(
+    settings: Settings, project_id: str, property_id: str, content: str
+) -> Path:
+    target = property_text_path(settings, project_id, property_id)
+    target.write_text(str(content or "").strip(), encoding="utf-8")
+    return target
+
+
+def read_property_text(
+    settings: Settings, project_id: str, property_id: str
+) -> str | None:
+    path = property_text_path(settings, project_id, property_id)
+    if not path.is_file():
+        return None
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def delete_property_text(settings: Settings, project_id: str, property_id: str) -> None:
+    property_text_path(settings, project_id, property_id).unlink(missing_ok=True)
+
+
 def safe_directory(directory: str) -> Path:
     normalized = (directory or "").strip().strip("/")
     if not normalized or normalized == ".":
@@ -23,7 +68,7 @@ def safe_directory(directory: str) -> Path:
     parts = Path(normalized).parts
     if any(
         part in {"", ".", ".."}
-        or not re.fullmatch(r"[A-Za-z0-9_-]+(?: [A-Za-z0-9_-]+)*", part)
+        or not re.fullmatch(r"[\w-]+(?: [\w-]+)*", part)
         for part in parts
     ):
         raise ValueError("Directory may contain only safe folder names")

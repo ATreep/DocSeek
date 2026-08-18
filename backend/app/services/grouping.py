@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import shutil
 import tempfile
+import hashlib
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,6 +27,7 @@ def apply_group_placements(
     project_id: str,
     catalog_rows: list[dict],
     placements: dict[str, str],
+    filenames: dict[str, str] | None = None,
 ) -> list[dict]:
     project_root = settings.projects_dir / project_id
     properties_root = property_dir(settings, project_id)
@@ -38,7 +41,9 @@ def apply_group_placements(
         requested_directory = placements.get(property_id, _stored_directory(row))
         directory_path = safe_directory(requested_directory)
         directory = "" if directory_path == Path() else directory_path.as_posix()
-        filename = safe_filename(str(row.get("filename") or "property"))
+        filename = safe_filename(
+            str((filenames or {}).get(property_id) or row.get("filename") or "property")
+        )
         source = project_root / str(row.get("relative_path") or "")
         target = properties_root / directory_path / filename
         target_key = str(target).casefold()
@@ -47,6 +52,7 @@ def apply_group_placements(
         target_paths[target_key] = property_id
         updated_rows.append({
             **row,
+            "filename": filename,
             "directory": directory,
             "relative_path": str(target.relative_to(project_root)),
             "updated_at": updated_at,
@@ -84,3 +90,20 @@ def apply_group_placements(
         raise
     finally:
         shutil.rmtree(staging_root, ignore_errors=True)
+
+
+def catalog_signature(catalog_rows: list[dict]) -> str:
+    payload = [
+        {
+            "id": str(row.get("id") or ""),
+            "filename": str(row.get("filename") or ""),
+            "directory": _stored_directory(row),
+            "relative_path": str(row.get("relative_path") or ""),
+            "updated_at": str(row.get("updated_at") or ""),
+        }
+        for row in sorted(catalog_rows, key=lambda item: str(item.get("id") or ""))
+    ]
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()

@@ -3,7 +3,13 @@ from __future__ import annotations
 import httpx
 import json
 import os
+from typing import Any
 from pydantic import SecretStr
+
+from .display_language import localized_messages
+from .model_errors import attach_model_response
+from .retry import retry_model_call
+from .system_prompts import MODEL_PROVIDER_VALIDATION_SYSTEM_PROMPT
 
 
 class ProviderError(RuntimeError):
@@ -97,9 +103,23 @@ def probe_provider_profile(settings, profile_id: str) -> dict[str, str | int | b
     try:
         if profile["provider_type"] == "llm":
             # Reasoning models can consume a short budget before emitting visible content.
-            provider.complete([{"role": "user", "content": "Reply with OK."}], temperature=0, max_tokens=32)
+            retry_model_call(
+                lambda: provider.complete(
+                    localized_messages([
+                        {
+                            "role": "system",
+                            "content": MODEL_PROVIDER_VALIDATION_SYSTEM_PROMPT,
+                        },
+                        {"role": "user", "content": "Reply with OK."},
+                    ]),
+                    temperature=0,
+                    max_tokens=32,
+                )
+            )
             return {"ready": True, "provider_type": "llm", "model": profile["model"]}
-        vectors = provider.embed(["DocSeek provider health check"])
+        vectors = retry_model_call(
+            lambda: provider.embed(["DocSeek provider health check"])
+        )
         return {"ready": True, "provider_type": "embedding", "model": profile["model"], "dimensions": len(vectors[0]) if vectors else 0}
     finally:
         provider.close()
@@ -135,6 +155,7 @@ class _OpenAICompatibleProvider:
         }
 
     def _post(self, payload: dict) -> dict:
+        response: httpx.Response | None = None
         try:
             response = self.client.post(
                 f"{self.base_url}/{self.endpoint}",
@@ -148,9 +169,15 @@ class _OpenAICompatibleProvider:
         except (httpx.HTTPError, ValueError) as exc:
             status = getattr(getattr(exc, "response", None), "status_code", None)
             suffix = f" (HTTP {status})" if status else ""
-            raise ProviderError(f"provider request failed{suffix}") from exc
+            response_text = response.text if response is not None else ""
+            raise attach_model_response(
+                ProviderError(f"provider request failed{suffix}"), response_text
+            ) from exc
         if not isinstance(body, dict):
-            raise ProviderError("provider returned an invalid response")
+            raise attach_model_response(
+                ProviderError("provider returned an invalid response"),
+                json.dumps(body, ensure_ascii=False),
+            )
         return body
 
 
@@ -162,21 +189,36 @@ class OpenAIChatProvider(_OpenAICompatibleProvider):
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
         body = self._post(payload)
+        raw_response = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
         try:
             content = body["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
-            raise ProviderError("provider returned no chat content") from exc
+            raise attach_model_response(
+                ProviderError("provider returned no chat content"), raw_response
+            ) from exc
         if not isinstance(content, str) or not content.strip():
-            raise ProviderError("provider returned empty chat content")
+            raise attach_model_response(
+                ProviderError("provider returned empty chat content"), raw_response
+            )
         return content.strip()
 
-    def stream(self, messages: list[dict[str, str]], *, temperature: float = 0.2):
+    def stream_with_tools(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        temperature: float = 0.2,
+        tools: list[dict[str, Any]] | None = None,
+    ):
         payload = {
             "model": self.model,
             "messages": messages,
             "temperature": temperature,
             "stream": True,
         }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+        tool_calls: dict[int, dict[str, Any]] = {}
         try:
             with self.client.stream(
                 "POST",
@@ -190,7 +232,7 @@ class OpenAIChatProvider(_OpenAICompatibleProvider):
                         continue
                     data = line[5:].strip()
                     if data == "[DONE]":
-                        return
+                        break
                     try:
                         body = json.loads(data)
                     except json.JSONDecodeError as exc:
@@ -214,13 +256,67 @@ class OpenAIChatProvider(_OpenAICompatibleProvider):
                     if content is not None and not isinstance(content, str):
                         raise ProviderError("provider returned an invalid streaming response")
                     if isinstance(content, str) and content:
-                        yield content
+                        yield {"type": "content", "content": content}
+                    raw_tool_calls = delta.get("tool_calls")
+                    if raw_tool_calls is None:
+                        continue
+                    if not isinstance(raw_tool_calls, list):
+                        raise ProviderError("provider returned an invalid streaming response")
+                    for raw_call in raw_tool_calls:
+                        if not isinstance(raw_call, dict) or not isinstance(
+                            raw_call.get("index"), int
+                        ):
+                            raise ProviderError(
+                                "provider returned an invalid streaming response"
+                            )
+                        index = raw_call["index"]
+                        call = tool_calls.setdefault(
+                            index,
+                            {
+                                "id": "",
+                                "type": "function",
+                                "function": {"name": "", "arguments": ""},
+                            },
+                        )
+                        if isinstance(raw_call.get("id"), str):
+                            call["id"] = raw_call["id"]
+                        if isinstance(raw_call.get("type"), str):
+                            call["type"] = raw_call["type"]
+                        function = raw_call.get("function")
+                        if function is None:
+                            continue
+                        if not isinstance(function, dict):
+                            raise ProviderError(
+                                "provider returned an invalid streaming response"
+                            )
+                        name = function.get("name")
+                        arguments = function.get("arguments")
+                        if name is not None and not isinstance(name, str):
+                            raise ProviderError(
+                                "provider returned an invalid streaming response"
+                            )
+                        if arguments is not None and not isinstance(arguments, str):
+                            raise ProviderError(
+                                "provider returned an invalid streaming response"
+                            )
+                        call["function"]["name"] += name or ""
+                        call["function"]["arguments"] += arguments or ""
         except ProviderError:
             raise
         except httpx.HTTPError as exc:
             status = getattr(getattr(exc, "response", None), "status_code", None)
             suffix = f" (HTTP {status})" if status else ""
             raise ProviderError(f"provider streaming request failed{suffix}") from exc
+        if tool_calls:
+            yield {
+                "type": "tool_calls",
+                "tool_calls": [tool_calls[index] for index in sorted(tool_calls)],
+            }
+
+    def stream(self, messages: list[dict[str, Any]], *, temperature: float = 0.2):
+        for event in self.stream_with_tools(messages, temperature=temperature):
+            if event["type"] == "content":
+                yield event["content"]
 
 
 class OpenAIEmbeddingProvider(_OpenAICompatibleProvider):
