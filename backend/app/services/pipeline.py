@@ -5,18 +5,19 @@ import base64
 import mimetypes
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Event, Thread
-from typing import TypedDict
+from threading import Event, Lock, Semaphore, Thread
+from typing import Callable, Sequence, TypeVar, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
 from ..config import Settings
 from ..db import connect
 from ..api.projects import release_lock
-from .agents import DGAgent, GAAgent, PGBAgent, validate_edge_proposals
+from .agents import DGAgent, GAAgent, PGBAgent
 from .catalog import PropertyCatalog
 from .extraction_text import (
     DEFAULT_EXTRACTION_TEXT_MAX_CHARS,
@@ -24,8 +25,10 @@ from .extraction_text import (
     TemporaryExtractionStore,
     select_extraction_text,
 )
+from .display_language import current_display_language, run_in_display_language
 from .grouping import apply_group_placements
 from .model_errors import extract_model_response
+from .parallelism import load_batch_llm_concurrency
 from .graph_store import (
     DEFAULT_ENTITY_PROMPT,
     DEFAULT_ENTITY_SCHEMA,
@@ -37,8 +40,17 @@ from .graph_store import (
     embeddings_for_texts,
     entity_embedding_text,
     prune_property_snapshot,
+    prune_properties_snapshot,
 )
 from .providers import chat_provider, embedding_provider, provider_route_metadata
+from .relation_batches import (
+    CollectionPair,
+    apply_entity_merges,
+    consolidate_exact_entity_ids,
+    deduplicate_edges,
+    merge_call_specs,
+    relation_call_specs,
+)
 from .parsers import extract_text
 from .storage import delete_property_text, move_original, read_property_text, safe_directory, write_property_text
 
@@ -77,6 +89,149 @@ class JobCancelled(Exception):
 
 
 JOB_HEARTBEAT_SECONDS = 10.0
+BatchResult = TypeVar("BatchResult")
+
+
+def _batch_llm_workers(settings: Settings, total: int) -> int:
+    return max(1, min(total, load_batch_llm_concurrency(settings)))
+
+
+def _run_bounded_calls(
+    settings: Settings,
+    job_id: str,
+    calls: Sequence[CollectionPair],
+    worker: Callable[[CollectionPair], BatchResult],
+    *,
+    thread_name_prefix: str,
+    on_complete: Callable[[int, int], None] | None = None,
+) -> list[BatchResult]:
+    if not calls:
+        return []
+    output_language = current_display_language()
+    results: dict[int, BatchResult] = {}
+    with ThreadPoolExecutor(
+        max_workers=_batch_llm_workers(settings, len(calls)),
+        thread_name_prefix=thread_name_prefix,
+    ) as executor:
+        futures = {
+            executor.submit(
+                run_in_display_language,
+                output_language,
+                worker,
+                call,
+            ): index
+            for index, call in enumerate(calls)
+        }
+        for completed, future in enumerate(as_completed(futures), start=1):
+            _raise_if_cancelled(settings, job_id)
+            results[futures[future]] = future.result()
+            if on_complete is not None:
+                on_complete(completed, len(calls))
+    return [results[index] for index in range(len(calls))]
+
+
+def _flatten_call_results(
+    results: Sequence[Sequence[dict]],
+) -> list[dict]:
+    return [item for result in results for item in result]
+
+
+def _generate_property_relation_edges(
+    settings: Settings,
+    job_id: str,
+    properties: list[dict],
+    active_property_graph: dict,
+    processed_property_ids: set[str],
+    on_progress: Callable[[int], None],
+    llm_slots: Semaphore | None = None,
+) -> list[dict]:
+    active_property_nodes = active_property_graph.get("nodes", [])
+    active_property_ids = {
+        str(item.get("id") or "")
+        for item in active_property_nodes
+        if item.get("id")
+    }
+    if not active_property_ids:
+        processed_property_ids = {
+            str(item.get("id") or "") for item in properties
+        }
+    new_properties = [
+        item
+        for item in properties
+        if str(item.get("id") or "") in processed_property_ids
+    ]
+    old_properties = [
+        item
+        for item in properties
+        if str(item.get("id") or "") not in processed_property_ids
+    ]
+    within_calls, cross_calls = relation_call_specs(
+        new_properties,
+        old_properties,
+    )
+    total = len(within_calls) + len(cross_calls)
+
+    def report(completed: int) -> None:
+        on_progress(
+            min(100, max(0, int(completed * 100 / total))) if total else 100
+        )
+
+    def invoke_worker(pair: CollectionPair) -> list[dict]:
+        pgb_agent = PGBAgent(settings=settings)
+        try:
+            propose_pair = getattr(pgb_agent, "propose_pair", None)
+            if callable(propose_pair):
+                return propose_pair(pair)
+            return pgb_agent.propose([*pair.left, *pair.right])
+        finally:
+            provider = getattr(pgb_agent, "provider", None)
+            close = getattr(provider, "close", None)
+            if close:
+                close()
+
+    def worker(pair: CollectionPair) -> list[dict]:
+        if llm_slots is None:
+            return invoke_worker(pair)
+        with llm_slots:
+            return invoke_worker(pair)
+
+    report(0)
+    with _job_heartbeat(settings, job_id):
+        within_results = _run_bounded_calls(
+            settings,
+            job_id,
+            within_calls,
+            worker,
+            thread_name_prefix="property-relations-within",
+            on_complete=lambda completed, _total: report(completed),
+        )
+        cross_results = _run_bounded_calls(
+            settings,
+            job_id,
+            cross_calls,
+            worker,
+            thread_name_prefix="property-relations-cross",
+            on_complete=lambda completed, _total: report(
+                len(within_calls) + completed
+            ),
+        )
+    report(total)
+    old_property_ids = {
+        str(item.get("id") or "") for item in old_properties
+    }
+    preserved_edges = [
+        edge
+        for edge in active_property_graph.get("edges", [])
+        if str(edge.get("source") or "") in old_property_ids
+        and str(edge.get("target") or "") in old_property_ids
+    ]
+    return deduplicate_edges(
+        [
+            *preserved_edges,
+            *_flatten_call_results(within_results),
+            *_flatten_call_results(cross_results),
+        ]
+    )
 
 
 def _job_timings(raw: str | None) -> dict[str, float]:
@@ -134,7 +289,13 @@ def _transition_job(
             (job_id,),
         ).fetchone()
         timings = _job_timings(current["timings_json"] if current else None)
-        if current and current["stage"] and current["stage_started_at"]:
+        same_stage = bool(current and current["stage"] == stage)
+        if (
+            current
+            and not same_stage
+            and current["stage"]
+            and current["stage_started_at"]
+        ):
             try:
                 started = datetime.fromisoformat(current["stage_started_at"])
             except ValueError:
@@ -144,11 +305,16 @@ def _transition_job(
                 timings[current["stage"]] = round(
                     timings.get(current["stage"], 0.0) + elapsed, 3
                 )
+        stage_started_at = (
+            current["stage_started_at"]
+            if same_stage and current["stage_started_at"]
+            else now.isoformat()
+        )
         fields = {
             "stage": stage,
             "status": status,
             "heartbeat": now.isoformat(),
-            "stage_started_at": now.isoformat(),
+            "stage_started_at": stage_started_at,
             "stage_detail": detail,
             "timings_json": json.dumps(timings, separators=(",", ":")),
             **extra,
@@ -592,11 +758,46 @@ def build_workflow(graph_store: Neo4jGraphStore):
                 )
         with connect(settings.sqlite_path) as db:
             config = {row["key"]: row["value"] for row in db.execute("SELECT key,value FROM system_config WHERE key IN ('entity_schema','entity_prompt')")}
+        # A retry reads the candidate checkpoint so completed entity extraction
+        # is preserved, but relation generation must compare those entities with
+        # the graph that was active before this batch started.  Using the
+        # checkpoint as both graphs makes every recovered entity look "old" and
+        # therefore produces no relation-generation calls.
         current_entity_graph = graph_store.graph(
             project_id, "entity", resume_snapshot_id
         ) or {}
         current_entities = current_entity_graph.get("nodes", [])
         current_entity_edges = current_entity_graph.get("edges", [])
+        if is_batch_add and resume_snapshot_id:
+            baseline_entity_graph = graph_store.graph(project_id, "entity") or {}
+        else:
+            baseline_entity_graph = current_entity_graph
+        baseline_entities = baseline_entity_graph.get("nodes", [])
+        baseline_entity_edges = baseline_entity_graph.get("edges", [])
+        checkpoint_resume = bool(is_batch_add and resume_snapshot_id)
+        baseline_entities_by_id = {
+            str(entity.get("id") or ""): entity
+            for entity in baseline_entities
+            if entity.get("id")
+        }
+        recovered_generated_entities = []
+        for entity in current_entities:
+            entity_id = str(entity.get("id") or "")
+            if not entity_id:
+                continue
+            baseline_entity = baseline_entities_by_id.get(entity_id)
+            if baseline_entity is None or (
+                checkpoint_resume
+                and (
+                    entity.get("source_property_ids")
+                    != baseline_entity.get("source_property_ids")
+                    or entity.get("source_contexts")
+                    != baseline_entity.get("source_contexts")
+                )
+            ):
+                # Same-ID extraction results are included as a recovered delta
+                # so exact-ID consolidation retains their new source metadata.
+                recovered_generated_entities.append(dict(entity))
         documents_by_property_id = {
             document["property_id"]: document for document in documents
         }
@@ -623,8 +824,12 @@ def build_workflow(graph_store: Neo4jGraphStore):
                 for document in entity_documents
                 if document["property_id"] not in completed_property_ids
             ]
-        extraction_store = TemporaryExtractionStore(settings)
+        entity_generation_total = (
+            len(batch_property_ids) if is_batch_add else len(entity_documents)
+        )
         embedder = embedding_provider(settings, route_key="shared_embedding_route")
+        output_language = current_display_language()
+        property_relation_executor: ThreadPoolExecutor | None = None
         try:
             _transition_job(
                 settings,
@@ -636,151 +841,417 @@ def build_workflow(graph_store: Neo4jGraphStore):
                 vectors = embeddings_for_texts(pending_embedding_texts, embedder)
                 for index, vector in zip(pending_embedding_indexes, vectors):
                     properties[index]["embedding"] = vector
-            entity_llm = chat_provider(
-                settings,
-                route_key="entity_agent_route",
-                timeout=settings.entity_agent_timeout_seconds,
+            progress_lock = Lock()
+            shared_llm_slots = Semaphore(load_batch_llm_concurrency(settings))
+            combined_progress = {
+                "entities": len(completed_property_ids),
+                "property_relations": 0,
+            }
+
+            def update_combined_progress(
+                *,
+                entities: int | None = None,
+                property_relations: int | None = None,
+            ) -> None:
+                with progress_lock:
+                    if entities is not None:
+                        combined_progress["entities"] = entities
+                    if property_relations is not None:
+                        combined_progress["property_relations"] = property_relations
+                    entity_percent = (
+                        min(
+                            100,
+                            max(
+                                0,
+                                int(
+                                    combined_progress["entities"]
+                                    * 100
+                                    / entity_generation_total
+                                ),
+                            ),
+                        )
+                        if entity_generation_total
+                        else 100
+                    )
+                    combined_percent = int(
+                        (entity_percent + combined_progress["property_relations"])
+                        / 2
+                    )
+                    _transition_job(
+                        settings,
+                        state["job_id"],
+                        "graph-entity-property-relations",
+                        detail=(
+                            "Generating entity nodes and property relations: "
+                            f"{combined_percent}%"
+                        ),
+                    )
+
+            processed_property_ids = set(batch_property_ids)
+            if not processed_property_ids and state.get("property_id"):
+                processed_property_ids.add(str(state["property_id"]))
+            update_combined_progress()
+            entity_generation_started = Event()
+
+            def generate_property_relations() -> list[dict]:
+                entity_generation_started.wait()
+                return _generate_property_relation_edges(
+                    settings,
+                    state["job_id"],
+                    properties,
+                    active_property_graph,
+                    processed_property_ids,
+                    lambda percent: update_combined_progress(
+                        property_relations=percent
+                    ),
+                    shared_llm_slots,
+                )
+
+            property_relation_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="property-relations-stage",
             )
-            entity_builder = GraphRAGBuilder(
-                config.get("entity_schema", DEFAULT_ENTITY_SCHEMA),
-                config.get("entity_prompt", DEFAULT_ENTITY_PROMPT),
-                settings.neo4j_entity_database,
-                llm=entity_llm,
-            )
-            _transition_job(
-                settings,
-                state["job_id"],
-                "graph-entity-extraction",
-                detail=(
-                    f"Preparing {len(entity_documents)} new properties for entity extraction"
-                    if is_batch_add
-                    else f"Analyzing new property against {len(current_entities)} existing entities"
-                    if incremental_entity_add
-                    else f"Analyzing {len(entity_documents)} text documents"
-                ),
+            property_relation_future = property_relation_executor.submit(
+                run_in_display_language,
+                output_language,
+                generate_property_relations,
             )
             try:
-                temporary_extraction_paths: list[Path] = []
+                generated_entities: list[dict] = list(recovered_generated_entities)
+                entities = list(current_entities) if checkpoint_resume else (
+                    list(baseline_entities) if incremental_entity_add else []
+                )
+                entity_edges = list(current_entity_edges) if checkpoint_resume else list(
+                    baseline_entity_edges
+                )
+                checkpoint_snapshot_id = None
+                total_batch_items = entity_generation_total
+                filenames_by_property_id = {
+                    document["property_id"]: document.get("filename")
+                    or document["property_id"]
+                    for document in entity_documents
+                }
                 if is_batch_add:
-                    entities = current_entities
-                    entity_edges = current_entity_edges
                     checkpoint_snapshot_id = (
                         resume_snapshot_id or f"{state['job_id']}-checkpoint"
                     )
-                    total_batch_items = len(batch_property_ids)
-                    for document in entity_documents:
-                        _raise_if_cancelled(settings, state["job_id"])
-                        prepared_document, selection = _prepare_entity_document(
-                            document,
-                            entities,
-                        )
-                        extraction_path = extraction_store.save(
-                            project_id,
-                            state["job_id"],
-                            document["property_id"],
-                            selection,
-                        )
-                        temporary_extraction_paths.append(extraction_path)
-                        filename = next(
-                            (
-                                item["filename"]
-                                for item in batch_items
-                                if item["property_id"] == document["property_id"]
+                    filenames_by_property_id.update(
+                        {
+                            item["property_id"]: item["filename"]
+                            for item in batch_items
+                        }
+                    )
+
+                # Entity extraction receives the original property document. Do not
+                # run the relevance/section selection pass here: GraphRAGBuilder
+                # retains its own 12,000-character overlapping chunk mechanism for
+                # documents that exceed the model context budget.
+                entity_items = []
+                for index, document in enumerate(entity_documents):
+                    _raise_if_cancelled(settings, state["job_id"])
+                    entity_items.append(
+                        {
+                            "index": index,
+                            "document": document,
+                            "property_id": document["property_id"],
+                            "filename": filenames_by_property_id.get(
+                                document["property_id"],
+                                document["property_id"],
                             ),
-                            document["property_id"],
-                        )
-                        _transition_job(
+                        }
+                    )
+
+                def extract_document(entity_document):
+                    with shared_llm_slots:
+                        worker_llm = chat_provider(
                             settings,
-                            state["job_id"],
-                            "graph-entity-extraction",
-                            detail=(
-                                f"Generating graph nodes and edges {len(completed_property_ids) + 1}/{total_batch_items}: "
-                                f"{filename}"
-                            ),
+                            route_key="entity_agent_route",
+                            timeout=settings.entity_agent_timeout_seconds,
                         )
-                        with _job_heartbeat(settings, state["job_id"]):
-                            delta_entities, delta_edges = entity_builder.build(
-                                [prepared_document],
+                        worker_builder = GraphRAGBuilder(
+                            config.get("entity_schema", DEFAULT_ENTITY_SCHEMA),
+                            config.get("entity_prompt", DEFAULT_ENTITY_PROMPT),
+                            settings.neo4j_entity_database,
+                            llm=worker_llm,
+                        )
+                        try:
+                            result = worker_builder.build(
+                                [entity_document],
                                 embedder=None,
-                                current_entities=entities,
-                                incremental=True,
                             )
-                        extraction_store.delete(extraction_path)
-                        entities, entity_edges = _merge_entity_delta(
-                            entities,
-                            entity_edges,
-                            delta_entities,
-                            delta_edges,
-                        )
-                        completed_property_ids.add(document["property_id"])
+                            if isinstance(result, tuple) and len(result) == 2:
+                                return result[0]
+                            return result
+                        finally:
+                            if worker_llm is not None:
+                                close = getattr(worker_llm, "close", None)
+                                if close:
+                                    close()
+
+                if entity_items:
+                    results_by_index = {}
+                    first_error = None
+                    if is_batch_add:
+                        property_ids = {item["id"] for item in properties}
                         checkpoint_property_edges = [
                             edge
                             for edge in active_property_graph.get("edges", [])
-                            if edge.get("source") in {item["id"] for item in properties}
-                            and edge.get("target") in {item["id"] for item in properties}
+                            if edge.get("source") in property_ids
+                            and edge.get("target") in property_ids
                         ]
-                        graph_store.write_snapshot(
-                            GraphSnapshot(
-                                project_id,
-                                checkpoint_snapshot_id,
-                                properties,
-                                entities,
-                                checkpoint_property_edges,
-                                entity_edges,
-                            )
-                        )
-                        _update_job(
-                            settings,
-                            state["job_id"],
-                            candidate_snapshot=checkpoint_snapshot_id,
-                        )
-                        _merge_job_progress(
-                            settings,
-                            state["job_id"],
-                            completed_property_ids=sorted(completed_property_ids),
-                            directories=state.get("directories") or {},
-                            candidate_snapshot=checkpoint_snapshot_id,
-                        )
-                else:
-                    bounded_entity_documents = []
-                    extraction_paths = []
-                    for document in entity_documents:
-                        prepared_document, selection = _prepare_entity_document(
-                            document,
-                            current_entities,
-                        )
-                        bounded_entity_documents.append(prepared_document)
-                        extraction_path = extraction_store.save(
-                            project_id,
-                            state["job_id"],
-                            document["property_id"],
-                            selection,
-                        )
-                        extraction_paths.append(extraction_path)
-                        temporary_extraction_paths.append(extraction_path)
+                    else:
+                        checkpoint_property_edges = []
+                    entity_generation_started.set()
                     with _job_heartbeat(settings, state["job_id"]):
-                        entities, entity_edges = entity_builder.build(
-                            bounded_entity_documents,
-                            embedder=None,
-                            current_entities=current_entities,
-                            incremental=incremental_entity_add,
-                        )
-                    for extraction_path in extraction_paths:
-                        extraction_store.delete(extraction_path)
-            finally:
-                for extraction_path in temporary_extraction_paths:
-                    extraction_store.delete(extraction_path)
-                if entity_llm is not None:
-                    close = getattr(entity_llm, "close", None)
-                    if close:
-                        close()
-            if incremental_entity_add and not is_batch_add:
-                entities, entity_edges = _merge_entity_delta(
-                    current_entities,
-                    current_entity_edges,
-                    entities,
-                    entity_edges,
+                        with ThreadPoolExecutor(
+                            max_workers=_batch_llm_workers(
+                                settings, len(entity_items)
+                            ),
+                            thread_name_prefix="entity-generation",
+                        ) as executor:
+                            futures = {
+                                executor.submit(
+                                    run_in_display_language,
+                                    output_language,
+                                    extract_document,
+                                    item["document"],
+                                ): item
+                                for item in entity_items
+                            }
+                            for future in as_completed(futures):
+                                item = futures[future]
+                                try:
+                                    results_by_index[item["index"]] = future.result()
+                                except Exception as exc:
+                                    if first_error is None:
+                                        first_error = exc
+                                    continue
+                                for result_index in sorted(results_by_index):
+                                    delta_entities = results_by_index[result_index]
+                                    generated_entities, _ = _merge_entity_delta(
+                                        generated_entities,
+                                        [],
+                                        delta_entities,
+                                        [],
+                                    )
+                                entities, _ = _merge_entity_delta(
+                                    baseline_entities if incremental_entity_add else [],
+                                    [],
+                                    generated_entities,
+                                    [],
+                                )
+                                entity_edges = baseline_entity_edges
+                                completed_property_ids.add(item["property_id"])
+                                update_combined_progress(
+                                    entities=len(completed_property_ids),
+                                )
+                                if is_batch_add and checkpoint_snapshot_id:
+                                    graph_store.write_snapshot(
+                                        GraphSnapshot(
+                                            project_id,
+                                            checkpoint_snapshot_id,
+                                            properties,
+                                            entities,
+                                            checkpoint_property_edges,
+                                            entity_edges,
+                                        )
+                                    )
+                                    _update_job(
+                                        settings,
+                                        state["job_id"],
+                                        candidate_snapshot=checkpoint_snapshot_id,
+                                    )
+                                    _merge_job_progress(
+                                        settings,
+                                        state["job_id"],
+                                        completed_property_ids=sorted(
+                                            completed_property_ids
+                                        ),
+                                        directories=state.get("directories") or {},
+                                        candidate_snapshot=checkpoint_snapshot_id,
+                                    )
+                    if first_error is not None:
+                        raise first_error
+                elif incremental_entity_add:
+                    entity_generation_started.set()
+                    entities = list(current_entities) if checkpoint_resume else list(
+                        baseline_entities
+                    )
+                else:
+                    entity_generation_started.set()
+
+                property_edges = property_relation_future.result()
+                property_relation_executor.shutdown(wait=True)
+                property_relation_executor = None
+
+                old_entities_for_relations = (
+                    baseline_entities if incremental_entity_add else []
                 )
+
+                # Keep collection membership deterministic even when extraction
+                # futures complete in a different order.  The batch property
+                # order is the user-visible order and is also what checkpoint
+                # recovery uses to reconstruct the new-entity set.
+                property_order = {
+                    str(property_id): index
+                    for index, property_id in enumerate(batch_property_ids)
+                }
+
+                def entity_order_key(entity: dict) -> tuple[int, str]:
+                    source_ids = [
+                        str(source_id)
+                        for source_id in entity.get("source_property_ids") or []
+                    ]
+                    source_index = min(
+                        (
+                            property_order.get(source_id, len(property_order))
+                            for source_id in source_ids
+                        ),
+                        default=len(property_order),
+                    )
+                    return source_index, str(entity.get("id") or "")
+
+                generated_entities.sort(key=entity_order_key)
+
+                def entity_worker(pair: CollectionPair, method_name: str):
+                    worker_llm = chat_provider(
+                        settings,
+                        route_key="entity_agent_route",
+                        timeout=settings.entity_agent_timeout_seconds,
+                    )
+                    worker_builder = GraphRAGBuilder(
+                        config.get("entity_schema", DEFAULT_ENTITY_SCHEMA),
+                        config.get("entity_prompt", DEFAULT_ENTITY_PROMPT),
+                        settings.neo4j_entity_database,
+                        llm=worker_llm,
+                    )
+                    try:
+                        return getattr(worker_builder, method_name)(pair)
+                    finally:
+                        if worker_llm is not None:
+                            close = getattr(worker_llm, "close", None)
+                            if close:
+                                close()
+
+                exact_old, exact_new = consolidate_exact_entity_ids(
+                    old_entities_for_relations,
+                    generated_entities,
+                    context_word_count=_context_word_count,
+                )
+                merge_calls = merge_call_specs(exact_new, exact_old)
+
+                def update_entity_merge_progress(completed: int) -> None:
+                    percent = (
+                        min(100, max(0, int(completed * 100 / len(merge_calls))))
+                        if merge_calls
+                        else 100
+                    )
+                    _transition_job(
+                        settings,
+                        state["job_id"],
+                        "graph-entity-merging",
+                        detail=(
+                            "Generating redundant entity merge proposals: "
+                            f"{percent}%"
+                        ),
+                    )
+
+                update_entity_merge_progress(0)
+                with _job_heartbeat(settings, state["job_id"]):
+                    merge_results = _run_bounded_calls(
+                        settings,
+                        state["job_id"],
+                        merge_calls,
+                        lambda pair: entity_worker(pair, "propose_merges"),
+                        thread_name_prefix="entity-merging",
+                        on_complete=lambda completed, _total: update_entity_merge_progress(
+                            completed
+                        ),
+                    )
+                _transition_job(
+                    settings,
+                    state["job_id"],
+                    "graph-entity-merging",
+                    detail="Applying redundant entity merges",
+                )
+                merge_proposals = [
+                    proposal for result in merge_results for proposal in result
+                ]
+                entities, surviving_new_entities = apply_entity_merges(
+                    exact_old,
+                    exact_new,
+                    merge_proposals,
+                    context_word_count=_context_word_count,
+                )
+
+                within_relation_calls, cross_relation_calls = relation_call_specs(
+                    surviving_new_entities,
+                    exact_old,
+                )
+                relation_total = len(within_relation_calls) + len(cross_relation_calls)
+
+                def update_entity_relation_progress(completed: int) -> None:
+                    percent = (
+                        min(100, max(0, int(completed * 100 / relation_total)))
+                        if relation_total
+                        else 100
+                    )
+                    _transition_job(
+                        settings,
+                        state["job_id"],
+                        "graph-entity-relations",
+                        detail=f"Generating relations for entities: {percent}%",
+                    )
+
+                update_entity_relation_progress(0)
+                with _job_heartbeat(settings, state["job_id"]):
+                    within_relation_results = _run_bounded_calls(
+                        settings,
+                        state["job_id"],
+                        within_relation_calls,
+                        lambda pair: entity_worker(pair, "generate_relation_edges"),
+                        thread_name_prefix="entity-relations-within",
+                        on_complete=lambda completed, _total: update_entity_relation_progress(
+                            completed
+                        ),
+                    )
+                    cross_relation_results = _run_bounded_calls(
+                        settings,
+                        state["job_id"],
+                        cross_relation_calls,
+                        lambda pair: entity_worker(pair, "generate_relation_edges"),
+                        thread_name_prefix="entity-relations-cross",
+                        on_complete=lambda completed, _total: update_entity_relation_progress(
+                            len(within_relation_calls) + completed
+                        ),
+                    )
+                update_entity_relation_progress(relation_total)
+                final_entity_ids = {
+                    str(entity.get("id") or "") for entity in entities
+                }
+                old_entity_ids = {
+                    str(entity.get("id") or "") for entity in exact_old
+                }
+                preserved_entity_edges = [
+                    edge
+                    for edge in current_entity_edges
+                    if str(edge.get("source") or "") in old_entity_ids
+                    and str(edge.get("target") or "") in old_entity_ids
+                    and str(edge.get("source") or "") in final_entity_ids
+                    and str(edge.get("target") or "") in final_entity_ids
+                ]
+                entity_edges = deduplicate_edges(
+                    [
+                        *preserved_entity_edges,
+                        *_flatten_call_results(within_relation_results),
+                        *_flatten_call_results(cross_relation_results),
+                    ]
+                )
+
+            finally:
+                # The entity stage no longer creates temporary extraction files.
+                pass
+
             _transition_job(
                 settings,
                 state["job_id"],
@@ -796,26 +1267,13 @@ def build_workflow(graph_store: Neo4jGraphStore):
                     for entity, vector in zip(entities, entity_vectors)
                 ]
         finally:
+            if property_relation_executor is not None:
+                entity_generation_started.set()
+                property_relation_executor.shutdown(wait=True)
             if embedder is not None:
                 close = getattr(embedder, "close", None)
                 if close:
                     close()
-        _transition_job(
-            settings,
-            state["job_id"],
-            "graph-property-relations",
-            detail=f"Relating {len(properties)} property nodes",
-        )
-        pgb_agent = PGBAgent(settings=settings)
-        try:
-            property_edges = validate_edge_proposals(
-                properties, pgb_agent.propose(properties)
-            )
-        finally:
-            provider = getattr(pgb_agent, "provider", None)
-            close = getattr(provider, "close", None)
-            if close:
-                close()
         _transition_job(
             settings,
             state["job_id"],
@@ -905,8 +1363,18 @@ def build_workflow(graph_store: Neo4jGraphStore):
         release_lock(settings, project_id, job_id)
         return {}
 
+    def first_stage(state: PipelineState) -> str:
+        if state.get("operation") == "batch-add" and state.get("directories"):
+            return "graphs"
+        return "dg"
+
     builder.add_node("dg", dg).add_node("ga", ga).add_node("graphs", graphs).add_node("activate", activate)
-    builder.add_edge(START, "dg").add_edge("dg", "ga").add_edge("ga", "graphs").add_edge("graphs", "activate").add_edge("activate", END)
+    builder.add_conditional_edges(
+        START,
+        first_stage,
+        {"dg": "dg", "graphs": "graphs"},
+    )
+    builder.add_edge("dg", "ga").add_edge("ga", "graphs").add_edge("graphs", "activate").add_edge("activate", END)
     return builder.compile()
 
 
@@ -1081,6 +1549,81 @@ def run_property_removal(
         graph_store.close()
 
 
+def run_property_removals(
+    settings: Settings,
+    project_id: str,
+    property_ids: list[str],
+    job_id: str,
+    paths: list[Path],
+) -> None:
+    graph_store = Neo4jGraphStore(settings)
+    try:
+        _transition_job(
+            settings,
+            job_id,
+            "graph-prune",
+            detail=f"Removing {len(property_ids)} properties from both graphs",
+        )
+        snapshot_id = str(uuid.uuid4())
+        snapshot = prune_properties_snapshot(
+            graph_store,
+            project_id,
+            property_ids,
+            snapshot_id,
+        )
+        graph_store.write_snapshot(snapshot)
+        _update_job(settings, job_id, candidate_snapshot=snapshot_id)
+        _raise_if_cancelled(settings, job_id)
+        _transition_job(
+            settings,
+            job_id,
+            "graph-activate",
+            detail="Activating pruned graph snapshot",
+        )
+        graph_store.activate(project_id, snapshot_id)
+        catalog = PropertyCatalog(settings)
+        for property_id, path in zip(property_ids, paths):
+            catalog.delete(project_id, property_id)
+            delete_property_text(settings, project_id, property_id)
+            path.unlink(missing_ok=True)
+        _transition_job(
+            settings,
+            job_id,
+            "active",
+            status="completed",
+            detail=f"{len(property_ids)} properties removed from both graphs",
+            active_snapshot=snapshot_id,
+        )
+        release_lock(settings, project_id, job_id)
+    except JobCancelled:
+        release_lock(settings, project_id, job_id)
+    except Exception as exc:
+        _transition_job(
+            settings,
+            job_id,
+            "failed",
+            status="failed",
+            detail=str(exc),
+            error=str(exc),
+            error_detail=traceback.format_exc(),
+            llm_response=extract_model_response(exc),
+        )
+        catalog = PropertyCatalog(settings)
+        failed_at = datetime.now(timezone.utc).isoformat()
+        for property_id in property_ids:
+            try:
+                catalog.update(
+                    project_id,
+                    property_id,
+                    {"status": "failed", "updated_at": failed_at},
+                )
+            except KeyError:
+                pass
+        release_lock(settings, project_id, job_id)
+    finally:
+        graph_store.close()
+
+
 def run_batch_pipeline(
     settings: Settings,
     project_id: str,
@@ -1132,6 +1675,18 @@ def run_batch_pipeline(
             "queued",
             detail=f"Preparing {len(prepared_items)} imported properties",
         )
+        planned_directories = (
+            directories
+            if directories is not None
+            else {
+                item["property_id"]: str(item.get("directory") or "")
+                for item in prepared_items
+            }
+            if all("directory" in item for item in prepared_items)
+            else {}
+        )
+        if planned_directories:
+            _merge_job_progress(settings, job_id, directories=planned_directories)
         state: PipelineState = {
             "settings": settings,
             "project_id": project_id,
@@ -1141,7 +1696,7 @@ def run_batch_pipeline(
             "filename": prepared_items[0]["filename"],
             "resume_snapshot_id": resume_snapshot_id or "",
             "completed_property_ids": completed_property_ids or [],
-            "directories": directories or {},
+            "directories": planned_directories,
         }
         build_workflow(graph_store).invoke(state)
     except JobCancelled:

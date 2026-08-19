@@ -1,17 +1,16 @@
 export type Project = { id: string; name: string; processing?: boolean }
 export type Property = { id: string; project_id?: string; filename: string; property_type: string; definition?: string; status: string; relative_path: string }
-export type PropertyUploadResult = { import_id: string; status: 'awaiting_confirmation'; property_type: string; original_filename: string; suggested_filename: string; definition: string }
+export type PropertyUploadResult = { import_id: string; status: 'awaiting_confirmation'; property_type: string; original_filename: string; suggested_filename: string; suggested_directory: string; definition: string }
 export type PropertyImportConfirmResult = { property_id: string; job_id: string; status: string; property_type: string }
-export type PropertyImportBatchItem = { import_id: string; property_type: string; original_filename: string; suggested_filename: string; definition: string; word_count: number; character_count: number; oversized: boolean; reasons: Array<'word_count' | 'character_count'> }
+export type PropertyImportBatchItem = { import_id: string; property_type: string; original_filename: string; suggested_filename: string; suggested_directory: string; definition: string; word_count: number; character_count: number; oversized: boolean; reasons: Array<'word_count' | 'character_count'> }
 export type PropertyImportBatchResult = { batch_id: string; status: 'awaiting_confirmation'; items: PropertyImportBatchItem[] }
 export type PropertyImportBatchStreamEvent =
-  | { type: 'batch_started'; batch_id: string; total: number }
+  | { type: 'batch_started'; batch_id: string; total: number; workers: number }
   | { type: 'file_started'; batch_id: string; index: number; total: number; filename: string }
   | { type: 'keepalive'; batch_id: string; index: number; total: number; filename: string }
-  | { type: 'file_analyzed'; batch_id: string; index: number; total: number; filename: string; item: Omit<PropertyImportBatchItem, 'suggested_filename'> }
-  | { type: 'filename_generation_started'; batch_id: string; total: number }
-  | { type: 'filename_generation_keepalive'; batch_id: string; total: number }
-  | { type: 'file_completed'; batch_id: string; index: number; total: number; filename: string; item: PropertyImportBatchItem }
+  | { type: 'file_analyzed'; batch_id: string; index: number; total: number; filename: string; item: Omit<PropertyImportBatchItem, 'suggested_filename' | 'suggested_directory'> }
+  | { type: 'import_plan_generation_started'; batch_id: string; total: number }
+  | { type: 'import_plan_generation_keepalive'; batch_id: string; total: number }
   | ({ type: 'batch_completed'; total: number } & PropertyImportBatchResult)
   | { type: 'error'; batch_id: string; message: string }
 export type ConfirmedPropertyImport = { import_id: string; filename: string }

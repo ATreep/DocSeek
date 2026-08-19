@@ -1,6 +1,8 @@
-import { describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import AccountMenu from "./AccountMenu";
+
+afterEach(cleanup);
 
 describe("AccountMenu", () => {
   it("keeps sign out behind an explicit menu action", async () => {
@@ -20,5 +22,16 @@ describe("AccountMenu", () => {
 
     await screen.getByRole("menuitem", { name: "Sign out" }).click();
     expect(onSignOut).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes when the user clicks outside the account menu", async () => {
+    render(<AccountMenu onSignOut={vi.fn()} />);
+
+    await screen.getByRole("button", { name: "Account menu" }).click();
+    expect(screen.getByRole("menu")).toBeTruthy();
+
+    fireEvent.mouseDown(document.body);
+
+    expect(screen.queryByRole("menu")).toBeNull();
   });
 });

@@ -1,4 +1,5 @@
 from pathlib import Path
+from threading import Barrier, Event, Lock
 import time
 
 from backend.app.config import Settings
@@ -12,6 +13,7 @@ from backend.app.services.pipeline import (
     _merge_entity_delta,
     _prepare_entity_document,
     _should_extract_entities_incrementally,
+    _transition_job,
     run_pipeline,
     run_property_removal,
 )
@@ -461,6 +463,7 @@ def test_add_extracts_only_new_property_and_remove_prunes_graphs_without_models(
     pgb_inventories = []
     entity_document_sets = []
     entity_build_modes = []
+    entity_only_modes = []
     entity_inventories = []
     embedding_batches = []
     extracted_paths = []
@@ -470,10 +473,10 @@ def test_add_extracts_only_new_property_and_remove_prunes_graphs_without_models(
         def __init__(self, settings):
             pass
 
-        def propose(self, inventory):
-            ids = [item["id"] for item in inventory]
+        def propose_pair(self, pair):
+            ids = [item["id"] for item in [*pair.left, *pair.right]]
             pgb_inventories.append(ids)
-            if ids == ["alpha", "beta"]:
+            if ids == ["beta", "alpha"]:
                 return [
                     {
                         "source": "beta",
@@ -491,6 +494,7 @@ def test_add_extracts_only_new_property_and_remove_prunes_graphs_without_models(
             ids = [document["property_id"] for document in documents]
             entity_document_sets.append(ids)
             entity_build_modes.append(kwargs.get("incremental"))
+            entity_only_modes.append(kwargs.get("entity_only"))
             entity_inventories.append(
                 [item["id"] for item in kwargs.get("current_entities", [])]
             )
@@ -519,27 +523,20 @@ def test_add_extracts_only_new_property_and_remove_prunes_graphs_without_models(
                         }
                     ],
                 )
-            return (
-                [
+
+        def propose_merges(self, pair):
+            return []
+
+        def generate_relation_edges(self, pair):
+            if pair.right:
+                return [
                     {
-                        "id": "alpha-system",
-                        "name": "Alpha System",
-                        "definition": "A software system.",
-                    },
-                    {
-                        "id": "coredb",
-                        "name": "CoreDB",
-                        "definition": "A database.",
-                    },
-                ],
-                [
-                    {
-                        "source": "alpha-system",
-                        "target": "coredb",
-                        "type": "STORES_DATA_IN",
+                        "source": "beta-service",
+                        "target": "alpha-system",
+                        "type": "EXTENDS",
                     }
-                ],
-            )
+                ]
+            return []
 
     class StableGAAgent:
         def __init__(self, settings):
@@ -607,12 +604,11 @@ def test_add_extracts_only_new_property_and_remove_prunes_graphs_without_models(
     )
     after_remove = LocalGraphStore(settings).read(project_id)
 
-    assert pgb_inventories == [["alpha", "beta"]]
+    assert pgb_inventories == [["beta"], ["beta", "alpha"]]
     assert entity_document_sets == [["beta"]]
-    assert entity_build_modes == [True]
-    assert entity_inventories == [
-        ["alpha-system", "coredb"],
-    ]
+    assert entity_build_modes == [None]
+    assert entity_only_modes == [None]
+    assert entity_inventories == [[]]
     assert after_add.property_edges == [
         {"source": "beta", "target": "alpha", "type": "EXTENDS_DESIGN"}
     ]
@@ -875,19 +871,70 @@ def test_pipeline_records_granular_graph_stage_timings(tmp_path, monkeypatch):
         "ga-agent",
         "graph-property-read",
         "graph-property-embedding",
-        "graph-entity-extraction",
-        "graph-entity-embedding",
+        "graph-entity-generation",
+        "graph-entity-merging",
+        "graph-entity-relations",
         "graph-property-relations",
+        "graph-entity-embedding",
         "graph-snapshot",
         "graph-activate",
     ]
     assert all(value >= 0 for value in timings.values())
     assert job["stage"] == "active"
     assert job["stage_detail"] == "Candidate snapshot active"
-    assert entity_provider_calls == [("entity_agent_route", 300)]
+    assert entity_provider_calls == [
+        ("entity_agent_route", 300),
+        ("entity_agent_route", 300),
+        ("entity_agent_route", 300),
+    ]
 
 
-def test_batch_pipeline_groups_once_and_extracts_new_properties_one_by_one(
+def test_transition_job_keeps_stage_start_time_for_progress_updates(tmp_path):
+    settings = Settings(data_dir=tmp_path)
+    settings.ensure_directories()
+    initialize(settings.sqlite_path)
+    project_id, job_id = "progress-project", "progress-job"
+    with connect(settings.sqlite_path) as db:
+        db.execute(
+            "INSERT INTO projects(id,name,created_at,updated_at) VALUES (?,?,?,?)",
+            (project_id, "Progress project", "now", "now"),
+        )
+        db.execute(
+            """
+            INSERT INTO jobs(
+                id,project_id,stage,status,heartbeat,stage_started_at,stage_detail,timings_json
+            ) VALUES (?,?,?,?,?,?,?,?)
+            """,
+            (
+                job_id,
+                project_id,
+                "graph-property-relations",
+                "running",
+                "now",
+                "2026-08-16T00:00:00+00:00",
+                "Generating property relations: 40%",
+                '{"graph-property-read":1.25}',
+            ),
+        )
+
+    _transition_job(
+        settings,
+        job_id,
+        "graph-property-relations",
+        detail="Generating property relations: 60%",
+    )
+
+    with connect(settings.sqlite_path) as db:
+        job = db.execute(
+            "SELECT stage_started_at,stage_detail,timings_json FROM jobs WHERE id=?",
+            (job_id,),
+        ).fetchone()
+    assert job["stage_started_at"] == "2026-08-16T00:00:00+00:00"
+    assert job["stage_detail"] == "Generating property relations: 60%"
+    assert json.loads(job["timings_json"]) == {"graph-property-read": 1.25}
+
+
+def test_batch_pipeline_generates_entities_in_parallel_with_property_relations(
     tmp_path, monkeypatch
 ):
     import backend.app.services.pipeline as pipeline_service
@@ -999,16 +1046,26 @@ def test_batch_pipeline_groups_once_and_extracts_new_properties_one_by_one(
 
     ga_calls = []
     entity_calls = []
-    entity_progress_details = []
+    merge_calls = []
+    relation_calls = []
+    property_relation_calls = []
+    progress_updates = []
+    entity_barrier = Barrier(2, timeout=3)
+    entity_generation_started = Event()
+    property_relations_finished = Event()
+    calls_lock = Lock()
     original_transition_job = pipeline_service._transition_job
 
     def recording_transition_job(*args, **kwargs):
         stage = args[2] if len(args) > 2 else kwargs.get("stage")
         detail = kwargs.get("detail")
-        if stage == "graph-entity-extraction" and str(detail).startswith(
-            "Generating graph nodes and edges"
-        ):
-            entity_progress_details.append(detail)
+        if stage in {
+            "graph-entity-property-relations",
+            "graph-entity-merging",
+            "graph-entity-relations",
+            "graph-property-relations",
+        }:
+            progress_updates.append((stage, detail))
         return original_transition_job(*args, **kwargs)
 
     class RecordingGAAgent:
@@ -1017,11 +1074,7 @@ def test_batch_pipeline_groups_once_and_extracts_new_properties_one_by_one(
 
         def organize_tree(self, tree_context, import_contexts):
             ga_calls.append((tree_context, import_contexts))
-            return {
-                "core": "Existing",
-                "atlas": "Products/Atlas",
-                "nova": "Products/Nova",
-            }
+            raise AssertionError("confirmed import plans must skip Group Arrangement Agent")
 
     class RecordingEntityBuilder:
         def __init__(self, *args, **kwargs):
@@ -1029,73 +1082,99 @@ def test_batch_pipeline_groups_once_and_extracts_new_properties_one_by_one(
 
         def build(self, documents, **kwargs):
             property_id = documents[0]["property_id"]
-            entity_calls.append(
-                {
-                    "documents": [item["property_id"] for item in documents],
-                    "text": documents[0]["text"],
-                    "original_text": documents[0].get("original_text"),
-                    "has_offsets": bool(documents[0].get("extraction_chunks")),
-                    "inventory": [
-                        item["id"] for item in kwargs.get("current_entities", [])
-                    ],
-                    "incremental": kwargs.get("incremental"),
-                }
-            )
-            if property_id == "atlas":
-                return (
-                    [
-                        {
-                            "id": "atlas-product",
-                            "name": "Atlas",
-                            "definition": "A product that uses CoreDB.",
-                            "project_id": project_id,
-                            "source_property_ids": ["atlas"],
-                            "source_contexts": [
-                                {
-                                    "property_id": "atlas",
-                                    "text": "Atlas uses CoreDB.",
-                                }
-                            ],
-                        }
-                    ],
-                    [
-                        {
-                            "source": "atlas-product",
-                            "target": "coredb",
-                            "type": "USES",
-                        }
-                    ],
-                )
-            return (
-                [
+            entity_generation_started.set()
+            entity_barrier.wait()
+            with calls_lock:
+                entity_calls.append(
                     {
-                        "id": "nova-product",
-                        "name": "Nova",
-                        "definition": "An integration for Atlas.",
+                        "documents": [item["property_id"] for item in documents],
+                        "text": documents[0]["text"],
+                        "original_text": documents[0].get("original_text"),
+                        "has_offsets": bool(documents[0].get("extraction_chunks")),
+                        "inventory": [
+                            item["id"] for item in kwargs.get("current_entities", [])
+                        ],
+                        "incremental": kwargs.get("incremental"),
+                        "entity_only": kwargs.get("entity_only"),
+                    }
+                )
+            if property_id == "atlas":
+                return [
+                    {
+                        "id": "atlas-product",
+                        "name": "Atlas",
+                        "definition": "A product that uses CoreDB.",
                         "project_id": project_id,
-                        "source_property_ids": ["nova"],
+                        "source_property_ids": ["atlas"],
                         "source_contexts": [
                             {
-                                "property_id": "nova",
-                                "text": "Nova integrates with Atlas.",
+                                "property_id": "atlas",
+                                "text": "Atlas uses CoreDB.",
                             }
                         ],
                     }
-                ],
-                [
+                ]
+            return [
+                {
+                    "id": "nova-product",
+                    "name": "Nova",
+                    "definition": "An integration for Atlas.",
+                    "project_id": project_id,
+                    "source_property_ids": ["nova"],
+                    "source_contexts": [
+                        {
+                            "property_id": "nova",
+                            "text": "Nova integrates with Atlas.",
+                        }
+                    ],
+                }
+            ]
+
+        def propose_merges(self, pair):
+            assert property_relations_finished.is_set()
+            merge_calls.append(
+                (
+                    [item["id"] for item in pair.left],
+                    [item["id"] for item in pair.right],
+                )
+            )
+            return []
+
+        def generate_relation_edges(self, pair):
+            left_ids = [item["id"] for item in pair.left]
+            right_ids = [item["id"] for item in pair.right]
+            relation_calls.append((left_ids, right_ids))
+            if right_ids == []:
+                return [
                     {
                         "source": "nova-product",
                         "target": "atlas-product",
                         "type": "INTEGRATES_WITH",
                     }
-                ],
-            )
+                ]
+            return [
+                {"source": "atlas-product", "target": "coredb", "type": "USES"}
+            ]
 
-    class EmptyPGBAgent:
+    class RecordingPGBAgent:
         def __init__(self, settings):
             self.provider = None
 
-        def propose(self, inventory):
+        def propose_pair(self, pair):
+            assert entity_generation_started.is_set()
+            left_ids = [item["id"] for item in pair.left]
+            right_ids = [item["id"] for item in pair.right]
+            property_relation_calls.append((left_ids, right_ids))
+            if len(property_relation_calls) == 2:
+                property_relations_finished.set()
+            if not right_ids:
+                return [
+                    {
+                        "source": "atlas",
+                        "target": "nova",
+                        "type": "INTEGRATES_WITH",
+                    }
+                ]
             return []
 
     class RecordingEmbedder:
@@ -1107,7 +1186,7 @@ def test_batch_pipeline_groups_once_and_extracts_new_properties_one_by_one(
 
     monkeypatch.setattr(pipeline_service, "GAAgent", RecordingGAAgent)
     monkeypatch.setattr(pipeline_service, "GraphRAGBuilder", RecordingEntityBuilder)
-    monkeypatch.setattr(pipeline_service, "PGBAgent", EmptyPGBAgent)
+    monkeypatch.setattr(pipeline_service, "PGBAgent", RecordingPGBAgent)
     monkeypatch.setattr(
         pipeline_service, "_transition_job", recording_transition_job
     )
@@ -1134,6 +1213,7 @@ def test_batch_pipeline_groups_once_and_extracts_new_properties_one_by_one(
                 "path": first_path,
                 "definition": "The Atlas product guide.",
                 "comment": "Product documentation",
+                "directory": "Products/Atlas",
             },
             {
                 "property_id": "nova",
@@ -1142,44 +1222,48 @@ def test_batch_pipeline_groups_once_and_extracts_new_properties_one_by_one(
                 "path": second_path,
                 "definition": "The Nova integration guide.",
                 "comment": "Integration documentation",
+                "directory": "Products/Nova",
             },
         ],
     )
 
-    assert len(ga_calls) == 1
-    tree_context, import_contexts = ga_calls[0]
-    serialized_tree = json.dumps(tree_context, ensure_ascii=False)
-    assert "core.md" in serialized_tree
-    assert "The CoreDB storage guide." in serialized_tree
-    assert "atlas.md" in serialized_tree
-    assert "The Atlas product guide." in serialized_tree
-    assert "nova.md" in serialized_tree
-    assert "The Nova integration guide." in serialized_tree
-    assert import_contexts == {
-        "atlas": "Product documentation",
-        "nova": "Integration documentation",
-    }
-    assert entity_calls == [
+    assert ga_calls == []
+    assert sorted(entity_calls, key=lambda item: item["documents"]) == [
         {
             "documents": ["atlas"],
             "text": "Atlas uses CoreDB.",
             "original_text": "Atlas uses CoreDB.",
             "has_offsets": True,
-            "inventory": ["coredb"],
-            "incremental": True,
+            "inventory": [],
+            "incremental": None,
+            "entity_only": None,
         },
         {
             "documents": ["nova"],
             "text": "Nova integrates with Atlas.",
             "original_text": "Nova integrates with Atlas.",
             "has_offsets": True,
-            "inventory": ["coredb", "atlas-product"],
-            "incremental": True,
+            "inventory": [],
+            "incremental": None,
+            "entity_only": None,
         },
     ]
-    assert entity_progress_details == [
-        "Generating graph nodes and edges 1/2: atlas.md",
-        "Generating graph nodes and edges 2/2: nova.md",
+    generation_details = [
+        detail
+        for stage, detail in progress_updates
+        if stage == "graph-entity-property-relations"
+    ]
+    assert generation_details[0] == "Generating entity nodes and property relations: 0%"
+    assert generation_details[-1] == "Generating entity nodes and property relations: 100%"
+    assert ("graph-entity-relations", "Generating relations for entities: 100%") in progress_updates
+    assert len(merge_calls) == 2
+    assert relation_calls == [
+        (["atlas-product", "nova-product"], []),
+        (["atlas-product", "nova-product"], ["coredb"]),
+    ]
+    assert property_relation_calls == [
+        (["atlas", "nova"], []),
+        (["atlas", "nova"], ["core"]),
     ]
     assert not (
         settings.projects_dir
@@ -1192,6 +1276,17 @@ def test_batch_pipeline_groups_once_and_extracts_new_properties_one_by_one(
         "coredb",
         "atlas-product",
         "nova-product",
+    ]
+    assert snapshot.entity_edges == [
+        {
+            "source": "nova-product",
+            "target": "atlas-product",
+            "type": "INTEGRATES_WITH",
+        },
+        {"source": "atlas-product", "target": "coredb", "type": "USES"},
+    ]
+    assert snapshot.property_edges == [
+        {"source": "atlas", "target": "nova", "type": "INTEGRATES_WITH"}
     ]
     active_rows = {row["id"]: row for row in catalog.list(project_id)}
     assert active_rows["atlas"]["relative_path"] == (
@@ -1212,6 +1307,301 @@ def test_batch_pipeline_groups_once_and_extracts_new_properties_one_by_one(
         assert db.execute(
             "SELECT COUNT(*) FROM project_locks WHERE project_id=?", (project_id,)
         ).fetchone()[0] == 0
+
+
+def test_batch_retry_relates_completed_entities_recovered_from_checkpoint(
+    tmp_path, monkeypatch
+):
+    import backend.app.services.pipeline as pipeline_service
+
+    settings = Settings(data_dir=tmp_path)
+    settings.ensure_directories()
+    initialize(settings.sqlite_path)
+    project_id, job_id = "retry-relations-project", "retry-relations-job"
+    property_root = settings.projects_dir / project_id / "properties"
+    property_root.mkdir(parents=True)
+    paths = {
+        "core": property_root / "core.md",
+        "atlas": property_root / "atlas.md",
+        "nova": property_root / "nova.md",
+    }
+    contents = {
+        "core": "CoreDB stores project data.",
+        "atlas": "Atlas uses CoreDB.",
+        "nova": "Nova integrates with Atlas.",
+    }
+    for property_id, path in paths.items():
+        path.write_text(contents[property_id], encoding="utf-8")
+    with connect(settings.sqlite_path) as db:
+        db.execute(
+            "INSERT INTO projects(id,name,created_at,updated_at) VALUES (?,?,?,?)",
+            (project_id, "Retry relations project", "now", "now"),
+        )
+        db.execute(
+            "INSERT INTO jobs(id,project_id,stage,status,heartbeat) VALUES (?,?,?,?,?)",
+            (job_id, project_id, "queued", "queued", "now"),
+        )
+        db.execute(
+            "INSERT INTO project_locks(project_id,job_id,acquired_at) VALUES (?,?,?)",
+            (project_id, job_id, "now"),
+        )
+    catalog = PropertyCatalog(settings)
+    for property_id in ("core", "atlas", "nova"):
+        catalog.create(
+            project_id,
+            {
+                "id": property_id,
+                "project_id": project_id,
+                "filename": paths[property_id].name,
+                "property_type": "markdown",
+                "relative_path": f"properties/{paths[property_id].name}",
+                "directory": "",
+                "definition": f"The {property_id} guide.",
+                "status": "active" if property_id == "core" else "failed",
+                "created_at": "now",
+                "updated_at": "now",
+            },
+        )
+
+    baseline_property = {
+        "id": "core",
+        "project_id": project_id,
+        "filename": "core.md",
+        "property_type": "markdown",
+        "definition": "The core guide.",
+        "content": contents["core"],
+        "relative_path": "properties/core.md",
+        "directory": "",
+        "embedding": [0.5],
+    }
+    baseline_entity = {
+        "id": "coredb",
+        "name": "CoreDB",
+        "definition": "A project data store.",
+        "project_id": project_id,
+        "source_property_ids": ["core"],
+        "source_contexts": [
+            {"property_id": "core", "text": contents["core"]}
+        ],
+        "embedding": [0.5],
+    }
+    checkpoint_properties = [
+        baseline_property,
+        {
+            **baseline_property,
+            "id": "atlas",
+            "filename": "atlas.md",
+            "definition": "The atlas guide.",
+            "content": contents["atlas"],
+            "relative_path": "properties/atlas.md",
+        },
+        {
+            **baseline_property,
+            "id": "nova",
+            "filename": "nova.md",
+            "definition": "The nova guide.",
+            "content": contents["nova"],
+            "relative_path": "properties/nova.md",
+        },
+    ]
+    checkpoint_entities = [
+        {
+            **baseline_entity,
+            "source_property_ids": ["core", "atlas"],
+            "source_contexts": [
+                {"property_id": "core", "text": contents["core"]},
+                {"property_id": "atlas", "text": contents["atlas"]},
+            ],
+        },
+        {
+            "id": "atlas-product",
+            "name": "Atlas",
+            "definition": "A product that uses CoreDB.",
+            "project_id": project_id,
+            "source_property_ids": ["atlas"],
+            "source_contexts": [
+                {"property_id": "atlas", "text": contents["atlas"]}
+            ],
+        },
+        {
+            "id": "nova-product",
+            "name": "Nova",
+            "definition": "An integration for Atlas.",
+            "project_id": project_id,
+            "source_property_ids": ["nova"],
+            "source_contexts": [
+                {"property_id": "nova", "text": contents["nova"]}
+            ],
+        },
+    ]
+    store = LocalGraphStore(settings)
+    store.write_snapshot(
+        GraphSnapshot(
+            project_id,
+            "before-retry",
+            [baseline_property],
+            [baseline_entity],
+            [],
+            [],
+        )
+    )
+    store.activate(project_id, "before-retry")
+    store.write_snapshot(
+        GraphSnapshot(
+            project_id,
+            "entity-checkpoint",
+            checkpoint_properties,
+            checkpoint_entities,
+            [],
+            [],
+        )
+    )
+
+    merge_calls = []
+    relation_calls = []
+    property_relation_calls = []
+    progress_updates = []
+    original_transition_job = pipeline_service._transition_job
+
+    def recording_transition_job(*args, **kwargs):
+        stage = args[2] if len(args) > 2 else kwargs.get("stage")
+        if stage in {
+            "graph-entity-property-relations",
+            "graph-entity-merging",
+            "graph-entity-relations",
+            "graph-property-relations",
+        }:
+            progress_updates.append((stage, kwargs.get("detail")))
+        return original_transition_job(*args, **kwargs)
+
+    class RetryEntityBuilder:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def build(self, *_args, **_kwargs):
+            raise AssertionError("completed entity generation must not run again")
+
+        def propose_merges(self, pair):
+            merge_calls.append(
+                ([item["id"] for item in pair.left], [item["id"] for item in pair.right])
+            )
+            return []
+
+        def generate_relation_edges(self, pair):
+            left_ids = [item["id"] for item in pair.left]
+            right_ids = [item["id"] for item in pair.right]
+            relation_calls.append((left_ids, right_ids))
+            if right_ids:
+                return [
+                    {"source": "atlas-product", "target": "coredb", "type": "USES"}
+                ]
+            return [
+                {
+                    "source": "nova-product",
+                    "target": "atlas-product",
+                    "type": "INTEGRATES_WITH",
+                }
+            ]
+
+    class RetryPGBAgent:
+        def __init__(self, settings):
+            self.provider = None
+
+        def propose_pair(self, pair):
+            left_ids = [item["id"] for item in pair.left]
+            right_ids = [item["id"] for item in pair.right]
+            property_relation_calls.append((left_ids, right_ids))
+            return []
+
+    class RecordingEmbedder:
+        def embed(self, texts):
+            return [[1.0] for _ in texts]
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(pipeline_service, "GraphRAGBuilder", RetryEntityBuilder)
+    monkeypatch.setattr(pipeline_service, "PGBAgent", RetryPGBAgent)
+    monkeypatch.setattr(
+        pipeline_service, "_transition_job", recording_transition_job
+    )
+    monkeypatch.setattr(
+        pipeline_service,
+        "embedding_provider",
+        lambda *_args, **_kwargs: RecordingEmbedder(),
+    )
+    monkeypatch.setattr(
+        pipeline_service, "chat_provider", lambda *_args, **_kwargs: None
+    )
+
+    pipeline_service.run_batch_pipeline(
+        settings,
+        project_id,
+        job_id,
+        [
+            {
+                "property_id": property_id,
+                "filename": paths[property_id].name,
+                "kind": "markdown",
+                "path": paths[property_id],
+                "definition": f"The {property_id} guide.",
+                "comment": "",
+                "directory": "",
+            }
+            for property_id in ("atlas", "nova")
+        ],
+        resume_snapshot_id="entity-checkpoint",
+        completed_property_ids=["atlas", "nova"],
+        directories={"atlas": "", "nova": ""},
+    )
+
+    assert merge_calls == [
+        (["atlas-product", "nova-product"], []),
+        (["atlas-product", "nova-product"], ["coredb"]),
+    ]
+    assert relation_calls == merge_calls
+    assert property_relation_calls == [
+        (["atlas", "nova"], []),
+        (["atlas", "nova"], ["core"]),
+    ]
+    assert (
+        "graph-entity-property-relations",
+        "Generating entity nodes and property relations: 50%",
+    ) in progress_updates
+    assert (
+        "graph-entity-merging",
+        "Generating redundant entity merge proposals: 0%",
+    ) in progress_updates
+    assert (
+        "graph-entity-merging",
+        "Generating redundant entity merge proposals: 100%",
+    ) in progress_updates
+    assert ("graph-entity-relations", "Generating relations for entities: 0%") in progress_updates
+    assert ("graph-entity-relations", "Generating relations for entities: 100%") in progress_updates
+    assert any(
+        stage == "graph-entity-property-relations"
+        and detail == "Generating entity nodes and property relations: 100%"
+        for stage, detail in progress_updates
+    )
+    snapshot = LocalGraphStore(settings).read(project_id)
+    assert [item["id"] for item in snapshot.entities] == [
+        "coredb",
+        "atlas-product",
+        "nova-product",
+    ]
+    assert snapshot.entities[0]["source_property_ids"] == ["core", "atlas"]
+    assert snapshot.entities[0]["source_contexts"] == [
+        {"property_id": "core", "text": contents["core"]},
+        {"property_id": "atlas", "text": contents["atlas"]},
+    ]
+    assert snapshot.entity_edges == [
+        {
+            "source": "nova-product",
+            "target": "atlas-product",
+            "type": "INTEGRATES_WITH",
+        },
+        {"source": "atlas-product", "target": "coredb", "type": "USES"},
+    ]
 
 
 def test_job_heartbeat_stays_fresh_during_blocking_provider_call(

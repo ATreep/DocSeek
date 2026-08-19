@@ -11,6 +11,7 @@ import { useDocSeekTranslation } from "../i18n";
 import {
   BrainCircuit,
   Bug,
+  CheckSquare2,
   ChevronDown,
   FilePlus2,
   FolderOpen,
@@ -86,6 +87,42 @@ function droppedPropertyFiles(dataTransfer: DataTransfer): File[] {
   });
 }
 
+function appendPropertyFiles(current: File[], incoming: File[]): File[] {
+  const seen = new Set(
+    current.map((file) => `${file.name}\u0000${file.size}\u0000${file.lastModified}`),
+  );
+  const next = [...current];
+  for (const file of incoming) {
+    const key = `${file.name}\u0000${file.size}\u0000${file.lastModified}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    next.push(file);
+  }
+  return next;
+}
+
+function ProcessingElapsedTime({
+  active,
+  stageStartedAt,
+}: {
+  active: boolean;
+  stageStartedAt?: string | null;
+}) {
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    setNow(Date.now());
+    if (!active || !stageStartedAt) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [active, stageStartedAt]);
+
+  const elapsed = active
+    ? processingElapsedLabel(stageStartedAt, now)
+    : "";
+  return elapsed ? <span className="processing-elapsed"> · {elapsed}</span> : null;
+}
+
 type Graph = GraphData;
 type ProcessingStatus = {
   locked: boolean;
@@ -113,9 +150,10 @@ type PropertyImportTarget = {
   items: PropertyImportBatchItem[];
 };
 type ImportPreparationProgress = {
-  phase: "uploading" | "generating" | "naming";
-  index: number;
+  phase: "uploading" | "generating" | "arranging";
+  completed: number;
   total: number;
+  workers: number;
   filename: string;
 };
 type ImportProviderReadiness = {
@@ -143,6 +181,10 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
   const [selected, setSelected] = useState<Property | null>(null);
   const [selectedEntity, setSelectedEntity] = useState<Entity | null>(null);
   const [selectedRelation, setSelectedRelation] = useState<GraphRelationDetail | null>(null);
+  const [propertySelectionMode, setPropertySelectionMode] = useState(false);
+  const [selectedPropertyIds, setSelectedPropertyIds] = useState<Set<string>>(
+    () => new Set(),
+  );
   const [search, setSearch] = useState("");
   const [results, setResults] = useState<{
     properties: any[];
@@ -201,6 +243,13 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
     refreshProjects().catch((err) => setError(err.message));
   }, []);
   useEffect(() => {
+    const projectName = project?.name.trim();
+    document.title = projectName ? `${projectName} · DocSeek` : "DocSeek";
+    return () => {
+      document.title = "DocSeek";
+    };
+  }, [project?.name]);
+  useEffect(() => {
     refreshProject().catch((err) => setError(err.message));
   }, [project?.id]);
   useEffect(() => {
@@ -234,7 +283,16 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
   useEffect(() => {
     setPropertyGraphDisplaySelection({ groupPaths: [], propertyIds: [] });
     setEntityGraphDisplaySelection({ groupPaths: [], propertyIds: [] });
+    setPropertySelectionMode(false);
+    setSelectedPropertyIds(new Set());
   }, [project?.id]);
+  useEffect(() => {
+    setSelectedPropertyIds((current) => {
+      const available = new Set(properties.map((item) => item.id));
+      const next = new Set([...current].filter((id) => available.has(id)));
+      return next.size === current.size ? current : next;
+    });
+  }, [properties]);
   useEffect(() => {
     if (!project) {
       setProcessingStatus(null);
@@ -281,9 +339,8 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
       ),
     [project, processingStatus, properties],
   );
-  const processingElapsed = processingElapsedLabel(
-    processingStatus?.stage_started_at,
-  );
+  const processingTerminal =
+    processingStatus?.status === "failed" || processingStatus?.status === "cancelled";
   const processingDetail = processingStatus?.stage_detail
     ? processingStageDetail(processingStatus.stage, processingStatus.stage_detail)
     : null;
@@ -431,8 +488,9 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
     setBusy(true);
     setImportPreparation({
       phase: "uploading",
-      index: 0,
+      completed: 0,
       total: selectedFiles.length,
+      workers: 1,
       filename: "",
     });
     try {
@@ -444,25 +502,36 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
         (streamEvent) => {
           if (streamEvent.type === "batch_started") {
             setImportPreparation((current) => ({
-              phase: current?.phase || "uploading",
-              index: current?.index || 0,
+              phase: "generating",
+              completed: current?.completed || 0,
               filename: current?.filename || "",
               total: streamEvent.total,
+              workers: streamEvent.workers,
             }));
           } else if (streamEvent.type === "file_started") {
-            setImportPreparation({
+            setImportPreparation((current) => ({
               phase: "generating",
-              index: streamEvent.index,
+              completed: current?.completed || 0,
               total: streamEvent.total,
+              workers: current?.workers || 1,
+              filename: current?.filename || "",
+            }));
+          } else if (streamEvent.type === "file_analyzed") {
+            setImportPreparation((current) => ({
+              phase: "generating",
+              completed: Math.min((current?.completed || 0) + 1, streamEvent.total),
+              total: streamEvent.total,
+              workers: current?.workers || 1,
               filename: streamEvent.filename,
-            });
-          } else if (streamEvent.type === "filename_generation_started") {
-            setImportPreparation({
-              phase: "naming",
-              index: streamEvent.total,
+            }));
+          } else if (streamEvent.type === "import_plan_generation_started") {
+            setImportPreparation((current) => ({
+              phase: "arranging",
+              completed: streamEvent.total,
               total: streamEvent.total,
+              workers: current?.workers || 1,
               filename: "",
-            });
+            }));
           } else if (streamEvent.type === "batch_completed") {
             completedResults.push({
               batch_id: streamEvent.batch_id,
@@ -717,6 +786,26 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
       setError(err instanceof Error ? err.message : t("Property removal failed"));
     }
   }
+  async function removeSelectedProperties() {
+    if (!project || selectedPropertyIds.size === 0) return;
+    const count = selectedPropertyIds.size;
+    if (!window.confirm(t('Permanently remove {{count}} selected properties?', { count }))) return;
+    setBusy(true);
+    try {
+      await request(`/projects/${project.id}/properties/batch-delete`, {
+        method: 'POST',
+        body: JSON.stringify({ property_ids: [...selectedPropertyIds] }),
+      });
+      setSelected(null);
+      setSelectedPropertyIds(new Set());
+      setPropertySelectionMode(false);
+      await Promise.all([refreshProject(), refreshProcessingState()]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('Property removal failed'));
+    } finally {
+      setBusy(false);
+    }
+  }
   function selectProperty(property: Property | null) {
     setSelectedEntity(null);
     setSelectedRelation(null);
@@ -762,6 +851,9 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
   }
 
   const failedProperty = properties.find((item) => item.status === "failed");
+  const retryProperty = processingStatus?.status === "cancelled"
+    ? properties.find((item) => item.status === "queued")
+    : failedProperty;
   const showProjectCreation = projectCatalogLoaded && !project && projects.length === 0;
   return (
     <div className="app-shell">
@@ -867,9 +959,10 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
                   (processingStatus.locked
                     ? t('Project actions are locked until this stage completes.')
                     : t('Build finished.'))}
-                {processingStatus.locked && processingElapsed
-                  ? ` · ${processingElapsed}`
-                  : ""}
+                <ProcessingElapsedTime
+                  active={processingStatus.locked}
+                  stageStartedAt={processingStatus.stage_started_at}
+                />
                 {processingStatus.error ? ` · ${processingStatus.error}` : ""}
               </span>
             </div>
@@ -893,11 +986,11 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
                   {t('Cancel')}
                 </button>
               )}
-              {failedProperty && (
+              {retryProperty && processingTerminal && (
                 <button
                   type="button"
                   className="text-button"
-                  onClick={() => retryJob(failedProperty.id)}
+                  onClick={() => retryJob(retryProperty.id)}
                 >
                   {t('Retry')}
                 </button>
@@ -972,15 +1065,60 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
             )}
           </div>
           <div className="property-tree">
-            {properties.length ? (
-              <PropertyTree properties={properties} onSelect={selectProperty} />
-            ) : (
-              <div className="tree-empty">
-                {t('No properties yet.')}
-                <br />
-                {t('Add a file to begin.')}
+            <div className="property-tree-toolbar">
+              <span>{t('Property tree')}</span>
+              <div className="property-tree-toolbar-actions">
+                <button
+                  type="button"
+                  className={`tree-tool-button ${propertySelectionMode ? 'active' : ''}`}
+                  role="switch"
+                  aria-checked={propertySelectionMode}
+                  aria-label={t(propertySelectionMode ? 'Exit multiple selection' : 'Select multiple properties')}
+                  title={t(propertySelectionMode ? 'Exit multiple selection' : 'Select multiple properties')}
+                  disabled={!project || processing || busy || properties.length === 0}
+                  onClick={() => {
+                    setPropertySelectionMode((current) => !current);
+                    setSelectedPropertyIds(new Set());
+                  }}
+                >
+                  <CheckSquare2 size={14} />
+                </button>
+                <button
+                  type="button"
+                  className="tree-tool-button danger"
+                  aria-label={selectedPropertyIds.size > 0
+                    ? t('Delete selected ({{count}})', { count: selectedPropertyIds.size })
+                    : t('Delete selected properties')}
+                  title={selectedPropertyIds.size > 0
+                    ? t('Delete selected ({{count}})', { count: selectedPropertyIds.size })
+                    : t('Delete selected properties')}
+                  disabled={!propertySelectionMode || selectedPropertyIds.size === 0 || processing || busy}
+                  onClick={() => void removeSelectedProperties()}
+                >
+                  <Trash2 size={14} />
+                  {selectedPropertyIds.size > 0 && (
+                    <span className="tree-tool-count">{selectedPropertyIds.size}</span>
+                  )}
+                </button>
               </div>
-            )}
+            </div>
+            <div className="property-tree-content">
+              {properties.length ? (
+                <PropertyTree
+                  properties={properties}
+                  onSelect={selectProperty}
+                  selectionMode={propertySelectionMode}
+                  selectedPropertyIds={selectedPropertyIds}
+                  onSelectionChange={setSelectedPropertyIds}
+                />
+              ) : (
+                <div className="tree-empty">
+                  {t('No properties yet.')}
+                  <br />
+                  {t('Add a file to begin.')}
+                </div>
+              )}
+            </div>
           </div>
           <div className="sidebar-footer">
             <span className={`connection-dot ${processing ? "busy" : ""}`} />{" "}
@@ -1014,13 +1152,11 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
                 <MessageSquareText size={15} /> {t('AI Query')}
               </button>
             </div>
-            <div className="tab-status">
-              {processing && (
-                <>
-                  <span className="spinner" /> {t(processingStageLabel(processingStatus?.stage || "queued"))}
-                </>
-              )}
-            </div>
+            {processing && !processingTerminal && (
+              <div className="tab-status">
+                <span className="spinner" /> {t(processingStageLabel(processingStatus?.stage || "queued"))}
+              </div>
+            )}
           </div>
           {error && (
             <div className="error-banner">
@@ -1211,7 +1347,13 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
               aria-label={t('Property files')}
               multiple
               disabled={busy}
-              onChange={(event) => setUploadFiles(Array.from(event.target.files || []))}
+              onChange={(event) => {
+                setUploadFiles((current) =>
+                  appendPropertyFiles(current, Array.from(event.target.files || [])),
+                );
+                // Allow choosing the same local file again after removing it.
+                event.target.value = "";
+              }}
             />
             <button
               type="button"
@@ -1235,7 +1377,9 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
               onDrop={(event) => {
                 event.preventDefault();
                 setUploadDragActive(false);
-                setUploadFiles(droppedPropertyFiles(event.dataTransfer));
+                setUploadFiles((current) =>
+                  appendPropertyFiles(current, droppedPropertyFiles(event.dataTransfer)),
+                );
               }}
             >
               <Upload size={24} />
@@ -1298,13 +1442,16 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
               >
                 <div className="import-preparation-header">
                   <div>
-                    <span className="eyebrow">{t(importPreparation.phase === "naming" ? "Group Arrangement Agent" : "Definition Generation Agent")}</span>
+                    <span className="eyebrow">{t(importPreparation.phase === "arranging" ? "Group Arrangement Agent" : "Definition Generation Agent")}</span>
                     <strong>
                       {importPreparation.phase === "uploading"
                         ? `${t('Uploading')} ${importPreparation.total} ${t(importPreparation.total === 1 ? "property" : "properties")}`
-                        : importPreparation.phase === "naming"
-                          ? `${t('Generating')} ${t(importPreparation.total === 1 ? "a suggested filename" : "suggested filenames")}`
-                          : `${t('Preparing')} ${importPreparation.index} ${t('of')} ${importPreparation.total} ${t(importPreparation.total === 1 ? "property" : "properties")}`}
+                        : importPreparation.phase === "arranging"
+                          ? t('Generating suggested filenames and property tree')
+                          : t('Definitions completed: {{completed}}/{{total}}', {
+                              completed: importPreparation.completed,
+                              total: importPreparation.total,
+                            })}
                     </strong>
                   </div>
                   <span className="spinner" aria-hidden="true" />
@@ -1314,14 +1461,14 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
                     <FilePlus2 size={16} aria-hidden="true" />
                     <span>
                       <strong>{importPreparation.filename}</strong>
-                      <small>{t('Generating a concise property definition')}</small>
+                      <small>{t('Property definition generated')}</small>
                     </span>
                   </div>
                 )}
                 <progress
-                  aria-label={t('Definition Generation Agent preparation progress')}
+                  aria-label={t(importPreparation.phase === "arranging" ? 'Group Arrangement Agent preparation progress' : 'Definition Generation Agent preparation progress')}
                   max={Math.max(importPreparation.total, 1)}
-                  value={importPreparation.index}
+                  value={importPreparation.completed}
                 />
               </section>
             )}

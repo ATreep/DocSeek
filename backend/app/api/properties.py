@@ -1,6 +1,6 @@
 import uuid
 import base64
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from datetime import datetime, timezone
 from pathlib import Path
 import json
@@ -22,19 +22,29 @@ from ..services.agents import (
     DGAgent,
     DefinitionResult,
     GAAgent,
-    PropertyFilenameAgent,
     readable_property_identifier,
     unique_readable_property_identifier,
 )
-from ..services.extraction_text import TemporaryExtractionStore, select_extraction_text
+from ..services.extraction_text import (
+    DEFAULT_EXTRACTION_TEXT_MAX_CHARS,
+    ExtractionChunk,
+    ExtractionSelection,
+    TemporaryExtractionStore,
+)
 from ..services.grouping import apply_group_placements, catalog_signature
 from ..services.model_errors import extract_model_response
+from ..services.parallelism import load_batch_llm_concurrency
 from ..services.parsers import extract_text, property_type
-from ..services.pipeline import _current_group_tree, run_batch_pipeline, run_pipeline, run_property_removal
-from ..services.graph_store import Neo4jGraphStore
+from ..services.pipeline import (
+    _current_group_tree,
+    run_batch_pipeline,
+    run_pipeline,
+    run_property_removal,
+    run_property_removals,
+)
 from ..services.property_imports import PropertyImportStore
 from ..services.text_metrics import property_content_metrics
-from ..services.storage import delete_property_text, move_original, read_property_text, replace_original, safe_filename, save_original, write_property_text
+from ..services.storage import delete_property_text, move_original, read_property_text, replace_original, safe_directory, safe_filename, save_original, write_property_text
 from ..services.catalog import PropertyCatalog
 from ..services.display_language import (
     current_display_language,
@@ -46,6 +56,34 @@ from .projects import get_project, is_locked, acquire_lock, release_lock
 router = APIRouter(prefix="/projects", tags=["properties"])
 
 PROPERTY_IMPORT_KEEPALIVE_SECONDS = 10.0
+
+
+def _batch_llm_workers(settings: Settings, total: int) -> int:
+    return max(1, min(total, load_batch_llm_concurrency(settings)))
+
+
+def _direct_extraction_selection(content: str) -> ExtractionSelection:
+    """Bound property text without tokenization, scoring, or chunk ranking."""
+    source = str(content or "")
+    selected_text = source[:DEFAULT_EXTRACTION_TEXT_MAX_CHARS].rstrip()
+    chunks = (
+        [
+            ExtractionChunk(
+                start=0,
+                end=len(selected_text),
+                text=selected_text,
+                section="Document",
+            )
+        ]
+        if selected_text
+        else []
+    )
+    return ExtractionSelection(
+        text=selected_text,
+        chunks=chunks,
+        original_character_count=len(source),
+        selected_character_count=len(selected_text),
+    )
 
 
 class PropertyUpdate(BaseModel):
@@ -85,6 +123,10 @@ class RegroupConfirmation(BaseModel):
     items: list[RegroupConfirmationItem] = Field(min_length=1)
 
 
+class PropertyBatchDelete(BaseModel):
+    property_ids: list[str] = Field(min_length=1, max_length=1000)
+
+
 def _schedule(background_tasks: BackgroundTasks | None, function, *args):
     language = current_display_language()
     if background_tasks is None:
@@ -106,12 +148,7 @@ def generate_property_metadata(
 ) -> DefinitionResult:
     text = full_text if full_text is not None else extract_text(path, kind)
     if extraction_text is None and kind != "image":
-        extraction_text = select_extraction_text(
-            text,
-            filename=filename,
-            import_context=comment,
-            existing_entities=existing_entities or [],
-        ).text
+        extraction_text = _direct_extraction_selection(text).text
     image_data_url = None
     if kind == "image":
         media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
@@ -127,17 +164,6 @@ def generate_property_metadata(
         image_data_url=image_data_url,
         extraction_text=extraction_text,
     )
-
-
-def _existing_entity_inventory(settings: Settings, project_id: str) -> list[dict]:
-    graph_store = Neo4jGraphStore(settings)
-    try:
-        graph = graph_store.graph(project_id, "entity") or {}
-        return [node for node in graph.get("nodes", []) if isinstance(node, dict)]
-    except Exception:
-        return []
-    finally:
-        graph_store.close()
 
 
 def _generate_metadata_compatibly(
@@ -190,13 +216,7 @@ def _enqueue_property(settings: Settings, project_id: str, filename: str, conten
     extraction_path: Path | None = None
     try:
         full_text = extract_text(path, kind)
-        existing_entities = _existing_entity_inventory(settings, project_id)
-        initial_selection = select_extraction_text(
-            full_text,
-            filename=filename,
-            import_context=comment,
-            existing_entities=existing_entities,
-        )
+        prompt_selection = _direct_extraction_selection(full_text)
         metadata = _generate_metadata_compatibly(
             settings,
             filename,
@@ -204,8 +224,8 @@ def _enqueue_property(settings: Settings, project_id: str, filename: str, conten
             path,
             comment,
             full_text=full_text,
-            extraction_text=initial_selection.text,
-            existing_entities=existing_entities,
+            extraction_text=prompt_selection.text,
+            existing_entities=[],
         )
         used_property_ids = {
             str(row.get("id") or "").casefold()
@@ -218,28 +238,15 @@ def _enqueue_property(settings: Settings, project_id: str, filename: str, conten
         )
         catalog.create(project_id, {"id": property_id, "project_id": project_id, "filename": filename, "property_type": kind, "relative_path": f"properties/{filename}", "definition": metadata.definition, "status": "queued", "created_at": now, "updated_at": now})
         catalog_created = True
-        extraction_path = TemporaryExtractionStore(settings).save(
-            project_id,
-            job_id,
-            property_id,
-            initial_selection,
-        )
         canonical_content = metadata.content or (
             full_text if kind != "image" else metadata.definition
         )
         write_property_text(settings, project_id, property_id, canonical_content)
-        refined_selection = select_extraction_text(
-            canonical_content,
-            filename=filename,
-            definition=metadata.definition,
-            import_context=comment,
-            existing_entities=existing_entities,
-        )
         extraction_path = TemporaryExtractionStore(settings).save(
             project_id,
             job_id,
             property_id,
-            refined_selection,
+            _direct_extraction_selection(canonical_content),
         )
     except Exception as exc:
         failed_at = datetime.now(timezone.utc).isoformat()
@@ -300,14 +307,7 @@ def _stage_property_import(
     kind = property_type(clean_filename, content_type)
     try:
         full_text = extract_text(path, kind)
-        existing_entities = _existing_entity_inventory(settings, project_id)
-        initial_selection = select_extraction_text(
-            full_text,
-            filename=clean_filename,
-            import_context=comment,
-            existing_entities=existing_entities,
-        )
-        store.save_extraction(project_id, import_id, initial_selection)
+        prompt_selection = _direct_extraction_selection(full_text)
         metadata = _generate_metadata_compatibly(
             settings,
             clean_filename,
@@ -315,20 +315,17 @@ def _stage_property_import(
             path,
             comment,
             full_text=full_text,
-            extraction_text=initial_selection.text,
-            existing_entities=existing_entities,
+            extraction_text=prompt_selection.text,
+            existing_entities=[],
         )
         canonical_content = metadata.content or (
             full_text if kind != "image" else metadata.definition
         )
-        refined_selection = select_extraction_text(
-            canonical_content,
-            filename=clean_filename,
-            definition=metadata.definition,
-            import_context=comment,
-            existing_entities=existing_entities,
+        store.save_extraction(
+            project_id,
+            import_id,
+            _direct_extraction_selection(canonical_content),
         )
-        store.save_extraction(project_id, import_id, refined_selection)
         store.save(
             project_id,
             import_id,
@@ -360,7 +357,7 @@ def _stage_property_import(
     }
 
 
-def _add_suggested_filenames(
+def _add_import_plan(
     settings: Settings,
     project_id: str,
     items: list[dict],
@@ -368,21 +365,12 @@ def _add_suggested_filenames(
 ) -> list[dict]:
     rows = PropertyCatalog(settings).list(project_id)
     tree_context = _current_group_tree(rows) if rows else {}
-    agent = PropertyFilenameAgent(settings=settings)
-    suggestions = agent.suggest_many(
-        tree_context,
-        items,
-        comment,
-    )
     used_property_ids = {
         str(row.get("id") or "").casefold() for row in rows
     }
     store = PropertyImportStore(settings)
-    result: list[dict] = []
+    planned_items: list[dict] = []
     for item in items:
-        suggested_filename = safe_filename(
-            suggestions.get(item["import_id"]) or item["original_filename"]
-        )
         property_id = unique_readable_property_identifier(
             item.get("property_id")
             or readable_property_identifier(
@@ -391,15 +379,68 @@ def _add_suggested_filenames(
             ),
             used_property_ids,
         )
+        planned_items.append({**item, "property_id": property_id})
         store.update(
             project_id,
             item["import_id"],
             {"property_id": property_id},
         )
+
+    proposal = GAAgent(settings=settings).plan_import(
+        tree_context,
+        planned_items,
+        comment,
+    )
+    used_paths = {
+        (
+            str(
+                row.get("directory")
+                or (
+                    Path(str(row.get("relative_path") or "")).parent.relative_to(
+                        Path("properties")
+                    ).as_posix()
+                    if Path(str(row.get("relative_path") or "")).parent
+                    != Path("properties")
+                    else ""
+                )
+            ).casefold(),
+            str(row.get("filename") or "").casefold(),
+        )
+        for row in rows
+    }
+    result: list[dict] = []
+    for item in planned_items:
+        property_id = item["property_id"]
+        directory_path = safe_directory(proposal.directories.get(property_id, ""))
+        suggested_directory = (
+            "" if directory_path == Path() else directory_path.as_posix()
+        )
+        suggested_filename = safe_filename(
+            proposal.filenames.get(property_id) or item["original_filename"]
+        )
+        candidate_path = (suggested_directory.casefold(), suggested_filename.casefold())
+        if candidate_path in used_paths:
+            filename_path = Path(suggested_filename)
+            index = 2
+            while candidate_path in used_paths:
+                suggested_filename = (
+                    f"{filename_path.stem}-{index}{filename_path.suffix}"
+                )
+                candidate_path = (
+                    suggested_directory.casefold(),
+                    suggested_filename.casefold(),
+                )
+                index += 1
+        used_paths.add(candidate_path)
+        store.update(
+            project_id,
+            item["import_id"],
+            {"suggested_directory": suggested_directory},
+        )
         result.append({
             **item,
-            "property_id": property_id,
             "suggested_filename": suggested_filename,
+            "suggested_directory": suggested_directory,
         })
     return result
 
@@ -416,21 +457,41 @@ def _stage_property_import_batch(
         raise HTTPException(status_code=422, detail="Select at least one property")
 
     batch_id = str(uuid.uuid4())
+    language = current_display_language()
     store = PropertyImportStore(settings)
     items: list[dict] = []
     try:
-        for file in files:
-            items.append(
-                _stage_property_import(
+        staged_by_index: dict[int, dict] = {}
+        first_error: Exception | None = None
+        with ThreadPoolExecutor(
+            max_workers=_batch_llm_workers(settings, len(files)),
+            thread_name_prefix="property-import",
+        ) as executor:
+            futures = {
+                executor.submit(
+                    run_in_display_language,
+                    language,
+                    _stage_property_import,
                     settings,
                     project_id,
                     file.filename or "property",
                     file.file.read(),
                     file.content_type,
                     comment,
-                )
-            )
-        items = _add_suggested_filenames(settings, project_id, items, comment)
+                ): index
+                for index, file in enumerate(files)
+            }
+            for future in as_completed(futures):
+                index = futures[future]
+                try:
+                    staged_by_index[index] = future.result()
+                except Exception as exc:
+                    if first_error is None:
+                        first_error = exc
+        items = [staged_by_index[index] for index in sorted(staged_by_index)]
+        if first_error is not None:
+            raise first_error
+        items = _add_import_plan(settings, project_id, items, comment)
         store.save_batch(
             project_id,
             batch_id,
@@ -458,18 +519,25 @@ def _stream_property_import_batch(
     store = PropertyImportStore(settings)
     items: list[dict] = []
     total = len(files)
+    worker_count = _batch_llm_workers(settings, total)
 
     def event(payload: dict) -> str:
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
     try:
         yield event(
-            {"type": "batch_started", "batch_id": batch_id, "total": total}
+            {
+                "type": "batch_started",
+                "batch_id": batch_id,
+                "total": total,
+                "workers": worker_count,
+            }
         )
         with ThreadPoolExecutor(
-            max_workers=1,
+            max_workers=worker_count,
             thread_name_prefix="property-import",
         ) as executor:
+            pending: dict = {}
             for index, (filename, source, content_type) in enumerate(
                 files, start=1
             ):
@@ -493,37 +561,55 @@ def _stream_property_import_batch(
                     content_type,
                     comment,
                 )
-                while True:
-                    completed, _ = wait(
-                        (future,), timeout=PROPERTY_IMPORT_KEEPALIVE_SECONDS
-                    )
-                    if not completed:
-                        yield event(
-                            {
-                                "type": "keepalive",
-                                "batch_id": batch_id,
-                                "index": index,
-                                "total": total,
-                                "filename": filename,
-                            }
-                        )
-                        continue
-                    item = future.result()
-                    break
-                items.append(item)
-                yield event(
-                    {
-                        "type": "file_analyzed",
-                        "batch_id": batch_id,
-                        "index": index,
-                        "total": total,
-                        "filename": filename,
-                        "item": item,
-                    }
+                pending[future] = (index, filename)
+
+            staged_by_index: dict[int, dict] = {}
+            first_error: Exception | None = None
+            while pending:
+                completed, _ = wait(
+                    tuple(pending),
+                    timeout=PROPERTY_IMPORT_KEEPALIVE_SECONDS,
+                    return_when=FIRST_COMPLETED,
                 )
+                if not completed:
+                    index, filename = min(pending.values())
+                    yield event(
+                        {
+                            "type": "keepalive",
+                            "batch_id": batch_id,
+                            "index": index,
+                            "total": total,
+                            "filename": filename,
+                        }
+                    )
+                    continue
+                for future in sorted(
+                    completed, key=lambda current: pending[current][0]
+                ):
+                    index, filename = pending.pop(future)
+                    try:
+                        item = future.result()
+                    except Exception as exc:
+                        if first_error is None:
+                            first_error = exc
+                        continue
+                    staged_by_index[index] = item
+                    yield event(
+                        {
+                            "type": "file_analyzed",
+                            "batch_id": batch_id,
+                            "index": index,
+                            "total": total,
+                            "filename": filename,
+                            "item": item,
+                        }
+                    )
+            items = [staged_by_index[index] for index in sorted(staged_by_index)]
+            if first_error is not None:
+                raise first_error
             yield event(
                 {
-                    "type": "filename_generation_started",
+                    "type": "import_plan_generation_started",
                     "batch_id": batch_id,
                     "total": total,
                 }
@@ -531,7 +617,7 @@ def _stream_property_import_batch(
             future = executor.submit(
                 run_in_display_language,
                 language,
-                _add_suggested_filenames,
+                _add_import_plan,
                 settings,
                 project_id,
                 items,
@@ -544,7 +630,7 @@ def _stream_property_import_batch(
                 if not completed:
                     yield event(
                         {
-                            "type": "filename_generation_keepalive",
+                            "type": "import_plan_generation_keepalive",
                             "batch_id": batch_id,
                             "total": total,
                         }
@@ -552,17 +638,6 @@ def _stream_property_import_batch(
                     continue
                 items = future.result()
                 break
-            for index, item in enumerate(items, start=1):
-                yield event(
-                    {
-                        "type": "file_completed",
-                        "batch_id": batch_id,
-                        "index": index,
-                        "total": total,
-                        "filename": item["original_filename"],
-                        "item": item,
-                    }
-                )
         store.save_batch(
             project_id,
             batch_id,
@@ -729,6 +804,15 @@ def _confirm_property_import_batch(
         safe_filename(confirmed_by_id[import_id].filename)
         for import_id in batch["import_ids"]
     ]
+    planned_directories = [
+        (
+            ""
+            if (directory_path := safe_directory(staged.get("suggested_directory", "")))
+            == Path()
+            else directory_path.as_posix()
+        )
+        for staged in batch["imports"]
+    ]
     if len({filename.casefold() for filename in clean_filenames}) != len(
         clean_filenames
     ):
@@ -738,6 +822,32 @@ def _confirm_property_import_batch(
         )
 
     catalog = PropertyCatalog(settings)
+    existing_target_paths = {
+        str(
+            settings.projects_dir
+            / project_id
+            / str(row.get("relative_path") or "")
+        ).casefold()
+        for row in catalog.list(project_id)
+    }
+    planned_target_paths = [
+        str(
+            settings.projects_dir
+            / project_id
+            / "properties"
+            / safe_directory(directory)
+            / filename
+        ).casefold()
+        for directory, filename in zip(planned_directories, clean_filenames)
+    ]
+    if (
+        len(set(planned_target_paths)) != len(planned_target_paths)
+        or any(path in existing_target_paths for path in planned_target_paths)
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Confirmed property filenames conflict with the planned property tree",
+        )
     used_property_ids = {
         str(row.get("id") or "").casefold() for row in catalog.list(project_id)
     }
@@ -753,6 +863,7 @@ def _confirm_property_import_batch(
         )
         for staged, filename in zip(batch["imports"], clean_filenames)
     ]
+    planned_directories_by_id = dict(zip(property_ids, planned_directories))
     job_id = str(uuid.uuid4())
     if not acquire_lock(settings, project_id, job_id):
         raise HTTPException(status_code=409, detail="Project is processing")
@@ -763,16 +874,25 @@ def _confirm_property_import_batch(
     pipeline_items: list[dict] = []
     now = datetime.now(timezone.utc).isoformat()
     try:
-        for property_id, staged, requested_filename in zip(
-            property_ids, batch["imports"], clean_filenames
+        for property_id, staged, requested_filename, directory in zip(
+            property_ids, batch["imports"], clean_filenames, planned_directories
         ):
-            clean_filename, path = save_original(
+            stored_filename, path = save_original(
                 settings,
                 project_id,
                 requested_filename,
                 staged["source_path"].read_bytes(),
             )
             created_paths.append(path)
+            relative_path, path = move_original(
+                settings,
+                project_id,
+                f"properties/{stored_filename}",
+                directory,
+                requested_filename,
+            )
+            created_paths[-1] = path
+            clean_filename = requested_filename
             kind = property_type(clean_filename, staged.get("content_type"))
             catalog.create(
                 project_id,
@@ -781,7 +901,8 @@ def _confirm_property_import_batch(
                     "project_id": project_id,
                     "filename": clean_filename,
                     "property_type": kind,
-                    "relative_path": f"properties/{clean_filename}",
+                    "relative_path": relative_path,
+                    "directory": directory,
                     "definition": staged.get("definition", ""),
                     "status": "queued",
                     "created_at": now,
@@ -811,6 +932,7 @@ def _confirm_property_import_batch(
                     "definition": staged.get("definition", ""),
                     "text": staged.get("content", ""),
                     "extraction_path": str(extraction_path) if extraction_path else "",
+                    "directory": directory,
                 }
             )
         with connect(settings.sqlite_path) as db:
@@ -837,7 +959,10 @@ def _confirm_property_import_batch(
                         },
                         ensure_ascii=False,
                     ),
-                    "{}",
+                    json.dumps(
+                        {"directories": planned_directories_by_id},
+                        ensure_ascii=False,
+                    ),
                 ),
             )
     except Exception:
@@ -932,6 +1057,74 @@ def _enqueue_removal(settings: Settings, project_id: str, property_id: str, back
     return {"property_id": property_id, "job_id": job_id, "status": "removing"}
 
 
+def _enqueue_batch_removal(
+    settings: Settings,
+    project_id: str,
+    property_ids: list[str],
+    background_tasks: BackgroundTasks | None = None,
+) -> dict:
+    if is_locked(settings, project_id):
+        raise HTTPException(status_code=409, detail="Project is processing")
+    unique_property_ids = list(dict.fromkeys(str(item).strip() for item in property_ids))
+    if not all(unique_property_ids):
+        raise HTTPException(status_code=422, detail="Property identifiers cannot be empty")
+    catalog = PropertyCatalog(settings)
+    rows_by_id = {
+        str(row.get("id") or ""): row for row in catalog.list(project_id)
+    }
+    missing = [
+        property_id
+        for property_id in unique_property_ids
+        if property_id not in rows_by_id
+    ]
+    if missing:
+        raise HTTPException(status_code=404, detail="One or more properties were not found")
+    job_id = str(uuid.uuid4())
+    if not acquire_lock(settings, project_id, job_id):
+        raise HTTPException(status_code=409, detail="Project is processing")
+    now = datetime.now(timezone.utc).isoformat()
+    for property_id in unique_property_ids:
+        catalog.update(
+            project_id,
+            property_id,
+            {"status": "removing", "updated_at": now},
+        )
+    with connect(settings.sqlite_path) as db:
+        db.execute(
+            "INSERT INTO jobs(id,project_id,stage,status,candidate_snapshot,heartbeat,input_json) VALUES (?,?,?,?,?,?,?)",
+            (
+                job_id,
+                project_id,
+                "queued",
+                "queued",
+                None,
+                now,
+                json.dumps(
+                    {"operation": "batch-delete", "property_ids": unique_property_ids},
+                    separators=(",", ":"),
+                ),
+            ),
+        )
+    paths = [
+        settings.projects_dir / project_id / rows_by_id[property_id]["relative_path"]
+        for property_id in unique_property_ids
+    ]
+    _schedule(
+        background_tasks,
+        run_property_removals,
+        settings,
+        project_id,
+        unique_property_ids,
+        job_id,
+        paths,
+    )
+    return {
+        "property_ids": unique_property_ids,
+        "job_id": job_id,
+        "status": "removing",
+    }
+
+
 def _row(row):
     return dict(row) if row else None
 
@@ -962,7 +1155,7 @@ def add_property(
         comment,
     )
     try:
-        return _add_suggested_filenames(settings, project_id, [item], comment)[0]
+        return _add_import_plan(settings, project_id, [item], comment)[0]
     except Exception:
         PropertyImportStore(settings).discard(project_id, item["import_id"])
         raise
@@ -1426,6 +1619,22 @@ def property_content(
             content = row.get("definition") or ""
         write_property_text(settings, project_id, property_id, content)
     return PlainTextResponse(content, media_type="text/plain; charset=utf-8")
+
+
+@router.post("/{project_id}/properties/batch-delete", status_code=202)
+def remove_properties(
+    project_id: str,
+    payload: PropertyBatchDelete,
+    background_tasks: BackgroundTasks,
+    settings: Settings = Depends(get_settings),
+    user=Depends(require_capability("property.delete")),
+):
+    return _enqueue_batch_removal(
+        settings,
+        project_id,
+        payload.property_ids,
+        background_tasks,
+    )
 
 
 @router.delete("/{project_id}/properties/{property_id}", status_code=202)

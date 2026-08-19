@@ -23,6 +23,20 @@ vi.mock('../api', () => ({
       { id: 'provider-1', name: 'Embedding', provider_type: 'embedding', model: 'bge-m3', base_url: 'https://provider.test/v1', secret_configured: true },
       { id: 'provider-2', name: 'LLM', provider_type: 'llm', model: 'chat-model', base_url: 'https://provider.test/v1', secret_configured: true },
     ]
+    if (path === '/system/llm-invocations?limit=50') return [
+      {
+        id: 'log-1',
+        request_time: '2026-08-18T01:00:00+00:00',
+        response_time: '2026-08-18T01:00:01+00:00',
+        duration_ms: 1000,
+        model: 'chat-model',
+        route_key: 'dg_agent_route',
+        profile_id: 'provider-2',
+        status: 'success',
+        request_prompt: '[{"role":"user","content":"Define this"}]',
+        response_output: 'A concise definition.',
+      },
+    ]
     if (path === '/system/neo4j/check') return { ready: false, fallback: true, message: 'local fallback' }
     if (path === '/system/storage/check') return { writable: true, data_dir: './data', projects_dir: './data/projects' }
     if (path === '/admin/users') return [{ id: 'user-1', username: 'analyst', disabled: false }]
@@ -62,12 +76,14 @@ describe('SettingsPanel', () => {
         entity_limit: 30,
       },
     })
+    expect(normalized.batch_llm_concurrency).toBe(50)
   })
 
   it('shows system, access, and profile management sections', async () => {
     render(<SettingsPanel onClose={() => undefined} />)
     expect(await screen.findByRole('dialog', { name: 'Settings' })).toBeTruthy()
     expect(screen.getByRole('button', { name: 'System' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Logs' })).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Access' })).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Profile' })).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Validate provider Embedding' })).toBeTruthy()
@@ -95,6 +111,21 @@ describe('SettingsPanel', () => {
     expect(screen.queryByPlaceholderText('project.view, property.view')).toBeNull()
     await screen.getByRole('button', { name: 'Profile' }).click()
     expect(screen.queryByRole('checkbox', { name: 'Compact density' })).toBeNull()
+  })
+
+  it('loads LLM invocation details only when the logs tab is opened', async () => {
+    const user = userEvent.setup()
+    render(<SettingsPanel onClose={() => undefined} />)
+
+    await screen.findByRole('dialog', { name: 'Settings' })
+    expect(request).not.toHaveBeenCalledWith('/system/llm-invocations?limit=50')
+
+    await user.click(screen.getByRole('button', { name: 'Logs' }))
+
+    expect(await screen.findByText('Definition Generation Agent')).toBeTruthy()
+    expect(screen.getByText('Completed · 1000 ms')).toBeTruthy()
+    await user.click(screen.getByText('Definition Generation Agent'))
+    expect(screen.getByText('A concise definition.')).toBeTruthy()
   })
 
   it('focuses a requested model route when opened from the import alert', async () => {

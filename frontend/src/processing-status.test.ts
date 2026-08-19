@@ -16,6 +16,10 @@ describe('processingStageLabel', () => {
     ['graph-property-read', 'Reading property content'],
     ['graph-property-embedding', 'Updating property vectors'],
     ['graph-entity-extraction', 'Extracting entities and relations'],
+    ['graph-entity-generation', 'Generating entity nodes'],
+    ['graph-entity-property-relations', 'Generating entity nodes and property relations'],
+    ['graph-entity-merging', 'Merging redundant entities'],
+    ['graph-entity-relations', 'Generating entity relations'],
     ['graph-entity-embedding', 'Updating entity vectors'],
     ['graph-property-relations', 'Generating property relations'],
     ['graph-snapshot', 'Writing candidate graph'],
@@ -26,13 +30,86 @@ describe('processingStageLabel', () => {
 })
 
 describe('processingStageDetail', () => {
+  it('maps batched merge and relation progress details', () => {
+    expect(processingStageDetail(
+      'graph-entity-property-relations',
+      'Generating entity nodes and property relations: 42%',
+    )).toEqual({
+      key: 'Generating entity nodes and property relations: {{percent}}%',
+      values: { percent: 42 },
+    })
+    expect(processingStageDetail(
+      'graph-entity-property-relations',
+      'Generating entity nodes and property relations: entities 7/17 · property relations 42%',
+    )).toEqual({
+      key: 'Generating entity nodes and property relations: {{percent}}%',
+      values: { percent: 42 },
+    })
+    expect(processingStageDetail(
+      'graph-prune',
+      'Removing 12 properties from both graphs',
+    )).toEqual({
+      key: 'Removing {{count}} properties from both graphs',
+      values: { count: 12 },
+    })
+    expect(processingStageDetail(
+      'graph-entity-merging',
+      'Generating redundant entity merge proposals: 42%',
+    )).toEqual({
+      key: 'Generating redundant entity merge proposals: {{percent}}%',
+      values: { percent: 42 },
+    })
+    expect(processingStageDetail(
+      'graph-entity-relations',
+      'Generating relations for entities: 62%',
+    )).toEqual({
+      key: 'Generating relations for entities: {{percent}}%',
+      values: { percent: 62 },
+    })
+    expect(processingStageDetail(
+      'graph-property-relations',
+      'Generating property relations: 100%',
+    )).toEqual({
+      key: 'Generating property relations: {{percent}}%',
+      values: { percent: 100 },
+    })
+  })
+
   it('turns dynamic backend progress into a localizable message', () => {
     expect(processingStageDetail(
-      'graph-entity-extraction',
-      'Generating graph nodes and edges 2/5: 产品手册.md',
+      'graph-entity-generation',
+      'Generating entity nodes 2/5: resuming completed properties',
     )).toEqual({
-      key: 'Generating graph nodes and edges {{current}}/{{total}}: {{filename}}',
+      key: 'Generating entity nodes {{current}}/{{total}}: resuming completed properties',
+      values: { current: 2, total: 5 },
+    })
+    expect(processingStageDetail(
+      'graph-entity-generation',
+      'Generating entity nodes 2/5: 产品手册.md',
+    )).toEqual({
+      key: 'Generating entity nodes {{current}}/{{total}}: {{filename}}',
       values: { current: 2, total: 5, filename: '产品手册.md' },
+    })
+    expect(processingStageDetail(
+      'graph-entity-generation',
+      'Generating entity nodes 0/5',
+    )).toEqual({
+      key: 'Generating entity nodes {{current}}/{{total}}',
+      values: { current: 0, total: 5 },
+    })
+    expect(processingStageDetail(
+      'graph-entity-generation',
+      'Generating entity nodes for 5 properties in parallel',
+    )).toEqual({
+      key: 'Generating entity nodes {{current}}/{{total}}',
+      values: { current: 0, total: 5 },
+    })
+    expect(processingStageDetail(
+      'graph-entity-relations',
+      'Generating complete relations for 12 entities',
+    )).toEqual({
+      key: 'Generating complete relations for {{count}} entities',
+      values: { count: 12 },
     })
   })
 

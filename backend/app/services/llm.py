@@ -1,7 +1,7 @@
 import json
 from typing import Any
 
-from .display_language import language_instruction, localized_messages
+from .display_language import localized_messages
 from .providers import ProviderError, chat_provider
 from .retry import DEFAULT_MODEL_ATTEMPTS, retry_model_call
 from .system_prompts import AI_QUERY_SYSTEM_PROMPT
@@ -262,7 +262,6 @@ class AnswerLLM:
                 "entities": AnswerLLM._entity_context(context),
                 "relations": AnswerLLM._relations(context),
                 "retrieval_paths": AnswerLLM._retrieval_paths(context),
-                "output_instruction": language_instruction(),
             },
             ensure_ascii=True,
         )
@@ -280,7 +279,7 @@ class AnswerLLM:
             },
             *conversation,
             {"role": "user", "content": prompt},
-        ], include=False)
+        ])
 
     @staticmethod
     def _read_property_content(

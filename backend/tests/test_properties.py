@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from backend.app.config import get_settings
 from backend.app.db import connect, initialize
 from backend.app.main import app
-from backend.app.services.agents import DefinitionResult
+from backend.app.services.agents import DefinitionResult, PropertyTreeProposal
 from backend.app.services.catalog import PropertyCatalog
 from backend.app.services.storage import write_property_text
 from backend.tests.helpers import upload_and_confirm_property
@@ -20,7 +20,7 @@ def _auth(client):
     return {"Authorization": f"Bearer {response.json()['token']}"}
 
 
-def test_staged_import_sends_bounded_extraction_to_definition_agent_and_keeps_full_text(
+def test_staged_import_sends_direct_bounded_text_to_definition_agent_and_keeps_full_text(
     tmp_path, monkeypatch
 ):
     import backend.app.api.properties as properties_api
@@ -29,25 +29,10 @@ def test_staged_import_sends_bounded_extraction_to_definition_agent_and_keeps_fu
     settings.ensure_directories()
     initialize(settings.sqlite_path)
     full_text = (
-        "PORTAL HEADER\nPage 1 of 8\n\n"
         "# Architecture\nAtlas uses Neo4j for relation-aware retrieval.\n\n"
-        "# Migration\nLegacy Meridian depends on Atlas during migration.\n\n"
-        + ("PORTAL HEADER\nPage 2 of 8\n\n" * 30)
+        + ("Detailed architecture notes.\n" * 2_000)
     )
     recorded = {}
-
-    monkeypatch.setattr(
-        properties_api,
-        "_existing_entity_inventory",
-        lambda *_args: [
-            {
-                "id": "meridian",
-                "name": "Meridian Platform",
-                "aliases": ["Legacy Meridian"],
-                "definition": "A migration platform.",
-            }
-        ],
-    )
 
     def generate_metadata(
         _settings,
@@ -88,12 +73,13 @@ def test_staged_import_sends_bounded_extraction_to_definition_agent_and_keeps_fu
     )
 
     assert recorded["full_text"] == full_text.strip()
-    assert len(recorded["extraction_text"]) < len(full_text)
-    assert "Atlas uses Neo4j" in recorded["extraction_text"]
-    assert "Legacy Meridian" in recorded["extraction_text"]
+    assert recorded["extraction_text"] == full_text.strip()[:24_000].rstrip()
+    assert recorded["existing_entities"] == []
     assert staged is not None
     assert staged["content"] == full_text.strip()
     assert staged["extraction"]["original_character_count"] == len(full_text.strip())
+    assert staged["extraction"]["selected_character_count"] == 24_000
+    assert len(staged["extraction"]["chunks"]) == 1
 
 
 def test_direct_property_upload_uses_definition_agent_property_identifier(
@@ -217,17 +203,21 @@ def test_upload_returns_filename_suggestion_without_storing_it_as_property_metad
         ),
         raising=False,
     )
-    class RecordingFilenameAgent:
+    class RecordingGAAgent:
         def __init__(self, settings):
             self.settings = settings
 
-        def suggest_many(self, tree_context, items, import_context):
+        def plan_import(self, tree_context, items, import_context):
             assert tree_context == {}
             assert items[0]["definition"] == "A release plan for Atlas."
-            return {items[0]["import_id"]: "atlas-release-plan.md"}
+            property_id = items[0]["property_id"]
+            return PropertyTreeProposal(
+                {property_id: "Products/Atlas"},
+                {property_id: "atlas-release-plan.md"},
+            )
 
     monkeypatch.setattr(
-        properties_api, "PropertyFilenameAgent", RecordingFilenameAgent
+        properties_api, "GAAgent", RecordingGAAgent
     )
     with TestClient(app) as client:
         headers = _auth(client)
@@ -378,19 +368,22 @@ def test_batch_stage_generates_metadata_for_every_file_before_confirmation(monke
     )
     filename_calls = []
 
-    class RecordingFilenameAgent:
+    class RecordingGAAgent:
         def __init__(self, settings):
             self.settings = settings
 
-        def suggest_many(self, tree_context, items, import_context):
+        def plan_import(self, tree_context, items, import_context):
             filename_calls.append((tree_context, items, import_context))
-            return {
-                item["import_id"]: f"{item['original_filename'].rsplit('.', 1)[0]}-guide.md"
-                for item in items
-            }
+            return PropertyTreeProposal(
+                {item["property_id"]: "Product Guides" for item in items},
+                {
+                    item["property_id"]: f"{item['original_filename'].rsplit('.', 1)[0]}-guide.md"
+                    for item in items
+                },
+            )
 
     monkeypatch.setattr(
-        properties_api, "PropertyFilenameAgent", RecordingFilenameAgent
+        properties_api, "GAAgent", RecordingGAAgent
     )
 
     with TestClient(app) as client:
@@ -414,7 +407,7 @@ def test_batch_stage_generates_metadata_for_every_file_before_confirmation(monke
         assert staged.status_code == 202
         payload = staged.json()
         assert payload["status"] == "awaiting_confirmation"
-        assert analyzed == ["atlas.md", "nova.md"]
+        assert sorted(analyzed) == ["atlas.md", "nova.md"]
         assert len(filename_calls) == 1
         assert filename_calls[0][0] == {}
         assert filename_calls[0][2] == "Group these product guides together."
@@ -429,6 +422,10 @@ def test_batch_stage_generates_metadata_for_every_file_before_confirmation(monke
         assert [item["suggested_filename"] for item in payload["items"]] == [
             "atlas-guide.md",
             "nova-guide.md",
+        ]
+        assert [item["suggested_directory"] for item in payload["items"]] == [
+            "Product Guides",
+            "Product Guides",
         ]
         assert [item["definition"] for item in payload["items"]] == [
             "A concise guide to atlas.",
@@ -474,19 +471,22 @@ def test_batch_stage_stream_reports_each_file_before_metadata_generation(monkeyp
     )
     filename_calls = []
 
-    class RecordingFilenameAgent:
+    class RecordingGAAgent:
         def __init__(self, settings):
             self.settings = settings
 
-        def suggest_many(self, tree_context, items, import_context):
+        def plan_import(self, tree_context, items, import_context):
             filename_calls.append(items)
-            return {
-                item["import_id"]: f"{item['original_filename'].rsplit('.', 1)[0]}-guide.md"
-                for item in items
-            }
+            return PropertyTreeProposal(
+                {item["property_id"]: "Product Guides" for item in items},
+                {
+                    item["property_id"]: f"{item['original_filename'].rsplit('.', 1)[0]}-guide.md"
+                    for item in items
+                },
+            )
 
     monkeypatch.setattr(
-        properties_api, "PropertyFilenameAgent", RecordingFilenameAgent
+        properties_api, "GAAgent", RecordingGAAgent
     )
 
     with TestClient(app) as client:
@@ -509,18 +509,15 @@ def test_batch_stage_stream_reports_each_file_before_metadata_generation(monkeyp
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("application/x-ndjson")
     events = [json.loads(line) for line in response.text.splitlines() if line]
-    assert [event["type"] for event in events] == [
-        "batch_started",
-        "file_started",
-        "file_analyzed",
-        "file_started",
-        "file_analyzed",
-        "filename_generation_started",
-        "file_completed",
-        "file_completed",
+    event_types = [event["type"] for event in events]
+    assert event_types[0] == "batch_started"
+    assert event_types.count("file_started") == 2
+    assert event_types.count("file_analyzed") == 2
+    assert event_types[-2:] == [
+        "import_plan_generation_started",
         "batch_completed",
     ]
-    assert analyzed == ["atlas.md", "nova.md"]
+    assert sorted(analyzed) == ["atlas.md", "nova.md"]
     assert len(filename_calls) == 1
     assert [
         (event["index"], event["total"], event["filename"])
@@ -554,19 +551,23 @@ def test_batch_stage_stream_sends_keepalive_while_metadata_generation_is_slow(
         "generate_property_metadata",
         generate_metadata,
     )
-    class LocalFilenameAgent:
+    class LocalGAAgent:
         def __init__(self, settings):
             self.settings = settings
 
-        def suggest_many(self, _tree_context, items, _import_context):
-            return {
-                item["import_id"]: item["original_filename"] for item in items
-            }
+        def plan_import(self, _tree_context, items, _import_context):
+            return PropertyTreeProposal(
+                {item["property_id"]: "" for item in items},
+                {
+                    item["property_id"]: item["original_filename"]
+                    for item in items
+                },
+            )
 
     monkeypatch.setattr(
         properties_api,
-        "PropertyFilenameAgent",
-        LocalFilenameAgent,
+        "GAAgent",
+        LocalGAAgent,
     )
 
     with TestClient(app) as client:
@@ -609,15 +610,19 @@ def test_batch_stage_stream_preserves_chinese_filenames(monkeypatch):
             "产品手册.md",
         ),
     )
-    class RecordingFilenameAgent:
+    class RecordingGAAgent:
         def __init__(self, settings):
             self.settings = settings
 
-        def suggest_many(self, tree_context, items, import_context):
-            return {items[0]["import_id"]: "产品手册.md"}
+        def plan_import(self, tree_context, items, import_context):
+            property_id = items[0]["property_id"]
+            return PropertyTreeProposal(
+                {property_id: "产品/手册"},
+                {property_id: "产品手册.md"},
+            )
 
     monkeypatch.setattr(
-        properties_api, "PropertyFilenameAgent", RecordingFilenameAgent
+        properties_api, "GAAgent", RecordingGAAgent
     )
 
     with TestClient(app) as client:
@@ -661,6 +666,7 @@ def test_batch_confirm_creates_one_job_and_schedules_every_property(monkeypatch)
             filename,
         ),
     )
+
     monkeypatch.setattr(
         properties_api,
         "_schedule",
@@ -1049,6 +1055,48 @@ def test_remove_property_is_permanent_after_candidate_activation():
         removed = client.delete(f"/api/projects/{project['id']}/properties/{property_id}", headers=headers)
         assert removed.status_code == 202
         assert client.get(f"/api/projects/{project['id']}/properties", headers=headers).json() == []
+
+
+def test_batch_remove_properties_uses_one_graph_pruning_job():
+    with TestClient(app) as client:
+        headers = _auth(client)
+        project = client.post(
+            "/api/projects",
+            json={"name": f"Batch Remove-{uuid4().hex}"},
+            headers=headers,
+        ).json()
+        first = upload_and_confirm_property(
+            client,
+            project["id"],
+            headers,
+            "first.txt",
+            b"First property",
+            "text/plain",
+        )
+        second = upload_and_confirm_property(
+            client,
+            project["id"],
+            headers,
+            "second.txt",
+            b"Second property",
+            "text/plain",
+        )
+
+        removed = client.post(
+            f"/api/projects/{project['id']}/properties/batch-delete",
+            json={"property_ids": [first["property_id"], second["property_id"]]},
+            headers=headers,
+        )
+
+        assert removed.status_code == 202
+        assert removed.json()["property_ids"] == [
+            first["property_id"],
+            second["property_id"],
+        ]
+        assert client.get(
+            f"/api/projects/{project['id']}/properties",
+            headers=headers,
+        ).json() == []
 
 
 def test_completed_job_records_candidate_snapshot_and_provider_routes():

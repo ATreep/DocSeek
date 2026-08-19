@@ -5,6 +5,7 @@ import {
   Pencil,
   Plus,
   Save,
+  ScrollText,
   ServerCog,
   Shield,
   Trash2,
@@ -16,6 +17,7 @@ import { request } from "../api";
 import { useDocSeekTranslation } from "../i18n";
 import CapabilityPicker from "./CapabilityPicker";
 import FloatingWindow from "./FloatingWindow";
+import LLMInvocationLogs from "./LLMInvocationLogs";
 
 type Provider = {
   id: string;
@@ -46,6 +48,7 @@ type SystemConfig = {
   routes: Record<string, string | null>;
   entity_schema: string;
   entity_prompt: string;
+  batch_llm_concurrency: number;
   neo4j: {
     property_database: string;
     entity_database: string;
@@ -54,7 +57,8 @@ type SystemConfig = {
   mcp: { enabled: boolean };
   retrieval: RetrievalSettings;
 };
-type SystemConfigResponse = Omit<SystemConfig, "retrieval"> & {
+type SystemConfigResponse = Omit<SystemConfig, "retrieval" | "batch_llm_concurrency"> & {
+  batch_llm_concurrency?: number;
   retrieval?: {
     ai_query?: Partial<RetrievalSettings["ai_query"]>;
     search?: Partial<RetrievalSettings["search"]>;
@@ -80,12 +84,23 @@ const DEFAULT_RETRIEVAL_SETTINGS: RetrievalSettings = {
     entity_limit: 30,
   },
 };
+const DEFAULT_BATCH_LLM_CONCURRENCY = 50;
+const MAX_BATCH_LLM_CONCURRENCY = 50;
 
 export function normalizeSystemConfig(
   config: SystemConfigResponse,
 ): SystemConfig {
   return {
     ...config,
+    batch_llm_concurrency: Math.max(
+      1,
+      Math.min(
+        MAX_BATCH_LLM_CONCURRENCY,
+        Math.trunc(
+          config.batch_llm_concurrency ?? DEFAULT_BATCH_LLM_CONCURRENCY,
+        ),
+      ),
+    ),
     retrieval: {
       ai_query: {
         ...DEFAULT_RETRIEVAL_SETTINGS.ai_query,
@@ -110,7 +125,7 @@ export default function SettingsPanel({
 }) {
   const { t } = useDocSeekTranslation();
   const [dismissed, setDismissed] = useState(false);
-  const [tab, setTab] = useState<"system" | "access" | "profile">("system");
+  const [tab, setTab] = useState<"system" | "logs" | "access" | "profile">("system");
   const [profile, setProfile] = useState<Profile | null>(null);
   const [config, setConfig] = useState<SystemConfig | null>(null);
   const [providers, setProviders] = useState<Provider[]>([]);
@@ -239,6 +254,7 @@ export default function SettingsPanel({
         body: JSON.stringify({
           ...config.routes,
           mcp_enabled: config.mcp.enabled,
+          batch_llm_concurrency: config.batch_llm_concurrency,
         }),
       });
       setNotice(t("System configuration saved"));
@@ -485,6 +501,13 @@ export default function SettingsPanel({
         </button>
         <button
           type="button"
+          className={tab === "logs" ? "active" : ""}
+          onClick={() => setTab("logs")}
+        >
+          <ScrollText size={15} /> {t('Logs')}
+        </button>
+        <button
+          type="button"
           className={tab === "access" ? "active" : ""}
           onClick={() => setTab("access")}
         >
@@ -714,6 +737,31 @@ export default function SettingsPanel({
                   ))}
                 </select>
               </label>
+              <label>
+                {t('Parallel LLM concurrency')}
+                <input
+                  type="number"
+                  min={1}
+                  max={MAX_BATCH_LLM_CONCURRENCY}
+                  step={1}
+                  value={config.batch_llm_concurrency}
+                  aria-label={t('Parallel LLM concurrency')}
+                  onChange={(event) => {
+                    const value = Math.trunc(event.target.valueAsNumber);
+                    if (!Number.isFinite(value)) return;
+                    setConfig({
+                      ...config,
+                      batch_llm_concurrency: Math.max(
+                        1,
+                        Math.min(MAX_BATCH_LLM_CONCURRENCY, value),
+                      ),
+                    });
+                  }}
+                />
+                <small className="settings-field-hint">
+                  {t('Maximum simultaneous LLM requests for workflows that support concurrent processing (1–50).')}
+                </small>
+              </label>
               <label className="toggle-row">
                 <input
                   type="checkbox"
@@ -753,6 +801,7 @@ export default function SettingsPanel({
           )}
         </div>
       )}
+      <LLMInvocationLogs active={tab === "logs"} />
       {tab === "access" && (
         <div className="settings-content">
           <section className="settings-section">

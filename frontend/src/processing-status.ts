@@ -6,6 +6,10 @@ const STAGE_LABELS: Record<string, string> = {
   'graph-property-read': 'Reading property content',
   'graph-property-embedding': 'Updating property vectors',
   'graph-entity-extraction': 'Extracting entities and relations',
+  'graph-entity-generation': 'Generating entity nodes',
+  'graph-entity-property-relations': 'Generating entity nodes and property relations',
+  'graph-entity-merging': 'Merging redundant entities',
+  'graph-entity-relations': 'Generating entity relations',
   'graph-entity-embedding': 'Updating entity vectors',
   'graph-property-relations': 'Generating property relations',
   'graph-snapshot': 'Writing candidate graph',
@@ -40,6 +44,7 @@ const EXACT_STAGE_DETAILS: Record<string, string> = {
   'Candidate snapshot active': 'Candidate snapshot active',
   'Preparing property pipeline': 'Preparing property pipeline',
   'Removing property graph nodes and relations': 'Removing property graph nodes and relations',
+  'Applying redundant entity merges': 'Applying redundant entity merges',
   'Activating pruned graph snapshot': 'Activating pruned graph snapshot',
   'Property removed from both graphs': 'Property removed from both graphs',
 }
@@ -56,6 +61,86 @@ export function processingStageDetail(
     key: string
     values: (match: RegExpMatchArray) => Record<string, string | number>
   }> = [
+    {
+      pattern: /^Generating entity nodes and property relations: (\d+)%$/,
+      key: 'Generating entity nodes and property relations: {{percent}}%',
+      values: (match) => ({ percent: Number(match[1]) }),
+    },
+    {
+      pattern: /^Generating entity nodes and property relations: entities (\d+)\/(\d+) · property relations (\d+)%$/,
+      key: 'Generating entity nodes and property relations: {{percent}}%',
+      values: (match) => ({
+        percent: Math.round(
+          ((Number(match[1]) / Math.max(Number(match[2]), 1)) * 100
+            + Number(match[3])) / 2,
+        ),
+      }),
+    },
+    {
+      pattern: /^Generating redundant entity merge proposals: (\d+)%$/,
+      key: 'Generating redundant entity merge proposals: {{percent}}%',
+      values: (match) => ({ percent: Number(match[1]) }),
+    },
+    {
+      pattern: /^Generating relations for entities: (\d+)%$/,
+      key: 'Generating relations for entities: {{percent}}%',
+      values: (match) => ({ percent: Number(match[1]) }),
+    },
+    {
+      pattern: /^Generating redundant entity merge proposals\. (\d+)%$/,
+      key: 'Generating redundant entity merge proposals: {{percent}}%',
+      values: (match) => ({ percent: Number(match[1]) }),
+    },
+    {
+      pattern: /^Generating relations for entities\. (\d+)%$/,
+      key: 'Generating relations for entities: {{percent}}%',
+      values: (match) => ({ percent: Number(match[1]) }),
+    },
+    {
+      pattern: /^Generating property relations[:.] (\d+)%$/,
+      key: 'Generating property relations: {{percent}}%',
+      values: (match) => ({ percent: Number(match[1]) }),
+    },
+    {
+      pattern: /^Removing (\d+) properties from both graphs$/,
+      key: 'Removing {{count}} properties from both graphs',
+      values: (match) => ({ count: Number(match[1]) }),
+    },
+    {
+      pattern: /^(\d+) properties removed from both graphs$/,
+      key: '{{count}} properties removed from both graphs',
+      values: (match) => ({ count: Number(match[1]) }),
+    },
+    {
+      pattern: /^Generating entity nodes (\d+)\/(\d+): resuming completed properties$/,
+      key: 'Generating entity nodes {{current}}/{{total}}: resuming completed properties',
+      values: (match) => ({ current: Number(match[1]), total: Number(match[2]) }),
+    },
+    {
+      pattern: /^Generating entity nodes (\d+)\/(\d+)$/,
+      key: 'Generating entity nodes {{current}}/{{total}}',
+      values: (match) => ({ current: Number(match[1]), total: Number(match[2]) }),
+    },
+    {
+      pattern: /^Generating entity nodes (\d+)\/(\d+): (.+)$/,
+      key: 'Generating entity nodes {{current}}/{{total}}: {{filename}}',
+      values: (match) => ({ current: Number(match[1]), total: Number(match[2]), filename: match[3] }),
+    },
+    {
+      pattern: /^Generating entity nodes for (\d+) properties in parallel$/,
+      key: 'Generating entity nodes {{current}}/{{total}}',
+      values: (match) => ({ current: 0, total: Number(match[1]) }),
+    },
+    {
+      pattern: /^Generating entity nodes for (\d+) properties in parallel; property relations are running$/,
+      key: 'Generating entity nodes {{current}}/{{total}}',
+      values: (match) => ({ current: 0, total: Number(match[1]) }),
+    },
+    {
+      pattern: /^Generating complete relations for (\d+) entities$/,
+      key: 'Generating complete relations for {{count}} entities',
+      values: (match) => ({ count: Number(match[1]) }),
+    },
     {
       pattern: /^Generating graph nodes and edges (\d+)\/(\d+): (.+)$/,
       key: 'Generating graph nodes and edges {{current}}/{{total}}: {{filename}}',

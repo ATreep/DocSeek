@@ -1,5 +1,5 @@
 import { LogOut } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useDocSeekTranslation } from "../i18n";
 import "./ui-hardening.css";
 
@@ -10,6 +10,16 @@ export default function AccountMenu({
 }) {
   const { t } = useDocSeekTranslation();
   const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const close = (event: MouseEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", close);
+    return () => document.removeEventListener("mousedown", close);
+  }, [open]);
 
   async function signOut() {
     setOpen(false);
@@ -17,7 +27,7 @@ export default function AccountMenu({
   }
 
   return (
-    <div className="account-menu">
+    <div className="account-menu" ref={rootRef}>
       <button
         type="button"
         className="avatar"

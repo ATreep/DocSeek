@@ -73,14 +73,14 @@ def retry_processing(project_id: str, payload: RetryRequest, background_tasks: B
     if not row:
         raise HTTPException(status_code=404, detail="Property not found")
     with connect(settings.sqlite_path) as db:
-        failed_jobs = db.execute(
-            "SELECT * FROM jobs WHERE project_id=? AND status='failed' ORDER BY heartbeat DESC",
+        retryable_jobs = db.execute(
+            "SELECT * FROM jobs WHERE project_id=? AND status IN ('failed','cancelled') ORDER BY heartbeat DESC",
             (project_id,),
         ).fetchall()
     failed_batch = None
     batch_input: dict = {}
     batch_progress: dict = {}
-    for failed_job in failed_jobs:
+    for failed_job in retryable_jobs:
         try:
             candidate_input = json.loads(failed_job["input_json"] or "{}")
             candidate_progress = json.loads(failed_job["progress_json"] or "{}")
@@ -144,7 +144,7 @@ def retry_processing(project_id: str, payload: RetryRequest, background_tasks: B
             batch_input["items"],
             batch_progress.get("candidate_snapshot") or failed_batch["candidate_snapshot"],
             sorted(completed_ids),
-            batch_progress.get("directories") or {},
+            batch_progress.get("directories"),
         )
         return {
             "status": "queued",

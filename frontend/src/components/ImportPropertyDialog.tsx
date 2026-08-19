@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from 'react'
-import { AlertTriangle, Check, FileText, X } from 'lucide-react'
+import { AlertTriangle, Check, FileText, FolderTree, X } from 'lucide-react'
 import FloatingWindow from './FloatingWindow'
 import { useDocSeekTranslation } from '../i18n'
 
@@ -7,6 +7,7 @@ export type ImportPropertyDialogItem = {
   import_id: string
   original_filename: string
   suggested_filename: string
+  suggested_directory: string
   definition: string
   word_count?: number
   character_count?: number
@@ -87,6 +88,15 @@ export default function ImportPropertyDialog({ open, items, busy, onCancel, onCo
               onChange={(event) => setFilenames((current) => ({ ...current, [item.import_id]: event.target.value }))}
               required
             />
+            <span className="import-plan-location">
+              <FolderTree size={14} aria-hidden="true" />
+              <span>
+                <small>{t('Planned location')}</small>
+                <strong>
+                  {item.suggested_directory || t('Project root')} / {filenames[item.import_id] || item.suggested_filename}
+                </strong>
+              </span>
+            </span>
           </label>
         </section>)}
       </div>

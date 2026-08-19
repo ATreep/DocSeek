@@ -10,12 +10,14 @@ const items = [
     import_id: 'import-atlas',
     original_filename: 'notes.md',
     suggested_filename: 'atlas-guide.md',
+    suggested_directory: 'Products/Atlas',
     definition: 'An introduction to Atlas including setup and usage.',
   },
   {
     import_id: 'import-nova',
     original_filename: 'readme.md',
     suggested_filename: 'nova-readme.md',
+    suggested_directory: 'Products/Nova',
     definition: 'An overview of Nova including installation and FAQs.',
   },
 ]
@@ -30,6 +32,8 @@ describe('ImportPropertyDialog', () => {
     expect(screen.getByText(items[1].definition)).toBeTruthy()
     expect((screen.getByLabelText('Property filename for notes.md') as HTMLInputElement).value).toBe('atlas-guide.md')
     expect((screen.getByLabelText('Property filename for readme.md') as HTMLInputElement).value).toBe('nova-readme.md')
+    expect(screen.getByText('Products/Atlas / atlas-guide.md')).toBeTruthy()
+    expect(screen.getByText('Products/Nova / nova-readme.md')).toBeTruthy()
 
     await userEvent.click(screen.getByRole('button', { name: 'Import 2 properties' }))
 
@@ -49,6 +53,7 @@ describe('ImportPropertyDialog', () => {
     await userEvent.type(atlasInput, 'atlas-manual.md')
     await userEvent.clear(novaInput)
     await userEvent.type(novaInput, 'nova-guide.md')
+    expect(screen.getByText('Products/Atlas / atlas-manual.md')).toBeTruthy()
     await userEvent.click(screen.getByRole('button', { name: 'Import 2 properties' }))
 
     expect(confirm).toHaveBeenCalledWith([

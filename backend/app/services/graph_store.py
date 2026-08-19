@@ -7,17 +7,22 @@ import math
 import re
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import jieba
 
 from ..config import Settings
 from .agents import normalize_relation_type, parse_json_object
-from .display_language import localized_messages
+from .display_language import current_display_language, localized_messages
 from .model_errors import attach_model_response
 from .providers import embedding_provider
 from .retry import retry_model_call
-from .system_prompts import ENTITY_EXTRACTION_SYSTEM_PROMPT
+from .relation_batches import CollectionPair
+from .system_prompts import (
+    ENTITY_GENERATION_SYSTEM_PROMPT,
+    ENTITY_MERGING_SYSTEM_PROMPT,
+    ENTITY_RELATION_GENERATION_SYSTEM_PROMPT,
+)
 
 DEFAULT_ENTITY_SCHEMA = "DocSeekEntity(name, type, definition, source_property_ids)"
 EMBEDDING_CHUNK_CHARS = 12_000
@@ -297,12 +302,29 @@ def prune_property_snapshot(
     property_id: str,
     snapshot_id: str,
 ) -> GraphSnapshot:
+    return prune_properties_snapshot(
+        store,
+        project_id,
+        [property_id],
+        snapshot_id,
+    )
+
+
+def prune_properties_snapshot(
+    store: Any,
+    project_id: str,
+    property_ids: Iterable[str],
+    snapshot_id: str,
+) -> GraphSnapshot:
+    removed_property_ids = {
+        str(property_id) for property_id in property_ids if property_id
+    }
     property_graph = store.graph(project_id, "property")
     entity_graph = store.graph(project_id, "entity")
     properties = [
         dict(node)
         for node in property_graph.get("nodes", [])
-        if str(node.get("id") or "") != property_id
+        if str(node.get("id") or "") not in removed_property_ids
     ]
     property_ids = {str(node.get("id") or "") for node in properties}
     property_edges = [
@@ -327,17 +349,19 @@ def prune_property_snapshot(
             for context in entity.get("source_contexts", [])
             if isinstance(context, dict)
         ]
-        owned_by_property = property_id in original_sources or any(
-            str(context.get("property_id") or "") == property_id
+        owned_by_property = bool(removed_property_ids.intersection(original_sources)) or any(
+            str(context.get("property_id") or "") in removed_property_ids
             for context in original_contexts
         )
         remaining_sources = [
-            source_id for source_id in original_sources if source_id != property_id
+            source_id
+            for source_id in original_sources
+            if source_id not in removed_property_ids
         ]
         remaining_contexts = [
             context
             for context in original_contexts
-            if str(context.get("property_id") or "") != property_id
+            if str(context.get("property_id") or "") not in removed_property_ids
         ]
         if owned_by_property and not remaining_sources and not remaining_contexts:
             removed_entity_ids.add(entity_id)
@@ -881,7 +905,7 @@ def _merge_extracted_entity_graph(
 
 
 class GraphRAGBuilder:
-    """GraphRAG contract with a local deterministic mode and an optional Neo4j KG Builder backend."""
+    """Generate entity nodes, then rebuild their relations in a separate stage."""
 
     def __init__(self, schema: str, prompt: str, database: str = "entity_graph", llm: Any | None = None):
         self.schema = schema
@@ -901,8 +925,7 @@ class GraphRAGBuilder:
         documents: list[dict[str, str]],
         embedder: Any | None = None,
         current_entities: list[dict[str, Any]] | None = None,
-        incremental: bool = False,
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    ) -> list[dict[str, Any]]:
         text_documents = [document for document in documents if document.get("text")]
         self.last_documents = [document["property_id"] for document in text_documents]
         self.last_entity_inventory = [
@@ -925,35 +948,29 @@ class GraphRAGBuilder:
             ):
                 original_inventory = list(self.last_entity_inventory)
                 try:
-                    entities, edges = self._build_chunked_with_llm(
+                    entities = self._build_chunked_with_llm(
                         text_documents,
-                        incremental=incremental,
                         original_inventory=original_inventory,
                     )
                 finally:
                     self.last_entity_inventory = original_inventory
             else:
-                entities, edges = self._build_with_llm(
-                    text_documents, incremental=incremental
-                )
+                entities = self._build_with_llm(text_documents)
         else:
-            entities, edges = extract_entities(text_documents, self.last_entity_inventory)
+            entities, _ = extract_entities(text_documents, self.last_entity_inventory)
         if embedder and entities:
             entity_texts = [entity_embedding_text(entity) for entity in entities]
             vectors = retry_model_call(lambda: embedder.embed(entity_texts))
             entities = [{**entity, "embedding": vector} for entity, vector in zip(entities, vectors)]
-        return entities, edges
+        return entities
 
     def _build_chunked_with_llm(
         self,
         documents: list[dict[str, str]],
         *,
-        incremental: bool,
         original_inventory: list[dict[str, str]],
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    ) -> list[dict[str, Any]]:
         entities: list[dict[str, Any]] = []
-        edges: list[dict[str, Any]] = []
-        first_call = True
         for document in documents:
             for chunk in entity_extraction_chunks(document["text"]):
                 inventory_by_id = {
@@ -971,40 +988,30 @@ class GraphRAGBuilder:
                         }
                 self.last_entity_inventory = list(inventory_by_id.values())
                 chunk_document = {**document, "text": chunk}
-                delta_entities, delta_edges = self._build_with_llm(
-                    [chunk_document],
-                    incremental=incremental or not first_call,
-                )
-                entities, edges = _merge_extracted_entity_graph(
+                delta_entities = self._build_with_llm([chunk_document])
+                entities, _ = _merge_extracted_entity_graph(
                     entities,
-                    edges,
+                    [],
                     delta_entities,
-                    delta_edges,
+                    [],
                 )
-                first_call = False
-        return entities, edges
+        return entities
 
     def _build_with_llm(
-        self, documents: list[dict[str, str]], incremental: bool = False
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        return retry_model_call(
-            lambda: self._build_with_llm_once(documents, incremental)
-        )
+        self,
+        documents: list[dict[str, str]],
+    ) -> list[dict[str, Any]]:
+        return retry_model_call(lambda: self._build_with_llm_once(documents))
 
     def _build_with_llm_once(
-        self, documents: list[dict[str, str]], incremental: bool = False
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        self,
+        documents: list[dict[str, str]],
+    ) -> list[dict[str, Any]]:
         inventory = self.last_entity_inventory or []
         definition_guidance = "" if ENTITY_DEFINITION_GUIDANCE in self.prompt else f"{ENTITY_DEFINITION_GUIDANCE} "
         selection_guidance = "" if ENTITY_SELECTION_GUIDANCE in self.prompt else f"{ENTITY_SELECTION_GUIDANCE} "
         identifier_guidance = "" if ENTITY_IDENTIFIER_GUIDANCE in self.prompt else f"{ENTITY_IDENTIFIER_GUIDANCE} "
-        document_payload = [
-            {
-                "i": index,
-                "text": document["text"],
-            }
-            for index, document in enumerate(documents)
-        ]
+        document_payload = [{"text": document["text"]} for document in documents]
         compact_inventory = json.dumps(
             inventory, ensure_ascii=False, separators=(",", ":")
         )
@@ -1016,39 +1023,32 @@ class GraphRAGBuilder:
             if "{current_entities}" in self.prompt
             else f"Current entity inventory:\n{compact_inventory}\n"
         )
-        if incremental:
-            scope_guidance = (
-                "Incremental call: inspect only supplied new text; inventory is reference data. Reuse matching IDs and "
-                "return only mentioned entities and newly supported or changed relations. "
-            )
-            endpoint_guidance = (
-                "Edges may reference returned or inventory IDs. "
-            )
-        else:
-            scope_guidance = (
-                "Full call: rebuild entities and relations from all supplied current text; omit unsupported old relations. "
-            )
-            endpoint_guidance = "Edges must use returned IDs. "
         prompt = (
             f"{configured_prompt}\n\n"
-            f"{scope_guidance}"
-            f"{definition_guidance}"
-            f"{selection_guidance}"
-            f"{identifier_guidance}"
-            "Use only evidence-backed directed relations with a specific type; do not force connectivity. "
-            "Return compact JSON: entities as [\"id\",\"name\",\"definition\",[document_i]] and edges as "
-            "[\"source\",\"target\",\"type\"]. "
-            f"{endpoint_guidance}"
+            "Entity-node stage: inspect only the supplied property text and return only entity nodes "
+            "mentioned in that text. Return only entity nodes, no relations. "
+            f"{definition_guidance}{selection_guidance}{identifier_guidance}"
+            "Return exactly one compact JSON object. The top level must be an object, not an array: "
+            "{\"entities\":[[\"id\",\"name\",\"definition\"]]}. "
+            "Return {\"entities\":[]} when no entities are found. "
             "No Markdown or commentary.\n"
             f"{inventory_section}"
             "Current property documents:\n"
             f"{json.dumps(document_payload, ensure_ascii=False, separators=(',', ':'))}"
         )
         raw = self.llm.complete(
-            localized_messages([
-                {"role": "system", "content": ENTITY_EXTRACTION_SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ]),
+            localized_messages(
+                [
+                    {
+                        "role": "system",
+                        "content": ENTITY_GENERATION_SYSTEM_PROMPT.format(
+                            output_language=current_display_language()
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                include=False,
+            ),
             temperature=0.1,
             max_tokens=ENTITY_GRAPH_MAX_TOKENS,
         )
@@ -1056,30 +1056,27 @@ class GraphRAGBuilder:
             parsed = parse_json_object(raw)
         except ValueError as exc:
             raise attach_model_response(
-                ValueError("entity extraction provider returned invalid JSON"), raw
+                ValueError("entity generation provider returned invalid JSON"), raw
             ) from exc
         raw_entities = parsed.get("entities", []) if isinstance(parsed, dict) else []
-        raw_edges = parsed.get("edges", []) if isinstance(parsed, dict) else []
-        if not isinstance(raw_entities, list) or not isinstance(raw_edges, list):
+        if not isinstance(raw_entities, list):
             raise attach_model_response(
-                ValueError(
-                    "entity extraction provider returned invalid graph arrays"
-                ),
+                ValueError("entity generation provider returned an invalid entities array"),
                 raw,
             )
 
         project_id = documents[0]["project_id"]
-        property_ids = {document["property_id"] for document in documents}
-        property_ids_by_index = [document["property_id"] for document in documents]
+        source_ids = list(
+            dict.fromkeys(document["property_id"] for document in documents)
+        )
         entities = []
         for item in raw_entities:
             if isinstance(item, dict):
                 raw_id = item.get("id")
                 raw_name = item.get("name")
                 raw_definition = item.get("definition")
-                raw_source_ids = item.get("source_property_ids", [])
-            elif isinstance(item, list) and len(item) >= 4:
-                raw_id, raw_name, raw_definition, raw_source_ids = item[:4]
+            elif isinstance(item, list) and len(item) >= 3:
+                raw_id, raw_name, raw_definition = item[:3]
             else:
                 continue
             entity_id = str(raw_id or "").strip()
@@ -1089,19 +1086,10 @@ class GraphRAGBuilder:
             if not ENTITY_IDENTIFIER_PATTERN.fullmatch(entity_id):
                 raise attach_model_response(
                     ValueError(
-                        "entity extraction provider returned an invalid entity id"
+                        "entity generation provider returned an invalid entity id"
                     ),
                     raw,
                 )
-            source_ids = []
-            if isinstance(raw_source_ids, list):
-                for source_id in raw_source_ids:
-                    if isinstance(source_id, int) and 0 <= source_id < len(property_ids_by_index):
-                        resolved_id = property_ids_by_index[source_id]
-                    else:
-                        resolved_id = str(source_id)
-                    if resolved_id in property_ids and resolved_id not in source_ids:
-                        source_ids.append(resolved_id)
             entity = {
                 "id": entity_id,
                 "name": name,
@@ -1126,36 +1114,453 @@ class GraphRAGBuilder:
                 }
             )
 
-        entity_ids = {entity["id"] for entity in entities}
-        valid_edge_ids = set(entity_ids)
-        if incremental:
-            valid_edge_ids.update(
-                str(item["id"])
-                for item in inventory
-                if item.get("id")
+        return entities
+
+    @staticmethod
+    def _compact_relation_entities(
+        entities: Iterable[dict[str, Any]],
+    ) -> list[list[str]]:
+        return [
+            [
+                str(entity.get("id") or ""),
+                str(entity.get("name") or ""),
+                str(entity.get("definition") or ""),
+            ]
+            for entity in entities
+        ]
+
+    def propose_merges(self, pair: CollectionPair) -> list[tuple[str, str]]:
+        if not self.llm or not pair.left:
+            return []
+        left_ids = {str(entity.get("id") or "") for entity in pair.left}
+        right_ids = {str(entity.get("id") or "") for entity in pair.right}
+        allowed_ids = left_ids | right_ids
+        payload: dict[str, Any] = {
+            "source_collection": self._compact_relation_entities(pair.left),
+        }
+        if pair.is_cross:
+            payload["target_collection"] = self._compact_relation_entities(pair.right)
+            direction = (
+                "Every merge must point from an entity in source_collection to an entity "
+                "in target_collection."
             )
+        else:
+            direction = (
+                "Both endpoints must be distinct entities in source_collection. Choose the "
+                "less canonical redundant entity as source and its surviving entity as target."
+            )
+        prompt = (
+            "Judge redundancy from the supplied entity definitions. Merge only when two definitions "
+            "describe the same entity with nearly identical meaning. Do not merge entities merely "
+            "because they are related, similarly named, broader, narrower, components, or versions. "
+            f"{direction} Return exactly one compact JSON object as "
+            '{"merges":[["source_entity_id","target_entity_id"]]}. '
+            "Return an empty merges list when no merge is justified. No Markdown or commentary.\n"
+            f"{json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}"
+        )
+
+        def invoke() -> list[tuple[str, str]]:
+            raw = self.llm.complete(
+                localized_messages(
+                    [
+                        {"role": "system", "content": ENTITY_MERGING_SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt},
+                    ]
+                ),
+                temperature=0.1,
+                max_tokens=ENTITY_GRAPH_MAX_TOKENS,
+            )
+            try:
+                parsed = parse_json_object(raw)
+            except ValueError as exc:
+                raise attach_model_response(
+                    ValueError("entity merge provider returned invalid JSON"), raw
+                ) from exc
+            items = parsed.get("merges")
+            if not isinstance(items, list):
+                raise attach_model_response(
+                    ValueError("entity merge provider returned invalid merges"), raw
+                )
+            valid: list[tuple[str, str]] = []
+            for item in items:
+                if not isinstance(item, list) or len(item) != 2:
+                    continue
+                source, target = (str(value or "").strip() for value in item)
+                valid_direction = (
+                    source in left_ids and target in right_ids
+                    if pair.is_cross
+                    else source in left_ids and target in left_ids
+                )
+                if (
+                    source
+                    and target
+                    and source != target
+                    and source in allowed_ids
+                    and target in allowed_ids
+                    and valid_direction
+                    and (source, target) not in valid
+                ):
+                    valid.append((source, target))
+            return valid
+
+        return retry_model_call(invoke)
+
+    def generate_relation_edges(self, pair: CollectionPair) -> list[dict[str, str]]:
+        if not self.llm or not pair.left:
+            return []
+        left_ids = {str(entity.get("id") or "") for entity in pair.left}
+        right_ids = {str(entity.get("id") or "") for entity in pair.right}
+        payload: dict[str, Any] = {
+            "first_collection": self._compact_relation_entities(pair.left),
+        }
+        if pair.is_cross:
+            payload["second_collection"] = self._compact_relation_entities(pair.right)
+            endpoint_rule = (
+                "Each relation must have one endpoint in first_collection and the other in "
+                "second_collection. Either direction is allowed. Relations with both endpoints "
+                "in the same collection are forbidden."
+            )
+        else:
+            endpoint_rule = (
+                "Both endpoints must be distinct entities in first_collection."
+            )
+        prompt = (
+            "Generate only meaningful directed relations supported by the supplied entity names and "
+            "definitions. Independent entities and disconnected subgraphs are valid; never infer a "
+            "relation from similarity or co-occurrence alone. Use a concise, precise Unicode relation "
+            f"type. {endpoint_rule} Return exactly one compact JSON object as "
+            '{"edges":[["source_entity_id","target_entity_id","relation_type"]]}. '
+            "Return an empty edges list when no relation is supported. No Markdown or commentary.\n"
+            f"{json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}"
+        )
+
+        def invoke() -> list[dict[str, str]]:
+            raw = self.llm.complete(
+                localized_messages(
+                    [
+                        {
+                            "role": "system",
+                            "content": ENTITY_RELATION_GENERATION_SYSTEM_PROMPT,
+                        },
+                        {"role": "user", "content": prompt},
+                    ]
+                ),
+                temperature=0.1,
+                max_tokens=ENTITY_GRAPH_MAX_TOKENS,
+            )
+            try:
+                parsed = parse_json_object(raw)
+            except ValueError as exc:
+                raise attach_model_response(
+                    ValueError("entity relation provider returned invalid JSON"), raw
+                ) from exc
+            items = parsed.get("edges")
+            if not isinstance(items, list):
+                raise attach_model_response(
+                    ValueError("entity relation provider returned invalid edges"), raw
+                )
+            edges: list[dict[str, str]] = []
+            for item in items:
+                if isinstance(item, dict):
+                    source, target, raw_type = (
+                        item.get("source"),
+                        item.get("target"),
+                        item.get("type"),
+                    )
+                elif isinstance(item, list) and len(item) == 3:
+                    source, target, raw_type = item
+                else:
+                    continue
+                source, target = str(source or ""), str(target or "")
+                relation_type = normalize_relation_type(raw_type)
+                valid_endpoints = (
+                    (source in left_ids and target in right_ids)
+                    or (source in right_ids and target in left_ids)
+                    if pair.is_cross
+                    else source in left_ids and target in left_ids
+                )
+                if source == target or not relation_type or not valid_endpoints:
+                    continue
+                edge = {"source": source, "target": target, "type": relation_type}
+                if edge not in edges:
+                    edges.append(edge)
+            return edges
+
+        return retry_model_call(invoke)
+
+    def rebuild_relations(
+        self,
+        *,
+        existing_entities: list[dict[str, Any]],
+        existing_edges: list[dict[str, Any]],
+        new_entities: list[dict[str, Any]],
+        replace_existing: bool = False,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        entities_by_id: dict[str, dict[str, Any]] = {}
+        for entity in [] if replace_existing else existing_entities:
+            entity_id = str(entity.get("id") or "")
+            if entity_id:
+                entities_by_id[entity_id] = dict(entity)
+        for entity in new_entities:
+            entity_id = str(entity.get("id") or "")
+            if not entity_id:
+                continue
+            current = entities_by_id.get(entity_id)
+            entities_by_id[entity_id] = (
+                self._merge_entity_members(
+                    entity_id,
+                    [current, entity],
+                    name=str(entity.get("name") or ""),
+                    definition=str(entity.get("definition") or ""),
+                )
+                if current is not None
+                else dict(entity)
+            )
+        if not entities_by_id:
+            return [], []
+        if not self.llm:
+            valid_ids = set(entities_by_id)
+            return (
+                list(entities_by_id.values()),
+                [
+                    {
+                        "source": str(edge["source"]),
+                        "target": str(edge["target"]),
+                        "type": normalize_relation_type(edge.get("type")),
+                    }
+                    for edge in existing_edges
+                    if edge.get("source") in valid_ids
+                    and edge.get("target") in valid_ids
+                    and edge.get("source") != edge.get("target")
+                    and normalize_relation_type(edge.get("type"))
+                ],
+            )
+        return retry_model_call(
+            lambda: self._rebuild_relations_once(
+                entities_by_id,
+                existing_edges,
+                new_entities,
+                existing_entities,
+            )
+        )
+
+    @staticmethod
+    def _merge_entity_members(
+        canonical_id: str,
+        members: list[dict[str, Any] | None],
+        *,
+        name: str,
+        definition: str,
+    ) -> dict[str, Any]:
+        available = [member for member in members if isinstance(member, dict)]
+        canonical = next(
+            (
+                member
+                for member in available
+                if str(member.get("id") or "") == canonical_id
+            ),
+            available[0] if available else {},
+        )
+        merged = dict(canonical)
+        merged["id"] = canonical_id
+        if name:
+            merged["name"] = name
+        if definition:
+            merged["definition"] = definition
+        if not merged.get("project_id"):
+            merged["project_id"] = next(
+                (
+                    member.get("project_id")
+                    for member in available
+                    if member.get("project_id")
+                ),
+                "",
+            )
+        merged["source_property_ids"] = list(
+            dict.fromkeys(
+                str(property_id)
+                for member in available
+                for property_id in (member.get("source_property_ids") or [])
+                if property_id
+            )
+        )
+        contexts: list[dict[str, str]] = []
+        seen_contexts: set[tuple[str, str]] = set()
+        used_words = 0
+        for member in available:
+            for context in member.get("source_contexts") or []:
+                if not isinstance(context, dict):
+                    continue
+                property_id = str(context.get("property_id") or "")
+                text = str(context.get("text") or "").strip()
+                key = (property_id, text)
+                word_count = _context_word_count(text)
+                if (
+                    not property_id
+                    or not text
+                    or key in seen_contexts
+                    or used_words + word_count > ENTITY_CONTEXT_WORD_LIMIT
+                ):
+                    continue
+                contexts.append({"property_id": property_id, "text": text})
+                seen_contexts.add(key)
+                used_words += word_count
+        merged["source_contexts"] = contexts
+        merged["embedding"] = embedding(entity_embedding_text(merged))
+        return merged
+
+    def _rebuild_relations_once(
+        self,
+        entities_by_id: dict[str, dict[str, Any]],
+        existing_edges: list[dict[str, Any]],
+        new_entities: list[dict[str, Any]],
+        existing_entities: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        def compact_entity(entity: dict[str, Any]) -> dict[str, str]:
+            return {
+                "id": str(entity.get("id") or ""),
+                "name": str(entity.get("name") or ""),
+                "definition": str(entity.get("definition") or ""),
+            }
+        payload = {
+            "existing_entities": [
+                compact_entity(entity) for entity in existing_entities
+            ],
+            "existing_edges": [
+                {
+                    "source": str(edge.get("source") or ""),
+                    "target": str(edge.get("target") or ""),
+                    "type": str(edge.get("type") or ""),
+                }
+                for edge in existing_edges
+            ],
+            "new_entities": [compact_entity(entity) for entity in new_entities],
+            "current_entities": [
+                compact_entity(entity) for entity in entities_by_id.values()
+            ],
+            "current_entity_ids": list(entities_by_id),
+        }
+        prompt = (
+            "Review the old entity graph and all current entity definitions. In one response, merge near-duplicate "
+            "entities and return the full updated entity graph. Merge only when definitions describe the same entity "
+            "with nearly identical meaning; do not merge entities merely because they are related, share a name, or "
+            "represent a broader, narrower, component, or version concept. "
+            "Keep independent subgraphs; change or remove old relations when evidence requires it, and never connect by co-occurrence. "
+            "Use precise directed relation types. Return compact JSON with entities as "
+            "[\"canonical_id\",\"name\",\"definition\",[\"merged_member_id\"]] and edges as "
+            "[\"source\",\"target\",\"type\"]. Include every current_entity_ids value exactly once across all "
+            "merged-member arrays. Each canonical_id must be one of its own merged members. Use only canonical IDs in edges. "
+            "No Markdown or commentary.\n"
+            f"{json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}"
+        )
+        raw = self.llm.complete(
+            localized_messages(
+                [
+                    {
+                        "role": "system",
+                        "content": ENTITY_RELATION_GENERATION_SYSTEM_PROMPT,
+                    },
+                    {"role": "user", "content": prompt},
+                ]
+            ),
+            temperature=0.1,
+            max_tokens=ENTITY_GRAPH_MAX_TOKENS,
+        )
+        try:
+            parsed = parse_json_object(raw)
+        except ValueError as exc:
+            raise attach_model_response(
+                ValueError("entity relation provider returned invalid JSON"), raw
+            ) from exc
+        raw_entity_ids = parsed.get("entities", []) if isinstance(parsed, dict) else []
+        raw_edges = parsed.get("edges", []) if isinstance(parsed, dict) else []
+        if not isinstance(raw_entity_ids, list) or not isinstance(raw_edges, list):
+            raise attach_model_response(
+                ValueError("entity relation provider returned invalid graph arrays"),
+                raw,
+            )
+        expected_ids = set(entities_by_id)
+        seen_member_ids: set[str] = set()
+        resolved_entities: list[dict[str, Any]] = []
+        for item in raw_entity_ids:
+            if isinstance(item, dict):
+                canonical_id = str(item.get("id") or "").strip()
+                name = str(item.get("name") or "").strip()
+                definition = str(item.get("definition") or "").strip()
+                raw_member_ids = item.get(
+                    "merged_entity_ids", item.get("member_ids", [canonical_id])
+                )
+            elif isinstance(item, list) and len(item) >= 4:
+                canonical_id = str(item[0] or "").strip()
+                name = str(item[1] or "").strip()
+                definition = str(item[2] or "").strip()
+                raw_member_ids = item[3]
+            else:
+                canonical_id = str(item or "").strip()
+                current = entities_by_id.get(canonical_id, {})
+                name = str(current.get("name") or "")
+                definition = str(current.get("definition") or "")
+                raw_member_ids = [canonical_id]
+            member_ids = (
+                [str(member_id or "").strip() for member_id in raw_member_ids]
+                if isinstance(raw_member_ids, list)
+                else []
+            )
+            if (
+                not canonical_id
+                or canonical_id not in member_ids
+                or not member_ids
+                or len(set(member_ids)) != len(member_ids)
+                or any(member_id not in expected_ids for member_id in member_ids)
+                or any(member_id in seen_member_ids for member_id in member_ids)
+            ):
+                raise attach_model_response(
+                    ValueError(
+                        "entity relation provider returned an invalid entity merge"
+                    ),
+                    raw,
+                )
+            seen_member_ids.update(member_ids)
+            resolved_entities.append(
+                self._merge_entity_members(
+                    canonical_id,
+                    [entities_by_id[member_id] for member_id in member_ids],
+                    name=name,
+                    definition=definition,
+                )
+            )
+        if seen_member_ids != expected_ids:
+            raise attach_model_response(
+                ValueError("entity relation provider returned an invalid entity inventory"),
+                raw,
+            )
+        resolved_ids = {entity["id"] for entity in resolved_entities}
         edges = []
         for item in raw_edges:
             if isinstance(item, dict):
-                raw_source = item.get("source")
-                raw_target = item.get("target")
-                raw_type = item.get("type")
+                source, target, raw_type = (
+                    item.get("source"),
+                    item.get("target"),
+                    item.get("type"),
+                )
             elif isinstance(item, list) and len(item) >= 3:
-                raw_source, raw_target, raw_type = item[:3]
+                source, target, raw_type = item[:3]
             else:
                 continue
-            source = str(raw_source or "")
-            target = str(raw_target or "")
+            source = str(source or "")
+            target = str(target or "")
             relation_type = normalize_relation_type(raw_type)
-            if source not in valid_edge_ids or target not in valid_edge_ids or source == target or not relation_type:
-                raise attach_model_response(
-                    ValueError("entity extraction provider returned an invalid edge"),
-                    raw,
-                )
+            if (
+                source not in resolved_ids
+                or target not in resolved_ids
+                or source == target
+                or not relation_type
+            ):
+                continue
             edge = {"source": source, "target": target, "type": relation_type}
             if edge not in edges:
                 edges.append(edge)
-        return entities, edges
+        return resolved_entities, edges
 
     def write_to_neo4j(self, documents: list[dict[str, str]], driver: Any, llm: Any, embedder: Any, current_entities: list[dict[str, Any]] | None = None) -> list[Any]:
         """Run the real Neo4j GraphRAG KG Builder for configured deployments.

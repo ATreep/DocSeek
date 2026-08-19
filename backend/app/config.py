@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     session_ttl_hours: int = 24
     job_stale_after_seconds: int = 900
     entity_agent_timeout_seconds: float = 300.0
+    batch_llm_concurrency: int = 50
     llm_model: str | None = None
     llm_base_url: str | None = None
     llm_api_key: SecretStr | None = None

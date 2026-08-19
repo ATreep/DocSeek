@@ -1,7 +1,52 @@
 import json
 
 from backend.app.services.agents import PGBAgent, validate_edge_proposals
-from backend.app.services.graph_store import GraphRAGBuilder
+from backend.app.services.graph_store import GraphRAGBuilder, prune_properties_snapshot
+from backend.app.services.relation_batches import CollectionPair
+
+
+def test_batch_prune_removes_multiple_properties_and_shared_entity_sources():
+    class Store:
+        def graph(self, _project_id, kind):
+            if kind == "property":
+                return {
+                    "nodes": [{"id": "p1"}, {"id": "p2"}, {"id": "p3"}],
+                    "edges": [
+                        {"source": "p1", "target": "p2", "type": "RELATED"},
+                        {"source": "p2", "target": "p3", "type": "RELATED"},
+                    ],
+                }
+            return {
+                "nodes": [
+                    {
+                        "id": "shared",
+                        "source_property_ids": ["p1", "p3"],
+                        "source_contexts": [
+                            {"property_id": "p1", "text": "One"},
+                            {"property_id": "p3", "text": "Three"},
+                        ],
+                    },
+                    {
+                        "id": "removed",
+                        "source_property_ids": ["p2"],
+                        "source_contexts": [{"property_id": "p2", "text": "Two"}],
+                    },
+                ],
+                "edges": [
+                    {"source": "shared", "target": "removed", "type": "USES"}
+                ],
+            }
+
+    snapshot = prune_properties_snapshot(Store(), "project", ["p1", "p2"], "next")
+
+    assert [item["id"] for item in snapshot.properties] == ["p3"]
+    assert snapshot.property_edges == []
+    assert [item["id"] for item in snapshot.entities] == ["shared"]
+    assert snapshot.entities[0]["source_property_ids"] == ["p3"]
+    assert snapshot.entities[0]["source_contexts"] == [
+        {"property_id": "p3", "text": "Three"}
+    ]
+    assert snapshot.entity_edges == []
 
 
 def test_pgb_agent_can_only_propose_edges_between_existing_property_nodes():
@@ -98,11 +143,43 @@ def test_pgb_agent_prompt_excludes_content_and_embedding_payloads():
     prompt = provider.messages[0][1]["content"]
     assert "manual.md" in prompt
     assert "A user manual for Atlas." in prompt
-    assert "Product/Atlas" in prompt
+    assert "Product/Atlas" not in prompt
     assert "PRIVATE FULL DOCUMENT CONTENT" not in prompt
     assert "ANOTHER FULL DOCUMENT" not in prompt
     assert '"embedding"' not in prompt
     assert len(prompt) < 3000
+
+
+def test_pgb_agent_cross_collection_call_allows_only_opposite_side_edges():
+    provider = FakePropertyGraphChat(
+        '{"edges":[["old-manual","new-architecture","说明 架构"]]}'
+    )
+    pair = CollectionPair(
+        (
+            {
+                "id": "new-architecture",
+                "filename": "architecture.md",
+                "definition": "The new architecture guide.",
+            },
+        ),
+        (
+            {
+                "id": "old-manual",
+                "filename": "manual.md",
+                "definition": "The existing product manual.",
+            },
+        ),
+        "new-old",
+    )
+
+    assert PGBAgent(provider=provider).propose_pair(pair) == [
+        {
+            "source": "old-manual",
+            "target": "new-architecture",
+            "type": "说明_架构",
+        }
+    ]
+    assert "Either direction is allowed" in provider.messages[0][1]["content"]
 
 
 def test_pgb_agent_local_fallback_keeps_unrelated_properties_disconnected():
@@ -136,14 +213,14 @@ def test_graphrag_builder_extracts_entities_from_image_descriptions():
         {"project_id": "p", "property_id": "image-1", "property_type": "image", "text": "An architecture diagram shows Atlas connected to Neo4j."},
     ])
     assert builder.last_documents == ["text-1", "image-1"]
-    assert {source for entity in result[0] for source in entity["source_property_ids"]} == {"text-1", "image-1"}
+    assert {source for entity in result for source in entity["source_property_ids"]} == {"text-1", "image-1"}
     assert builder.schema == "DocSeekEntity(name,type)"
     assert builder.prompt == "Extract entities"
 
 
 def test_graphrag_builder_stores_entity_definition_without_duplicate_description():
     builder = GraphRAGBuilder(schema="DocSeekEntity(name,type)", prompt="Extract entities")
-    entities, _ = builder.build([
+    entities = builder.build([
         {"project_id": "p", "property_id": "text-1", "property_type": "text", "text": "Atlas service owns document ingestion. Beacon reviews the release."},
     ])
 
@@ -153,12 +230,12 @@ def test_graphrag_builder_stores_entity_definition_without_duplicate_description
     assert atlas["source_contexts"] == [{"property_id": "text-1", "text": "Atlas service owns document ingestion."}]
 
 
-def test_graphrag_builder_generates_typed_relationships_instead_of_co_occurs():
+def test_graphrag_builder_entity_stage_returns_nodes_without_relations():
     builder = GraphRAGBuilder(schema="DocSeekEntity(name,type,definition)", prompt="Extract entities")
-    _, edges = builder.build([
+    entities = builder.build([
         {"project_id": "p", "property_id": "text-1", "property_type": "text", "text": "Atlas uses Neo4j. Beacon owns Atlas."},
     ])
-    assert {edge["type"] for edge in edges} == {"USES", "OWNS"}
+    assert {entity["id"] for entity in entities} >= {"atlas", "neo4j", "beacon"}
 
 
 def test_graphrag_builder_does_not_connect_entities_without_a_stated_relation():
@@ -166,7 +243,7 @@ def test_graphrag_builder_does_not_connect_entities_without_a_stated_relation():
         schema="DocSeekEntity(name,type,definition)", prompt="Extract entities"
     )
 
-    entities, edges = builder.build(
+    entities = builder.build(
         [
             {
                 "project_id": "p",
@@ -178,7 +255,6 @@ def test_graphrag_builder_does_not_connect_entities_without_a_stated_relation():
     )
 
     assert {entity["id"] for entity in entities} >= {"atlas", "beacon"}
-    assert edges == []
 
 
 def test_graphrag_builder_does_not_attach_an_unrelated_third_entity():
@@ -186,7 +262,7 @@ def test_graphrag_builder_does_not_attach_an_unrelated_third_entity():
         schema="DocSeekEntity(name,type,definition)", prompt="Extract entities"
     )
 
-    _, edges = builder.build(
+    entities = builder.build(
         [
             {
                 "project_id": "p",
@@ -197,7 +273,7 @@ def test_graphrag_builder_does_not_attach_an_unrelated_third_entity():
         ]
     )
 
-    assert edges == [{"source": "atlas", "target": "neo4j", "type": "USES"}]
+    assert {entity["id"] for entity in entities} >= {"atlas", "neo4j", "beacon"}
 
 
 class FakeEntityExtractionChat:
@@ -212,6 +288,152 @@ class FakeEntityExtractionChat:
         return self.responses.pop(0)
 
 
+def _relation_entity(entity_id: str):
+    return {
+        "id": entity_id,
+        "name": entity_id.title(),
+        "definition": f"The {entity_id} service.",
+    }
+
+
+def test_entity_merge_call_accepts_valid_items_and_ignores_invalid_items():
+    provider = FakeEntityExtractionChat(
+        ['{"merges":[["new-a","old-a"],["old-a","new-a"],["missing","old-a"]]}']
+    )
+    builder = GraphRAGBuilder("schema", "prompt", llm=provider)
+    pair = CollectionPair(
+        (_relation_entity("new-a"),),
+        (_relation_entity("old-a"),),
+        "new-old",
+    )
+
+    assert builder.propose_merges(pair) == [("new-a", "old-a")]
+    assert len(provider.messages) == 1
+    prompt = provider.messages[0][1]["content"]
+    assert "source_collection" in prompt
+    assert "target_collection" in prompt
+    assert "source_property_ids" not in prompt
+
+
+def test_entity_merge_call_retries_when_every_nonempty_item_is_invalid():
+    provider = FakeEntityExtractionChat(
+        [
+            '{"merges":[["old-a","new-a"]]}',
+            '{"merges":[["new-a","old-a"]]}',
+        ]
+    )
+    builder = GraphRAGBuilder("schema", "prompt", llm=provider)
+    pair = CollectionPair(
+        (_relation_entity("new-a"),),
+        (_relation_entity("old-a"),),
+        "new-old",
+    )
+
+    assert builder.propose_merges(pair) == [("new-a", "old-a")]
+    assert len(provider.messages) == 2
+
+
+def test_entity_relation_pair_restricts_cross_edges_to_opposite_collections():
+    provider = FakeEntityExtractionChat(
+        ['{"edges":[["old-a","new-a","使用"]]}']
+    )
+    builder = GraphRAGBuilder("schema", "prompt", llm=provider)
+    pair = CollectionPair(
+        (_relation_entity("new-a"),),
+        (_relation_entity("old-a"),),
+        "new-old",
+    )
+
+    assert builder.generate_relation_edges(pair) == [
+        {"source": "old-a", "target": "new-a", "type": "使用"}
+    ]
+    prompt = provider.messages[0][1]["content"]
+    assert "Either direction is allowed" in prompt
+    assert "source_property_ids" not in prompt
+
+
+def test_entity_relation_pair_keeps_valid_edges_and_ignores_invalid_items():
+    provider = FakeEntityExtractionChat(
+        [
+            '{"edges":[["old-a","new-a","使用"],["new-a","new-b","无效"],'
+            '["missing","old-a","无效"]]}'
+        ]
+    )
+    builder = GraphRAGBuilder("schema", "prompt", llm=provider)
+    pair = CollectionPair(
+        (_relation_entity("new-a"),),
+        (_relation_entity("old-a"),),
+        "new-old",
+    )
+
+    assert builder.generate_relation_edges(pair) == [
+        {"source": "old-a", "target": "new-a", "type": "使用"}
+    ]
+    assert len(provider.messages) == 1
+
+
+def test_entity_relation_pair_retries_when_every_nonempty_edge_is_invalid():
+    provider = FakeEntityExtractionChat(
+        [
+            '{"edges":[["new-a","new-b","无效"]]}',
+            '{"edges":[["old-a","new-a","使用"]]}',
+        ]
+    )
+    builder = GraphRAGBuilder("schema", "prompt", llm=provider)
+    pair = CollectionPair(
+        (_relation_entity("new-a"),),
+        (_relation_entity("old-a"),),
+        "new-old",
+    )
+
+    assert builder.generate_relation_edges(pair) == [
+        {"source": "old-a", "target": "new-a", "type": "使用"}
+    ]
+    assert len(provider.messages) == 2
+
+
+def test_entity_generation_stage_returns_only_entity_nodes():
+    provider = FakeEntityExtractionChat(
+        ['{"entities":[["atlas-product","Atlas","A deployment product."]]}']
+    )
+    builder = GraphRAGBuilder(
+        schema="DocSeekEntity(name,type,definition)",
+        prompt="Extract entities and relations.",
+        llm=provider,
+    )
+
+    entities = builder.build(
+        [
+            {
+                "project_id": "p",
+                "property_id": "atlas-guide",
+                "property_type": "text",
+                "text": "Atlas uses CoreDB.",
+            }
+        ],
+        current_entities=[
+            {
+                "id": "coredb",
+                "name": "CoreDB",
+                "definition": "A project data store.",
+            }
+        ],
+    )
+
+    assert [entity["id"] for entity in entities] == ["atlas-product"]
+    assert entities[0]["source_property_ids"] == ["atlas-guide"]
+    assert len(provider.messages) == 1
+    assert provider.messages[0][0]["content"].startswith(
+        "You are an Entity Extraction Agent."
+    )
+    prompt = provider.messages[0][1]["content"]
+    assert "Return only entity nodes" in prompt
+    assert '{"entities":[["id","name","definition"]]}' in prompt
+    assert "document_i" not in prompt
+    assert "edges as" not in prompt
+    assert '"id":"coredb"' in prompt
+
+
 def test_entity_extraction_uses_bounded_text_but_context_comes_from_original_text():
     provider = FakeEntityExtractionChat(
         [
@@ -224,7 +446,7 @@ def test_entity_extraction_uses_bounded_text_but_context_comes_from_original_tex
         llm=provider,
     )
 
-    entities, _ = builder.build(
+    entities = builder.build(
         [
             {
                 "project_id": "p",
@@ -263,12 +485,12 @@ def test_long_entity_content_is_extracted_in_overlapping_twelve_thousand_charact
     )
     content = "A" * 11_500 + "B" * 500 + "C" * 11_500 + "D" * 500
 
-    entities, edges = builder.build([{
+    entities = builder.build([{
         "project_id": "p",
         "property_id": "long-property",
         "property_type": "text",
         "text": content,
-    }], incremental=True)
+    }])
 
     payloads = [
         json.loads(
@@ -284,17 +506,13 @@ def test_long_entity_content_is_extracted_in_overlapping_twelve_thousand_charact
     assert chunks[1] == content[11_500:23_500]
     assert chunks[2] == content[23_000:24_000]
     assert [entity["id"] for entity in entities] == ["alpha", "beta", "gamma"]
-    assert edges == [
-        {"source": "beta", "target": "alpha", "type": "FOLLOWS"},
-        {"source": "gamma", "target": "beta", "type": "FOLLOWS"},
-    ]
 
 
-def test_entity_extraction_retries_invalid_edges_before_returning_a_graph():
+def test_entity_extraction_retries_invalid_entity_ids_before_returning_nodes():
     provider = FakeEntityExtractionChat(
         [
-            '{"entities":[["atlas","Atlas","A product.",[0]]],"edges":[["atlas","missing","USES"]]}',
-            '{"entities":[["atlas","Atlas","A product.",[0]],["neo4j","Neo4j","A graph database.",[0]]],"edges":[["atlas","neo4j","USES"]]}',
+            '{"entities":[["Invalid ID","Atlas","A product."]]}',
+            '{"entities":[["atlas","Atlas","A product."],["neo4j","Neo4j","A graph database."]]}',
         ]
     )
     builder = GraphRAGBuilder(
@@ -303,13 +521,12 @@ def test_entity_extraction_retries_invalid_edges_before_returning_a_graph():
         llm=provider,
     )
 
-    entities, edges = builder.build(
+    entities = builder.build(
         [{"project_id": "p", "property_id": "p1", "property_type": "text", "text": "Atlas uses Neo4j."}]
     )
 
     assert len(provider.messages) == 2
     assert {entity["id"] for entity in entities} == {"atlas", "neo4j"}
-    assert edges == [{"source": "atlas", "target": "neo4j", "type": "USES"}]
 
 
 def test_entity_extraction_requires_ascii_ids_and_preserves_unicode_names():
@@ -326,7 +543,7 @@ def test_entity_extraction_requires_ascii_ids_and_preserves_unicode_names():
         llm=provider,
     )
 
-    entities, edges = builder.build(
+    entities = builder.build(
         [
             {
                 "project_id": "p",
@@ -340,53 +557,12 @@ def test_entity_extraction_requires_ascii_ids_and_preserves_unicode_names():
     assert len(provider.messages) == 3
     assert entities[0]["id"] == "peking-university"
     assert entities[0]["name"] == "北京大学"
-    assert edges == []
-    assert "ASCII IDs" in provider.messages[0][0]["content"]
+    system_prompt = provider.messages[0][0]["content"]
+    assert "Entity Extraction Agent" in system_prompt
     prompt = provider.messages[0][1]["content"]
-    assert "lowercase English ASCII id" in prompt
-    assert "letters/numbers joined by `-` or `_`" in prompt
-    assert "original Unicode spelling" in prompt
-
-
-def test_entity_extraction_llm_can_choose_and_change_relation_types():
-    provider = FakeEntityExtractionChat(
-        [
-            '{"entities":[{"id":"atlas","name":"Atlas","definition":"A product.","source_property_ids":["p1"]},{"id":"neo4j","name":"Neo4j","definition":"A graph database.","source_property_ids":["p1"]}],"edges":[{"source":"atlas","target":"neo4j","type":"USES"}]}',
-            '{"entities":[{"id":"atlas","name":"Atlas","definition":"A product.","source_property_ids":["p1","p2"]},{"id":"neo4j","name":"Neo4j","definition":"A graph database.","source_property_ids":["p1"]},{"id":"beacon","name":"Beacon","definition":"A service.","source_property_ids":["p2"]}],"edges":[{"source":"atlas","target":"neo4j","type":"STORES_KNOWLEDGE_IN"},{"source":"beacon","target":"atlas","type":"REVIEWS"}]}',
-        ]
-    )
-    builder = GraphRAGBuilder(
-        schema="DocSeekEntity(name,type,definition)",
-        prompt="Extract entities",
-        llm=provider,
-    )
-
-    _, first_edges = builder.build(
-        [{"project_id": "p", "property_id": "p1", "property_type": "text", "text": "Atlas uses Neo4j."}]
-    )
-    _, rebuilt_edges = builder.build(
-        [
-            {"project_id": "p", "property_id": "p1", "property_type": "text", "text": "Atlas uses Neo4j."},
-            {"project_id": "p", "property_id": "p2", "property_type": "text", "text": "Beacon reviews Atlas, which stores knowledge in Neo4j."},
-        ]
-    )
-
-    assert first_edges == [{"source": "atlas", "target": "neo4j", "type": "USES"}]
-    assert rebuilt_edges == [
-        {"source": "atlas", "target": "neo4j", "type": "STORES_KNOWLEDGE_IN"},
-        {"source": "beacon", "target": "atlas", "type": "REVIEWS"},
-    ]
-    prompt = provider.messages[0][1]["content"]
-    assert "evidence-backed directed relations with a specific type" in prompt
-    assert "Full call: rebuild entities and relations" in prompt
-    assert "one plain sentence" in prompt
-    assert "under 25 words" in prompt
-    assert "Do not copy source text, code, logs, or Markdown" in prompt
-    assert "Do not extract every noun" in prompt
-    assert "generic concepts (user, code, network)" in prompt
-    assert "headings, filler, numbers, hashes" in prompt
-    assert "laws, standards, and rare professional concepts" in prompt
-    assert "meaningful enough for a short definition" in prompt
+    assert "ASCII" in system_prompt and "identifier" in system_prompt
+    assert "lowercase" in system_prompt and "hyphens" in system_prompt
+    assert "Current entity inventory" in prompt
 
 
 def test_entity_extraction_accepts_json_wrapped_in_provider_quote_characters():
@@ -401,7 +577,7 @@ def test_entity_extraction_accepts_json_wrapped_in_provider_quote_characters():
         llm=provider,
     )
 
-    entities, edges = builder.build(
+    entities = builder.build(
         [
             {
                 "project_id": "p",
@@ -413,7 +589,6 @@ def test_entity_extraction_accepts_json_wrapped_in_provider_quote_characters():
     )
 
     assert [entity["id"] for entity in entities] == ["atlas"]
-    assert edges == []
 
 
 def test_entity_extraction_uses_compact_bounded_response_contract():
@@ -428,7 +603,7 @@ def test_entity_extraction_uses_compact_bounded_response_contract():
         llm=provider,
     )
 
-    entities, edges = builder.build(
+    entities = builder.build(
         [
             {
                 "project_id": "p",
@@ -450,13 +625,12 @@ def test_entity_extraction_uses_compact_bounded_response_contract():
         "property-with-a-long-stable-id-1",
         "property-with-a-long-stable-id-2",
     ]
-    assert edges == [{"source": "atlas", "target": "neo4j", "type": "STORES_IN"}]
     assert provider.kwargs[0]["max_tokens"] == 4096
     prompt = provider.messages[0][1]["content"]
-    assert '"i":0' in prompt
-    assert '"i":1' in prompt
+    assert '"i":0' not in prompt
+    assert '"i":1' not in prompt
     assert '"property_id"' not in prompt
-    assert '["id","name","definition",[document_i]]' in prompt
+    assert '{"entities":[["id","name","definition"]]}' in prompt
 
 
 def test_graphrag_builder_receives_current_entity_inventory():
@@ -468,7 +642,7 @@ def test_graphrag_builder_receives_current_entity_inventory():
     assert builder.last_entity_inventory == current
 
 
-def test_incremental_entity_extraction_uses_new_documents_and_existing_inventory():
+def test_entity_extraction_uses_new_documents_and_existing_inventory():
     provider = FakeEntityExtractionChat(
         [
             '{"entities":[["beacon","Beacon","A deployment service.",[0]]],'
@@ -481,7 +655,7 @@ def test_incremental_entity_extraction_uses_new_documents_and_existing_inventory
         llm=provider,
     )
 
-    entities, edges = builder.build(
+    entities = builder.build(
         [
             {
                 "project_id": "p",
@@ -497,13 +671,9 @@ def test_incremental_entity_extraction_uses_new_documents_and_existing_inventory
                 "definition": "A release management product.",
             }
         ],
-        incremental=True,
     )
 
     assert [entity["id"] for entity in entities] == ["beacon"]
-    assert edges == [
-        {"source": "beacon", "target": "atlas", "type": "DEPLOYS_TO"}
-    ]
     assert builder.last_documents == ["new-property"]
     assert builder.last_entity_inventory == [
         {
@@ -513,12 +683,11 @@ def test_incremental_entity_extraction_uses_new_documents_and_existing_inventory
         }
     ]
     prompt = provider.messages[0][1]["content"]
-    assert "Incremental call: inspect only supplied new text" in prompt
-    assert "inventory is reference data" in prompt
+    assert "Entity-node stage" in prompt
     assert '"id":"atlas"' in prompt
     assert '"name":"Atlas"' in prompt
     assert '"definition":"A release management product."' in prompt
-    assert "return only mentioned entities" in prompt
+    assert "return only entity nodes" in prompt
 
 
 def test_graphrag_builder_uses_shared_embedder_for_entities():
@@ -527,7 +696,7 @@ def test_graphrag_builder_uses_shared_embedder_for_entities():
             return [[float(index + 1)] for index, _ in enumerate(texts)]
 
     builder = GraphRAGBuilder(schema="DocSeekEntity(name,type)", prompt="Extract entities")
-    entities, _ = builder.build([{"project_id": "p", "property_id": "text-1", "property_type": "text", "text": "Neo4j powers DocSeek."}], embedder=FakeEmbedder())
+    entities = builder.build([{"project_id": "p", "property_id": "text-1", "property_type": "text", "text": "Neo4j powers DocSeek."}], embedder=FakeEmbedder())
     assert [item["embedding"] for item in entities] == [[1.0], [2.0]]
 
 
@@ -550,7 +719,7 @@ def test_entity_embedding_includes_name_definition_and_source_context():
         llm=provider,
     )
 
-    entities, _ = builder.build(
+    entities = builder.build(
         [
             {
                 "project_id": "p",
@@ -582,7 +751,7 @@ def test_entity_llm_uses_bounded_text_but_context_comes_from_original_text():
         llm=provider,
     )
 
-    entities, _ = builder.build(
+    entities = builder.build(
         [
             {
                 "project_id": "p",
@@ -615,7 +784,7 @@ def test_entity_context_is_limited_to_250_mixed_language_words():
     after = [f"after{index}" for index in range(140)]
     text = " ".join([*before, "Atlas", *after]) + "."
 
-    entities, _ = GraphRAGBuilder(
+    entities = GraphRAGBuilder(
         schema="DocSeekEntity(name,type,definition)", prompt="Extract entities"
     ).build(
         [

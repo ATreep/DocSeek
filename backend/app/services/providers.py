@@ -3,10 +3,14 @@ from __future__ import annotations
 import httpx
 import json
 import os
+from datetime import datetime, timezone
+from pathlib import Path
+from time import monotonic
 from typing import Any
 from pydantic import SecretStr
 
 from .display_language import localized_messages
+from .llm_invocation_logs import logged_llm_response, save_llm_invocation
 from .model_errors import attach_model_response
 from .retry import retry_model_call
 from .system_prompts import MODEL_PROVIDER_VALIDATION_SYSTEM_PROMPT
@@ -53,7 +57,9 @@ def _profile_secret(settings, profile_id: str) -> str | None:
     return secret if isinstance(secret, str) and secret else None
 
 
-def _selected_profile(settings, route_key: str, expected_type: str) -> tuple[str, str, str] | None:
+def _selected_profile(
+    settings, route_key: str, expected_type: str
+) -> tuple[str, str, str, str] | None:
     from ..db import connect
 
     with connect(settings.sqlite_path) as db:
@@ -66,7 +72,7 @@ def _selected_profile(settings, route_key: str, expected_type: str) -> tuple[str
     secret = _profile_secret(settings, profile["id"])
     if not secret:
         raise ProviderError(f"configured {expected_type} provider route has no secret")
-    return profile["model"], profile["base_url"], secret
+    return profile["model"], profile["base_url"], secret, profile["id"]
 
 
 def provider_route_metadata(settings) -> dict[str, dict[str, str | None]]:
@@ -100,6 +106,13 @@ def probe_provider_profile(settings, profile_id: str) -> dict[str, str | int | b
     if not secret:
         raise ProviderError("provider profile has no secret")
     provider = OpenAIChatProvider(profile["model"], profile["base_url"], secret) if profile["provider_type"] == "llm" else OpenAIEmbeddingProvider(profile["model"], profile["base_url"], secret)
+    configure_logging = getattr(provider, "enable_invocation_logging", None)
+    if profile["provider_type"] == "llm" and callable(configure_logging):
+        configure_logging(
+            settings.sqlite_path,
+            route_key="provider_validation",
+            profile_id=profile_id,
+        )
     try:
         if profile["provider_type"] == "llm":
             # Reasoning models can consume a short budget before emitting visible content.
@@ -111,7 +124,7 @@ def probe_provider_profile(settings, profile_id: str) -> dict[str, str | int | b
                             "content": MODEL_PROVIDER_VALIDATION_SYSTEM_PROMPT,
                         },
                         {"role": "user", "content": "Reply with OK."},
-                    ]),
+                    ], include=False),
                     temperature=0,
                     max_tokens=32,
                 )
@@ -143,6 +156,9 @@ class _OpenAICompatibleProvider:
         self.api_key = _secret(api_key)
         self.client = client or httpx.Client(timeout=timeout)
         self._owns_client = client is None
+        self._invocation_log_path: Path | None = None
+        self._invocation_route_key: str | None = None
+        self._invocation_profile_id: str | None = None
 
     def close(self) -> None:
         if self._owns_client:
@@ -184,23 +200,99 @@ class _OpenAICompatibleProvider:
 class OpenAIChatProvider(_OpenAICompatibleProvider):
     endpoint = "chat/completions"
 
+    def enable_invocation_logging(
+        self,
+        sqlite_path: Path,
+        *,
+        route_key: str | None,
+        profile_id: str | None,
+    ) -> OpenAIChatProvider:
+        self._invocation_log_path = sqlite_path
+        self._invocation_route_key = route_key
+        self._invocation_profile_id = profile_id
+        return self
+
+    @staticmethod
+    def _prompt_text(messages: list[dict[str, Any]]) -> str:
+        return json.dumps(messages, ensure_ascii=False, indent=2, default=str)
+
+    @staticmethod
+    def _error_output(exc: BaseException) -> str:
+        raw_response = getattr(exc, "llm_response", None)
+        if isinstance(raw_response, str) and raw_response:
+            return raw_response
+        return str(exc)
+
+    def _save_invocation(
+        self,
+        *,
+        request_time: datetime,
+        started_at: float,
+        status: str,
+        messages: list[dict[str, Any]],
+        response_output: str,
+    ) -> str | None:
+        if self._invocation_log_path is None:
+            return None
+        response_time = datetime.now(timezone.utc)
+        return save_llm_invocation(
+            self._invocation_log_path,
+            request_time=request_time.isoformat(),
+            response_time=response_time.isoformat(),
+            duration_ms=round((monotonic() - started_at) * 1000),
+            model=self.model,
+            route_key=self._invocation_route_key,
+            profile_id=self._invocation_profile_id,
+            status=status,
+            request_prompt=self._prompt_text(messages),
+            response_output=response_output,
+        )
+
     def complete(self, messages: list[dict[str, str]], *, temperature: float = 0.2, max_tokens: int | None = None) -> str:
+        request_time = datetime.now(timezone.utc)
+        started_at = monotonic()
+        status = "error"
+        response_output = ""
         payload: dict = {"model": self.model, "messages": messages, "temperature": temperature}
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
-        body = self._post(payload)
-        raw_response = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
         try:
-            content = body["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError) as exc:
-            raise attach_model_response(
-                ProviderError("provider returned no chat content"), raw_response
-            ) from exc
-        if not isinstance(content, str) or not content.strip():
-            raise attach_model_response(
-                ProviderError("provider returned empty chat content"), raw_response
+            body = self._post(payload)
+            raw_response = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+            try:
+                content = body["choices"][0]["message"]["content"]
+            except (KeyError, IndexError, TypeError) as exc:
+                raise attach_model_response(
+                    ProviderError("provider returned no chat content"), raw_response
+                ) from exc
+            if not isinstance(content, str) or not content.strip():
+                raise attach_model_response(
+                    ProviderError("provider returned empty chat content"), raw_response
+                )
+            response_output = content.strip()
+            status = "success"
+        except BaseException as exc:
+            response_output = self._error_output(exc)
+            self._save_invocation(
+                request_time=request_time,
+                started_at=started_at,
+                status=status,
+                messages=messages,
+                response_output=response_output,
             )
-        return content.strip()
+            raise
+        invocation_id = self._save_invocation(
+            request_time=request_time,
+            started_at=started_at,
+            status=status,
+            messages=messages,
+            response_output=response_output,
+        )
+        return logged_llm_response(
+            response_output,
+            sqlite_path=self._invocation_log_path,
+            invocation_id=invocation_id,
+        )
 
     def stream_with_tools(
         self,
@@ -209,6 +301,12 @@ class OpenAIChatProvider(_OpenAICompatibleProvider):
         temperature: float = 0.2,
         tools: list[dict[str, Any]] | None = None,
     ):
+        request_time = datetime.now(timezone.utc)
+        started_at = monotonic()
+        status = "cancelled"
+        content_parts: list[str] = []
+        response_tool_calls: list[dict[str, Any]] = []
+        response_output = ""
         payload = {
             "model": self.model,
             "messages": messages,
@@ -256,6 +354,7 @@ class OpenAIChatProvider(_OpenAICompatibleProvider):
                     if content is not None and not isinstance(content, str):
                         raise ProviderError("provider returned an invalid streaming response")
                     if isinstance(content, str) and content:
+                        content_parts.append(content)
                         yield {"type": "content", "content": content}
                     raw_tool_calls = delta.get("tool_calls")
                     if raw_tool_calls is None:
@@ -301,17 +400,45 @@ class OpenAIChatProvider(_OpenAICompatibleProvider):
                             )
                         call["function"]["name"] += name or ""
                         call["function"]["arguments"] += arguments or ""
-        except ProviderError:
+            response_tool_calls = [
+                tool_calls[index] for index in sorted(tool_calls)
+            ]
+            if response_tool_calls:
+                yield {"type": "tool_calls", "tool_calls": response_tool_calls}
+            status = "success"
+        except ProviderError as exc:
+            status = "error"
+            response_output = self._error_output(exc)
             raise
         except httpx.HTTPError as exc:
-            status = getattr(getattr(exc, "response", None), "status_code", None)
-            suffix = f" (HTTP {status})" if status else ""
-            raise ProviderError(f"provider streaming request failed{suffix}") from exc
-        if tool_calls:
-            yield {
-                "type": "tool_calls",
-                "tool_calls": [tool_calls[index] for index in sorted(tool_calls)],
-            }
+            http_status = getattr(getattr(exc, "response", None), "status_code", None)
+            suffix = f" (HTTP {http_status})" if http_status else ""
+            error = ProviderError(f"provider streaming request failed{suffix}")
+            response_output = self._error_output(error)
+            status = "error"
+            raise error from exc
+        finally:
+            if status != "error":
+                response_tool_calls = [
+                    tool_calls[index] for index in sorted(tool_calls)
+                ]
+                content_output = "".join(content_parts)
+                response_output = (
+                    json.dumps(
+                        {"content": content_output, "tool_calls": response_tool_calls},
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                    if response_tool_calls
+                    else content_output
+                )
+            self._save_invocation(
+                request_time=request_time,
+                started_at=started_at,
+                status=status,
+                messages=messages,
+                response_output=response_output,
+            )
 
     def stream(self, messages: list[dict[str, Any]], *, temperature: float = 0.2):
         for event in self.stream_with_tools(messages, temperature=temperature):
@@ -344,13 +471,24 @@ def chat_provider(
     if route_key:
         selected = _selected_profile(settings, route_key, "llm")
         if selected:
-            return OpenAIChatProvider(*selected, timeout=timeout)
+            model, base_url, secret, profile_id = selected
+            return OpenAIChatProvider(
+                model, base_url, secret, timeout=timeout
+            ).enable_invocation_logging(
+                settings.sqlite_path,
+                route_key=route_key,
+                profile_id=profile_id,
+            )
     if settings.llm_api_key and settings.llm_model and settings.llm_base_url:
         return OpenAIChatProvider(
             settings.llm_model,
             settings.llm_base_url,
             settings.llm_api_key,
             timeout=timeout,
+        ).enable_invocation_logging(
+            settings.sqlite_path,
+            route_key=route_key,
+            profile_id=None,
         )
     return None
 
@@ -359,7 +497,8 @@ def embedding_provider(settings, route_key: str | None = None) -> OpenAIEmbeddin
     if route_key:
         selected = _selected_profile(settings, route_key, "embedding")
         if selected:
-            return OpenAIEmbeddingProvider(*selected)
+            model, base_url, secret, _profile_id = selected
+            return OpenAIEmbeddingProvider(model, base_url, secret)
     if settings.embedding_api_key and settings.embedding_model and settings.embedding_base_url:
         return OpenAIEmbeddingProvider(settings.embedding_model, settings.embedding_base_url, settings.embedding_api_key)
     return None

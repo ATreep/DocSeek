@@ -18,9 +18,23 @@ PROPERTY_GRAPH_BUILDING_SYSTEM_PROMPT = (
     "evidence-backed property relations with precise Unicode types and directions."
 )
 
-ENTITY_EXTRACTION_SYSTEM_PROMPT = (
-    "You are an Entity Extraction Agent. Your role is to extract a few specific entities "
-    "and relations, using concise definitions, ASCII IDs, and Unicode names and relation types."
+ENTITY_GENERATION_SYSTEM_PROMPT = (
+    "You are an Entity Extraction Agent. Your role is to extract a small set of specific entity "
+    "nodes from supplied property content. Use a brief single-sentence definition, an ASCII-only "
+    "lowercase identifier with words separated by hyphens (for example `orthonormal-matrix`), "
+    "and a concise readable name. Write definitions and names in {output_language}."
+)
+
+ENTITY_RELATION_GENERATION_SYSTEM_PROMPT = (
+    "You are an Entity Relation Generation Agent. Your role is to generate only meaningful, "
+    "evidence-backed relations between the supplied entity nodes, using precise Unicode "
+    "types and directions."
+)
+
+ENTITY_MERGING_SYSTEM_PROMPT = (
+    "You identify redundant entity nodes. Merge only definitions that describe the same "
+    "entity with nearly identical meaning; related, broader, narrower, component, and "
+    "version concepts are distinct entities."
 )
 
 AI_QUERY_SYSTEM_PROMPT = (

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .llm_invocation_logs import mark_llm_invocation_validation_failed
+
 
 MAX_STORED_MODEL_RESPONSE_CHARS = 50_000
 
@@ -15,6 +17,7 @@ def bounded_model_response(value: object) -> str:
 
 
 def attach_model_response(error: Exception, response: object) -> Exception:
+    mark_llm_invocation_validation_failed(response)
     raw_response = bounded_model_response(response)
     if raw_response and not getattr(error, "llm_response", None):
         error.llm_response = raw_response

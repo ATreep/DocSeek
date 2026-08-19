@@ -205,13 +205,11 @@ def test_model_invocations_follow_the_display_language():
 
     assert instruction in definition_provider.messages[0][-1]["content"]
     assert instruction in filename_provider.messages[0][-1]["content"]
-    assert "Write definition and image content in Chinese" in definition_provider.messages[0][-1]["content"]
     assert "Keep property_id as 2-5 readable lowercase English ASCII words" in definition_provider.messages[0][-1]["content"]
-    assert "Write filename words in Chinese" in filename_provider.messages[0][-1]["content"]
     assert "Keep import_id unchanged" in filename_provider.messages[0][-1]["content"]
     assert instruction in grouping_provider.messages[0][-1]["content"]
     assert instruction in property_graph_provider.messages[0][-1]["content"]
-    assert instruction in entity_provider.messages[0][-1]["content"]
+    assert "Write definitions and names in Chinese" in entity_provider.messages[0][0]["content"]
     assert instruction in ai_messages[-1]["content"]
 
 

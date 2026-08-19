@@ -86,6 +86,20 @@ CREATE TABLE IF NOT EXISTS provider_profiles (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS llm_invocation_logs (
+  id TEXT PRIMARY KEY,
+  request_time TEXT NOT NULL,
+  response_time TEXT NOT NULL,
+  duration_ms INTEGER NOT NULL,
+  model TEXT NOT NULL,
+  route_key TEXT,
+  profile_id TEXT,
+  status TEXT NOT NULL,
+  request_prompt TEXT NOT NULL,
+  response_output TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_llm_invocation_logs_request_time
+  ON llm_invocation_logs(request_time DESC);
 """
 
 

@@ -22,6 +22,7 @@ from .services.graph_store import (
     PREVIOUS_SELECTION_ENTITY_PROMPT,
     PREVIOUS_SHORT_ASCII_ENTITY_IDENTIFIER_PROMPT,
 )
+from .services.parallelism import BATCH_LLM_CONCURRENCY_KEY
 from .services.retrieval_limits import RETRIEVAL_LIMIT_DEFAULTS
 
 
@@ -84,6 +85,11 @@ def seed_defaults(settings: Settings) -> None:
                 "ON CONFLICT(key) DO NOTHING",
                 (key, str(value), now),
             )
+        db.execute(
+            "INSERT INTO system_config(key,value,updated_at) VALUES (?,?,?) "
+            "ON CONFLICT(key) DO NOTHING",
+            (BATCH_LLM_CONCURRENCY_KEY, str(settings.batch_llm_concurrency), now),
+        )
     catalog = PropertyCatalog(settings)
     for catalog_path in settings.projects_dir.glob("*/jobs/property-catalog.json"):
         catalog.list(catalog_path.parent.parent.name)

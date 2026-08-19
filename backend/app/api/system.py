@@ -2,13 +2,17 @@ import os
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from ..config import Settings, get_settings
 from ..db import connect
 from ..security import require_capability
 from ..services.graph_store import DEFAULT_ENTITY_PROMPT, DEFAULT_ENTITY_SCHEMA, Neo4jGraphStore
+from ..services.parallelism import (
+    MAX_BATCH_LLM_CONCURRENCY,
+    batch_llm_concurrency_from_values,
+)
 from ..services.providers import ProviderError, probe_provider_profile, save_provider_secret
 from ..services.retrieval_limits import (
     MAX_RETRIEVAL_LIMIT_PER_KIND,
@@ -37,6 +41,9 @@ class SystemConfigUpdate(BaseModel):
     entity_schema: str | None = None
     entity_prompt: str | None = None
     mcp_enabled: bool | None = None
+    batch_llm_concurrency: int | None = Field(
+        default=None, ge=1, le=MAX_BATCH_LLM_CONCURRENCY
+    )
     ai_query_property_limit: int | None = Field(
         default=None, ge=1, le=MAX_RETRIEVAL_LIMIT_PER_KIND
     )
@@ -75,7 +82,7 @@ def get_config(settings: Settings = Depends(get_settings), user=Depends(require_
         values = {row["key"]: row["value"] for row in db.execute("SELECT key,value FROM system_config")}
     mcp_enabled = str(values.get("mcp_enabled", "true")).lower() in {"1", "true", "yes", "on"}
     retrieval = retrieval_limits_from_values(values)
-    return {"routes": {key: values.get(key) for key in ("dg_agent_route", "ga_agent_route", "pgb_agent_route", "entity_agent_route", "ai_query_route", "shared_embedding_route")}, "entity_schema": values.get("entity_schema", DEFAULT_ENTITY_SCHEMA), "entity_prompt": values.get("entity_prompt", DEFAULT_ENTITY_PROMPT), "neo4j": {"uri": settings.neo4j_uri, "property_database": settings.neo4j_property_database, "entity_database": settings.neo4j_entity_database, "use_neo4j": settings.use_neo4j}, "mcp": {"enabled": mcp_enabled}, "retrieval": retrieval.as_system_config()}
+    return {"routes": {key: values.get(key) for key in ("dg_agent_route", "ga_agent_route", "pgb_agent_route", "entity_agent_route", "ai_query_route", "shared_embedding_route")}, "entity_schema": values.get("entity_schema", DEFAULT_ENTITY_SCHEMA), "entity_prompt": values.get("entity_prompt", DEFAULT_ENTITY_PROMPT), "neo4j": {"uri": settings.neo4j_uri, "property_database": settings.neo4j_property_database, "entity_database": settings.neo4j_entity_database, "use_neo4j": settings.use_neo4j}, "mcp": {"enabled": mcp_enabled}, "batch_llm_concurrency": batch_llm_concurrency_from_values(values, default=int(settings.batch_llm_concurrency)), "retrieval": retrieval.as_system_config()}
 
 
 @router.get("/import-provider-readiness")
@@ -151,6 +158,25 @@ def list_provider_profiles(settings: Settings = Depends(get_settings), user=Depe
     with connect(settings.sqlite_path) as db:
         rows = db.execute("SELECT id,name,provider_type,model,base_url,secret_configured,created_at,updated_at FROM provider_profiles ORDER BY name").fetchall()
     return [{**dict(row), "secret_configured": bool(row["secret_configured"])} for row in rows]
+
+
+@router.get("/llm-invocations")
+def list_llm_invocations(
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    settings: Settings = Depends(get_settings),
+    user=Depends(require_capability("system.config.view")),
+):
+    with connect(settings.sqlite_path) as db:
+        rows = db.execute(
+            """SELECT id,request_time,response_time,duration_ms,model,route_key,
+                      profile_id,status,request_prompt,response_output
+               FROM llm_invocation_logs
+               ORDER BY request_time DESC
+               LIMIT ? OFFSET ?""",
+            (limit, offset),
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 @router.post("/providers", status_code=201)

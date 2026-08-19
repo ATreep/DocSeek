@@ -320,6 +320,54 @@ describe('ProjectShell AI Query history', () => {
 })
 
 describe('ProjectShell processing failure details', () => {
+  it('keeps retry hidden while processing', async () => {
+    apiMocks.request.mockImplementation(async (path: string) => {
+      if (path === '/projects') return [{ id: 'project-1', name: 'Test project' }]
+      if (path.endsWith('/properties')) {
+        return [{ id: 'property-1', project_id: 'project-1', filename: 'failed.md', property_type: 'markdown', relative_path: 'properties/failed.md', status: 'failed' }]
+      }
+      if (path.includes('/graphs/')) return { nodes: [], edges: [], snapshot_id: 'active' }
+      if (path.endsWith('/processing')) return { locked: true, status: 'running', stage: 'extracting_entities' }
+      throw new Error(`Unexpected request: ${path}`)
+    })
+    const { container } = render(<ProjectShell onLogout={() => undefined} />)
+
+    await waitFor(() => expect(container.querySelector('.tab-status')).toBeTruthy())
+    expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull()
+  })
+
+  it('hides tab status and allows retry after a failed job', async () => {
+    apiMocks.request.mockImplementation(async (path: string) => {
+      if (path === '/projects') return [{ id: 'project-1', name: 'Test project' }]
+      if (path.endsWith('/properties')) {
+        return [{ id: 'property-1', project_id: 'project-1', filename: 'failed.md', property_type: 'markdown', relative_path: 'properties/failed.md', status: 'failed' }]
+      }
+      if (path.includes('/graphs/')) return { nodes: [], edges: [], snapshot_id: 'active' }
+      if (path.endsWith('/processing')) return { locked: false, status: 'failed', stage: 'failed' }
+      throw new Error(`Unexpected request: ${path}`)
+    })
+    const { container } = render(<ProjectShell onLogout={() => undefined} />)
+
+    expect(await screen.findByRole('button', { name: 'Retry' })).toBeTruthy()
+    expect(container.querySelector('.tab-status')).toBeNull()
+  })
+
+  it('hides tab status and allows retry after a cancelled job', async () => {
+    apiMocks.request.mockImplementation(async (path: string) => {
+      if (path === '/projects') return [{ id: 'project-1', name: 'Test project' }]
+      if (path.endsWith('/properties')) {
+        return [{ id: 'property-1', project_id: 'project-1', filename: 'queued.md', property_type: 'markdown', relative_path: 'properties/queued.md', status: 'queued' }]
+      }
+      if (path.includes('/graphs/')) return { nodes: [], edges: [], snapshot_id: 'active' }
+      if (path.endsWith('/processing')) return { locked: false, status: 'cancelled', stage: 'cancelled' }
+      throw new Error(`Unexpected request: ${path}`)
+    })
+    const { container } = render(<ProjectShell onLogout={() => undefined} />)
+
+    expect(await screen.findByRole('button', { name: 'Retry' })).toBeTruthy()
+    expect(container.querySelector('.tab-status')).toBeNull()
+  })
+
   it('opens and copies the recorded error stack from a failed banner', async () => {
     const writeText = vi.fn().mockResolvedValue(undefined)
     apiMocks.request.mockImplementation(async (path: string) => {
@@ -580,6 +628,7 @@ describe('ProjectShell multiple property import', () => {
         import_id: 'import-atlas',
         original_filename: 'atlas.md',
         suggested_filename: 'atlas-guide.md',
+        suggested_directory: 'Products/Atlas',
         definition: 'An introduction to Atlas.',
         property_type: 'markdown',
       },
@@ -587,6 +636,7 @@ describe('ProjectShell multiple property import', () => {
         import_id: 'import-nova',
         original_filename: 'nova.md',
         suggested_filename: 'nova-guide.md',
+        suggested_directory: 'Products/Nova',
         definition: 'An introduction to Nova.',
         property_type: 'markdown',
       },
@@ -618,10 +668,22 @@ describe('ProjectShell multiple property import', () => {
       expect(options.method).toBe('POST')
       onEvent({ type: 'batch_started', batch_id: 'batch-1', total: 2 })
       onEvent({ type: 'file_started', batch_id: 'batch-1', index: 1, total: 2, filename: 'atlas.md' })
+      onEvent({
+        type: 'file_analyzed',
+        batch_id: 'batch-1',
+        index: 1,
+        total: 2,
+        filename: 'atlas.md',
+        item: {
+          import_id: stagedItems[0].import_id,
+          original_filename: stagedItems[0].original_filename,
+          definition: stagedItems[0].definition,
+          property_type: stagedItems[0].property_type,
+        },
+      })
       await streamGate
-      onEvent({ type: 'file_completed', batch_id: 'batch-1', index: 1, total: 2, filename: 'atlas.md', item: stagedItems[0] })
       onEvent({ type: 'file_started', batch_id: 'batch-1', index: 2, total: 2, filename: 'nova.md' })
-      onEvent({ type: 'file_completed', batch_id: 'batch-1', index: 2, total: 2, filename: 'nova.md', item: stagedItems[1] })
+      onEvent({ type: 'import_plan_generation_started', batch_id: 'batch-1', total: 2 })
       onEvent({ type: 'batch_completed', batch_id: 'batch-1', status: 'awaiting_confirmation', total: 2, items: stagedItems })
     })
     const user = userEvent.setup()
@@ -642,7 +704,7 @@ describe('ProjectShell multiple property import', () => {
     fireEvent.submit(uploadForm)
 
     expect(await screen.findByText('Definition Generation Agent')).toBeTruthy()
-    expect(screen.getByText('Preparing 1 of 2 properties')).toBeTruthy()
+    expect(screen.getByText('Definitions completed: 1/2')).toBeTruthy()
     expect(within(screen.getByRole('status')).getByText('atlas.md')).toBeTruthy()
     expect(screen.getByRole('progressbar', {
       name: 'Definition Generation Agent preparation progress',
