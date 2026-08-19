@@ -328,8 +328,11 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
       window.clearInterval(timer);
     };
   }, [project?.id]);
+  const processingTerminal =
+    processingStatus?.status === "failed" || processingStatus?.status === "cancelled";
   const processing = useMemo(
     () =>
+      !processingTerminal &&
       Boolean(
         project?.processing ||
         processingStatus?.locked ||
@@ -337,10 +340,8 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
           (item) => item.status === "queued" || item.status === "removing",
         ),
       ),
-    [project, processingStatus, properties],
+    [processingTerminal, project, processingStatus, properties],
   );
-  const processingTerminal =
-    processingStatus?.status === "failed" || processingStatus?.status === "cancelled";
   const processingDetail = processingStatus?.stage_detail
     ? processingStageDetail(processingStatus.stage, processingStatus.stage_detail)
     : null;
@@ -1342,6 +1343,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
             </div>
             <input
               ref={uploadInput}
+              id="property-file-input"
               className="visually-hidden"
               type="file"
               aria-label={t('Property files')}
@@ -1355,12 +1357,22 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
                 event.target.value = "";
               }}
             />
-            <button
-              type="button"
+            <label
+              htmlFor="property-file-input"
               className={`dropzone ${uploadDragActive ? "drag-active" : ""}`}
               aria-label={t('Choose property files')}
-              disabled={busy}
-              onClick={() => uploadInput.current?.click()}
+              role="button"
+              tabIndex={busy ? -1 : 0}
+              aria-disabled={busy}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  if (!busy) uploadInput.current?.click();
+                }
+              }}
+              onClick={(event) => {
+                if (busy) event.preventDefault();
+              }}
               onDragEnter={(event) => {
                 event.preventDefault();
                 setUploadDragActive(true);
@@ -1390,7 +1402,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
                   ? `${uploadFiles.length} ${t(uploadFiles.length === 1 ? "file" : "files")} ${t('selected')}`
                   : t('No files selected')}
               </span>
-            </button>
+            </label>
             {uploadFiles.length > 0 ? (
               <section className="upload-file-selection">
                 <div className="upload-file-selection-header">

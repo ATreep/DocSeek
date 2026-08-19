@@ -169,3 +169,8 @@ h2 { margin: 5px 0 0; font-size: 16px; letter-spacing: -.2px; }
   background: #eef5f2;
   color: #1e5d48;
 }
+
+.dropzone[aria-disabled="true"] {
+  cursor: wait;
+  opacity: .65;
+}
