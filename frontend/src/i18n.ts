@@ -509,6 +509,7 @@ const zh = {
   'Upload a property to create the first candidate snapshot.': '上传资产以创建第一个候选快照。',
   'MCP endpoint is publicly callable.': 'MCP 端点可被公开调用。',
   "It inherits this user's current capabilities until closed.": '关闭前，它将继承当前用户的权限。',
+  'Streamable HTTP endpoint:': 'Streamable HTTP 端点：',
   open: '已开启',
   closed: '已关闭',
 }

@@ -37,6 +37,12 @@ When startup finishes, open <http://localhost:5173> and sign in with the local d
 - **Project-scoped MCP**: Enable DocSeek's MCP server to provide third-party agents with tools for knowledge base management.
 - **Role-based access control**: Supports strict role- and group-based permissions for enterprise users and multi-user organizations.
 
+After opening a project MCP endpoint, copy the complete URL shown in the UI and select the **Streamable HTTP** transport in the client. For example, with Claude Code:
+
+```bash
+claude mcp add --transport http --scope project docseek "complete endpoint URL shown in the UI"
+```
+
 ## Screenshots
 
 ### AI Query

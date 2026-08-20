@@ -936,7 +936,12 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
           <span>
             {t("It inherits this user's current capabilities until closed.")}
           </span>
-          {mcpEndpoint && <code>{mcpEndpoint}</code>}
+          {mcpEndpoint && (
+            <>
+              <span>{t('Streamable HTTP endpoint:')}</span>
+              <code>{new URL(mcpEndpoint, window.location.origin).toString()}</code>
+            </>
+          )}
         </div>
       )}
       {processingStatus &&

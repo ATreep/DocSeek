@@ -36,6 +36,12 @@ npm --prefix frontend install
 - **项目级 MCP**：开启 DocSeek 的 MCP 服务器，为第三方 Agent 提供知识库管理的相关工具。
 - **角色权限管理**：支持严格的角色分组权限管理，面相企业用户和多人组织。
 
+开启项目 MCP 后，请复制页面显示的完整端点 URL，并在客户端中选择 **Streamable HTTP** 传输。例如，Claude Code 可使用：
+
+```bash
+claude mcp add --transport http --scope project docseek "页面显示的完整端点 URL"
+```
+
 ## 屏幕截图
 
 ### AI 查询

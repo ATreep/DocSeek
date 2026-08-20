@@ -1,9 +1,14 @@
 import uuid
 import base64
+import json
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlparse
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 from ..config import Settings, get_settings
 from ..db import connect
@@ -25,6 +30,147 @@ TOOLS = {
     "search_entities": "search.entities", "get_property_graph": "graph.property.view", "get_entity_graph": "graph.entity.view",
     "regroup_properties": "property.move", "get_processing_status": "agent.status.view",
 }
+MCP_PROTOCOL_VERSIONS = {"2025-03-26", "2025-06-18"}
+LATEST_MCP_PROTOCOL_VERSION = "2025-06-18"
+MCP_TOOL_DEFINITIONS = (
+    {
+        "name": "list_properties",
+        "description": "List the complete property tree for the open project.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "get_property",
+        "description": "Get one property and its metadata by property ID.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"property_id": {"type": "string"}},
+            "required": ["property_id"],
+        },
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "get_property_attribute",
+        "description": "Get the definition, type, and status of one property.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"property_id": {"type": "string"}},
+            "required": ["property_id"],
+        },
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "add_property",
+        "description": "Add a property file to the open project.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "filename": {"type": "string"},
+                "content": {"type": "string"},
+                "content_base64": {"type": "string"},
+                "content_type": {"type": "string"},
+                "comment": {"type": "string"},
+            },
+            "required": ["filename"],
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False},
+    },
+    {
+        "name": "replace_property",
+        "description": "Replace the file contents of an existing property.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "property_id": {"type": "string"},
+                "filename": {"type": "string"},
+                "content": {"type": "string"},
+                "content_base64": {"type": "string"},
+                "content_type": {"type": "string"},
+            },
+            "required": ["property_id", "filename"],
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": True},
+    },
+    {
+        "name": "remove_property",
+        "description": "Remove an existing property from the open project.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"property_id": {"type": "string"}},
+            "required": ["property_id"],
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": True},
+    },
+    {
+        "name": "list_entities",
+        "description": "List entities, optionally filtered to one source property.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"property_id": {"type": "string"}},
+        },
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "get_entity",
+        "description": "Get one entity by entity ID.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"entity_id": {"type": "string"}},
+            "required": ["entity_id"],
+        },
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "search_properties",
+        "description": "Search the properties in the open project.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        },
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "search_entities",
+        "description": "Search the entities in the open project.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        },
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "get_property_graph",
+        "description": "Get the property graph for the open project.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "get_entity_graph",
+        "description": "Get the entity graph for the open project.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "regroup_properties",
+        "description": "Rearrange the property tree using a natural-language instruction.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "revision_prompt": {"type": "string", "minLength": 1, "maxLength": 4000}
+            },
+            "required": ["revision_prompt"],
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": True},
+    },
+    {
+        "name": "get_processing_status",
+        "description": "Get the current processing state for the open project.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "annotations": {"readOnlyHint": True},
+    },
+)
 
 
 def _entity_belongs_to_property(entity: dict[str, Any], property_id: str) -> bool:
@@ -188,6 +334,193 @@ def _execute_tool(project_id: str, tool: str, payload: dict, settings: Settings,
         from .properties import _enqueue_removal
         return _enqueue_removal(settings, project_id, payload.get("property_id", ""), background_tasks)
     raise HTTPException(status_code=404, detail="Unknown MCP tool")
+
+
+def _matches_active_endpoint(project_id: str, endpoint_id: str) -> bool:
+    return bool(
+        _active
+        and _active["project_id"] == project_id
+        and _active["endpoint_id"] == endpoint_id
+    )
+
+
+def _origin_is_allowed(request: Request) -> bool:
+    origin = request.headers.get("origin")
+    if not origin:
+        return True
+    parsed = urlparse(origin)
+    return parsed.scheme in {"http", "https"} and parsed.hostname in {
+        "localhost",
+        "127.0.0.1",
+        "::1",
+    }
+
+
+def _jsonrpc_result(request_id: Any, result: Any) -> JSONResponse:
+    return JSONResponse(
+        jsonable_encoder({"jsonrpc": "2.0", "id": request_id, "result": result})
+    )
+
+
+def _jsonrpc_error(
+    request_id: Any,
+    code: int,
+    message: str,
+    *,
+    status_code: int = 200,
+    data: Any | None = None,
+) -> JSONResponse:
+    error: dict[str, Any] = {"code": code, "message": message}
+    if data is not None:
+        error["data"] = data
+    return JSONResponse(
+        jsonable_encoder({"jsonrpc": "2.0", "id": request_id, "error": error}),
+        status_code=status_code,
+    )
+
+
+def _available_mcp_tools(active: dict[str, Any]) -> list[dict[str, Any]]:
+    capabilities = active["capabilities"]
+    return [
+        definition
+        for definition in MCP_TOOL_DEFINITIONS
+        if TOOLS[definition["name"]] in capabilities
+    ]
+
+
+@transport_router.post("/{project_id}/{endpoint_id}")
+async def streamable_http(
+    project_id: str,
+    endpoint_id: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    settings: Settings = Depends(get_settings),
+):
+    active = _active
+    if not (
+        active
+        and active["project_id"] == project_id
+        and active["endpoint_id"] == endpoint_id
+    ):
+        return _jsonrpc_error(
+            None,
+            -32001,
+            "MCP endpoint is closed or expired",
+            status_code=404,
+        )
+    if not _origin_is_allowed(request):
+        return _jsonrpc_error(None, -32000, "Invalid Origin", status_code=403)
+
+    try:
+        message = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _jsonrpc_error(None, -32700, "Parse error", status_code=400)
+
+    if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
+        return _jsonrpc_error(None, -32600, "Invalid Request", status_code=400)
+
+    request_id = message.get("id")
+    method = message.get("method")
+    if method is None:
+        return Response(status_code=202)
+    if not isinstance(method, str):
+        return _jsonrpc_error(request_id, -32600, "Invalid Request", status_code=400)
+    if "id" not in message:
+        return Response(status_code=202)
+
+    params = message.get("params", {})
+    if not isinstance(params, dict):
+        return _jsonrpc_error(request_id, -32602, "Invalid params")
+
+    if method == "initialize":
+        requested_version = params.get("protocolVersion")
+        protocol_version = (
+            requested_version
+            if requested_version in MCP_PROTOCOL_VERSIONS
+            else LATEST_MCP_PROTOCOL_VERSION
+        )
+        return _jsonrpc_result(
+            request_id,
+            {
+                "protocolVersion": protocol_version,
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {
+                    "name": "docseek-project-mcp",
+                    "title": "DocSeek Project MCP",
+                    "version": "0.1.0",
+                },
+                "instructions": "Use these tools to work with the currently open project.",
+            },
+        )
+
+    protocol_version = request.headers.get("mcp-protocol-version", "2025-03-26")
+    if protocol_version not in MCP_PROTOCOL_VERSIONS:
+        return _jsonrpc_error(
+            request_id,
+            -32602,
+            "Unsupported protocol version",
+            status_code=400,
+            data={"supported": sorted(MCP_PROTOCOL_VERSIONS), "requested": protocol_version},
+        )
+
+    if method == "ping":
+        return _jsonrpc_result(request_id, {})
+    if method == "tools/list":
+        return _jsonrpc_result(request_id, {"tools": _available_mcp_tools(active)})
+    if method == "tools/call":
+        tool = params.get("name")
+        arguments = params.get("arguments", {})
+        if not isinstance(tool, str) or not isinstance(arguments, dict):
+            return _jsonrpc_error(request_id, -32602, "Invalid params")
+        try:
+            result = await run_in_threadpool(
+                _execute_tool,
+                project_id,
+                tool,
+                arguments,
+                settings,
+                active,
+                background_tasks,
+            )
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, str) else json.dumps(exc.detail)
+            return _jsonrpc_result(
+                request_id,
+                {"content": [{"type": "text", "text": detail}], "isError": True},
+            )
+        encoded_result = jsonable_encoder(result)
+        return _jsonrpc_result(
+            request_id,
+            {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(encoded_result, ensure_ascii=False),
+                    }
+                ],
+                "structuredContent": encoded_result,
+                "isError": False,
+            },
+        )
+    return _jsonrpc_error(request_id, -32601, "Method not found")
+
+
+@transport_router.get("/{project_id}/{endpoint_id}")
+def streamable_http_events(project_id: str, endpoint_id: str, request: Request):
+    if not _matches_active_endpoint(project_id, endpoint_id):
+        return Response(status_code=404)
+    if not _origin_is_allowed(request):
+        return Response(status_code=403)
+    return Response(status_code=405, headers={"Allow": "POST"})
+
+
+@transport_router.delete("/{project_id}/{endpoint_id}")
+def streamable_http_delete(project_id: str, endpoint_id: str, request: Request):
+    if not _matches_active_endpoint(project_id, endpoint_id):
+        return Response(status_code=404)
+    if not _origin_is_allowed(request):
+        return Response(status_code=403)
+    return Response(status_code=405, headers={"Allow": "GET, POST"})
 
 
 @transport_router.post("/{project_id}/{endpoint_id}/{tool}")
