@@ -1,12 +1,17 @@
-# DocSeek
+[中文](README.md)
 
-[中文 README](README.md)
+# DocSeek
 
 ## Introduction
 
-DocSeek is a self-hosted knowledge workbench. Upload documents or other properties, extract their content, build Property and Entity Graphs, and search or ask grounded AI questions with traceable citations.
+DocSeek is a local knowledge base management system for visual relationship graph generation and AI-powered knowledge Q&A.
+Powered by LLMs and GraphRAG, it automatically groups and organizes documents, extracts valuable conceptual entities from document content, generates entity relationship graphs, and enables cross-document AI chat and queries.
 
-## Start the project
+## Demo Projects
+
+The repository includes two demo projects, so you can explore the examples without configuring a Model Provider.
+
+## Quick Start
 
 Requirements: `uv`, Node.js 20+, npm, and Git.
 
@@ -21,42 +26,27 @@ npm --prefix frontend install
 
 When startup finishes, open <http://localhost:5173> and sign in with the local development account `admin` / `admin`. Change the password immediately after the first login; do not expose the development services to the public internet without hardening them.
 
-`start.sh` starts the API (default: `http://127.0.0.1:8000`) and frontend, and stores runtime data in `data/`. To use Neo4j, configure `DOCSEEK_NEO4J_*` variables before starting. Without Neo4j, DocSeek uses its local JSON graph fallback.
+`start.sh` starts the API (default: `http://127.0.0.1:8000`) and frontend, and stores runtime data in `data/`.
 
-## Main features
+## Main Features
 
-- **Property import and parsing**: Supports common text, PDF, and Office formats while preserving project and property structure.
-- **Property Graph**: Explore property-to-property relations with filtering, search, zoom, focus, and layout controls.
-- **Entity Graph**: Extract entities, definitions, and relations from property content while retaining source properties.
-- **Search and AI Query**: Search properties and entities; AI Query answers from graph evidence with citations and relation paths.
-- **Project-scoped MCP**: Enable or close MCP endpoints per project for compatible clients.
-- **Permissions and localization**: Manage users, groups, roles, and capabilities; switch the interface between Chinese and English.
-- **Local-first deployment**: Neo4j is optional, so the local fallback provides a quick way to try the workbench.
+- **Asset import and parsing**: Supports common text, PDF, and Office formats while preserving project and asset hierarchies.
+- **Asset Graph**: Explore relationships between assets with filtering, search, zoom, focus, and layout controls.
+- **Entity Graph**: Extract entities, definitions, and relationships from asset content while retaining their source assets.
+- **Search and AI Query**: Search assets and entities; AI Query answers using graph evidence and provides citations and relationship paths.
+- **Project-scoped MCP**: Enable DocSeek's MCP server to provide third-party agents with tools for knowledge base management.
+- **Role-based access control**: Supports strict role- and group-based permissions for enterprise users and multi-user organizations.
 
 ## Screenshots
-
-Full image directory: [screenshots/](screenshots/)
 
 ### AI Query
 
 ![AI Query](screenshots/ai-query.png)
 
-### Entity Graph overview
+### Entity Graph Overview
 
-![Entity Graph overview](screenshots/entity-graph-overview.png)
+![Entity Graph Overview](screenshots/entity-graph-overview.png)
 
-### Entity relation preview
+### Entity Relationship Preview
 
-![Entity relation preview](screenshots/entity-relation-preview.png)
-
-## Development checks
-
-```bash
-uv run pytest -q
-npm --prefix frontend test
-npm --prefix frontend run build
-```
-
-## License
-
-This project is licensed under [GPL-3.0](LICENSE).
+![Entity Relationship Preview](screenshots/entity-relation-preview.png)
