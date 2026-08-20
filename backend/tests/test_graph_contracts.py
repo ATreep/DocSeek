@@ -40,7 +40,9 @@ def test_batch_prune_removes_multiple_properties_and_shared_entity_sources():
     snapshot = prune_properties_snapshot(Store(), "project", ["p1", "p2"], "next")
 
     assert [item["id"] for item in snapshot.properties] == ["p3"]
-    assert snapshot.property_edges == []
+    assert snapshot.property_edges == [
+        {"source": "group:project:/", "target": "p3", "type": "CONTAINS_PROPERTY"}
+    ]
     assert [item["id"] for item in snapshot.entities] == ["shared"]
     assert snapshot.entities[0]["source_property_ids"] == ["p3"]
     assert snapshot.entities[0]["source_contexts"] == [
@@ -350,6 +352,36 @@ def test_entity_relation_pair_restricts_cross_edges_to_opposite_collections():
     prompt = provider.messages[0][1]["content"]
     assert "Either direction is allowed" in prompt
     assert "source_property_ids" not in prompt
+
+
+def test_entity_relation_prompt_includes_all_mention_contexts_and_filenames():
+    provider = FakeEntityExtractionChat(['{"edges":[]}'])
+    builder = GraphRAGBuilder("schema", "prompt", llm=provider)
+    entity = {
+        "id": "atlas",
+        "name": "Atlas",
+        "definition": "A deployment coordination service.",
+        "source_contexts": [
+            {
+                "property_id": "p-1",
+                "property_filename": "deployment-guide.md",
+                "text": "Atlas coordinates each deployment.",
+            },
+            {
+                "property_id": "p-2",
+                "property_filename": "operations-notes.txt",
+                "text": "Operators monitor Atlas during release windows.",
+            },
+        ],
+    }
+
+    assert builder.generate_relation_edges(CollectionPair((entity,), (), "within")) == []
+    prompt = provider.messages[0][1]["content"]
+    assert "A deployment coordination service." in prompt
+    assert "deployment-guide.md" in prompt
+    assert "Atlas coordinates each deployment." in prompt
+    assert "operations-notes.txt" in prompt
+    assert "Operators monitor Atlas during release windows." in prompt
 
 
 def test_entity_relation_pair_keeps_valid_edges_and_ignores_invalid_items():

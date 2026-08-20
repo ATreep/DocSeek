@@ -29,6 +29,7 @@ export default function FloatingWindow({ open, children, as = 'div', className =
     return () => window.clearTimeout(timer)
   }, [mounted, open])
 
-  if (!mounted) return null
-  return createElement(as, { className: `floating-window floating-window--${phase} ${className}`.trim(), role, 'aria-label': ariaLabel }, open ? children : contentRef.current)
+  if (!open && !mounted) return null
+  const renderPhase = open ? 'enter' : phase
+  return createElement(as, { className: `floating-window floating-window--${renderPhase} ${className}`.trim(), role, 'aria-label': ariaLabel, 'aria-hidden': open ? undefined : true }, open ? children : contentRef.current)
 }

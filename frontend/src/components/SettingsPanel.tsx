@@ -49,6 +49,7 @@ type SystemConfig = {
   entity_schema: string;
   entity_prompt: string;
   batch_llm_concurrency: number;
+  ai_query_history_compaction_token_threshold: number;
   neo4j: {
     property_database: string;
     entity_database: string;
@@ -57,8 +58,9 @@ type SystemConfig = {
   mcp: { enabled: boolean };
   retrieval: RetrievalSettings;
 };
-type SystemConfigResponse = Omit<SystemConfig, "retrieval" | "batch_llm_concurrency"> & {
+type SystemConfigResponse = Omit<SystemConfig, "retrieval" | "batch_llm_concurrency" | "ai_query_history_compaction_token_threshold"> & {
   batch_llm_concurrency?: number;
+  ai_query_history_compaction_token_threshold?: number;
   retrieval?: {
     ai_query?: Partial<RetrievalSettings["ai_query"]>;
     search?: Partial<RetrievalSettings["search"]>;
@@ -86,6 +88,7 @@ const DEFAULT_RETRIEVAL_SETTINGS: RetrievalSettings = {
 };
 const DEFAULT_BATCH_LLM_CONCURRENCY = 50;
 const MAX_BATCH_LLM_CONCURRENCY = 50;
+const DEFAULT_AI_QUERY_HISTORY_COMPACTION_TOKEN_THRESHOLD = 150_000;
 
 export function normalizeSystemConfig(
   config: SystemConfigResponse,
@@ -99,6 +102,13 @@ export function normalizeSystemConfig(
         Math.trunc(
           config.batch_llm_concurrency ?? DEFAULT_BATCH_LLM_CONCURRENCY,
         ),
+      ),
+    ),
+    ai_query_history_compaction_token_threshold: Math.max(
+      1,
+      Math.trunc(
+        config.ai_query_history_compaction_token_threshold
+          ?? DEFAULT_AI_QUERY_HISTORY_COMPACTION_TOKEN_THRESHOLD,
       ),
     ),
     retrieval: {
@@ -255,6 +265,8 @@ export default function SettingsPanel({
           ...config.routes,
           mcp_enabled: config.mcp.enabled,
           batch_llm_concurrency: config.batch_llm_concurrency,
+          ai_query_history_compaction_token_threshold:
+            config.ai_query_history_compaction_token_threshold,
         }),
       });
       setNotice(t("System configuration saved"));
@@ -670,23 +682,6 @@ export default function SettingsPanel({
                 </select>
               </label>
               <label>
-                {t('Property Graph Building Agent')}
-                <select
-                  data-route-key="pgb_agent_route"
-                  value={config.routes.pgb_agent_route || ""}
-                  onChange={(event) =>
-                    setRoute("pgb_agent_route", event.target.value)
-                  }
-                >
-                  <option value="">{t('Select profile')}</option>
-                  {llmProviders.map((item) => (
-                    <option key={item.id} value={item.id}>
-                      {item.name}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label>
                 {t('Entity Extraction Agent')}
                 <select
                   data-route-key="entity_agent_route"
@@ -760,6 +755,30 @@ export default function SettingsPanel({
                 />
                 <small className="settings-field-hint">
                   {t('Maximum simultaneous LLM requests for workflows that support concurrent processing (1–50).')}
+                </small>
+              </label>
+              <label>
+                {t('AI Query history compaction threshold')}
+                <input
+                  type="number"
+                  min={1}
+                  step={1}
+                  value={config.ai_query_history_compaction_token_threshold}
+                  aria-label={t('AI Query history compaction threshold')}
+                  onChange={(event) => {
+                    const value = Math.trunc(event.target.valueAsNumber);
+                    if (!Number.isFinite(value)) return;
+                    setConfig({
+                      ...config,
+                      ai_query_history_compaction_token_threshold: Math.max(
+                        1,
+                        value,
+                      ),
+                    });
+                  }}
+                />
+                <small className="settings-field-hint">
+                  {t('Compact AI Query history with the configured LLM when its estimated context exceeds this token count (default 150,000).')}
                 </small>
               </label>
               <label className="toggle-row">

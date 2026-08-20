@@ -61,6 +61,33 @@ describe('graph display filtering', () => {
     })
   })
 
+  it('keeps the selected property group ancestry visible', () => {
+    const graph = {
+      nodes: [
+        { id: 'group:/', name: 'Root', node_type: 'group' as const },
+        { id: 'group:Group 3', name: 'Group 3', node_type: 'group' as const },
+        { id: 'group:Group 3/Research', name: 'Research', node_type: 'group' as const },
+        { id: 'group-3-property', filename: 'three.md', node_type: 'property' as const },
+        { id: 'unselected-property', filename: 'four.md', node_type: 'property' as const },
+      ],
+      edges: [
+        { source: 'group:/', target: 'group:Group 3', type: 'CONTAINS_GROUP' },
+        { source: 'group:Group 3', target: 'group:Group 3/Research', type: 'CONTAINS_GROUP' },
+        { source: 'group:Group 3/Research', target: 'group-3-property', type: 'CONTAINS_PROPERTY' },
+        { source: 'group:/', target: 'unselected-property', type: 'CONTAINS_PROPERTY' },
+      ],
+    }
+
+    expect(filterGraphByPropertyIds(
+      graph,
+      'property',
+      new Set(['group-3-property']),
+    )).toEqual({
+      nodes: graph.nodes.slice(0, 4),
+      edges: graph.edges.slice(0, 3),
+    })
+  })
+
   it('filters entity nodes by source ownership and applies the same edge rule', () => {
     const graph = {
       nodes: [

@@ -28,6 +28,25 @@ def _entity_belongs_to_property(entity: dict[str, Any], property_id: str) -> boo
     )
 
 
+def _prompt_group_tree(group: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "group_name": str(group.get("group_name") or ""),
+        "properties": [
+            {
+                "property_id": str(item.get("property_id") or ""),
+                "property_name": str(item.get("filename") or ""),
+            }
+            for item in group.get("properties", [])
+            if item.get("property_id") and item.get("filename")
+        ],
+        "groups": [
+            _prompt_group_tree(child)
+            for child in group.get("groups", [])
+            if isinstance(child, dict)
+        ],
+    }
+
+
 class AIQueryTools:
     def __init__(
         self,
@@ -235,25 +254,9 @@ class AIQueryTools:
             "owned_entities": owned_entities,
         }
 
-    @staticmethod
-    def _public_group_tree(group: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "group_name": str(group.get("group_name") or ""),
-            "properties": [
-                {"filename": str(item.get("filename") or "")}
-                for item in group.get("properties", [])
-                if item.get("filename")
-            ],
-            "groups": [
-                AIQueryTools._public_group_tree(child)
-                for child in group.get("groups", [])
-                if isinstance(child, dict)
-            ],
-        }
-
-    def get_property_group_tree(self) -> dict[str, Any]:
+    def property_group_tree(self) -> dict[str, Any]:
         tree = _current_group_tree(self.catalog.list(self.project_id))
-        return self._public_group_tree(tree)
+        return _prompt_group_tree(tree)
 
     def execute(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(arguments, dict):
@@ -271,8 +274,6 @@ class AIQueryTools:
                 return self.get_entity_detail(arguments.get("entity_id"))
             if name == "get_property_detail":
                 return self.get_property_detail(arguments.get("property_id"))
-            if name == "get_property_group_tree":
-                return self.get_property_group_tree()
         except ValueError as exc:
             return {"error": str(exc)}
         return {"error": "Unsupported AI Query tool."}

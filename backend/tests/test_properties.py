@@ -1111,5 +1111,5 @@ def test_completed_job_records_candidate_snapshot_and_provider_routes():
         assert job["status"] == "completed"
         assert job["candidate_snapshot"] == job["active_snapshot"]
         routes = json.loads(job["routes_json"])
-        assert set(routes) == {"dg_agent_route", "ga_agent_route", "pgb_agent_route", "entity_agent_route", "ai_query_route", "shared_embedding_route"}
+        assert set(routes) == {"dg_agent_route", "ga_agent_route", "entity_agent_route", "ai_query_route", "shared_embedding_route"}
         assert all("model" in route and "provider_type" in route for route in routes.values())

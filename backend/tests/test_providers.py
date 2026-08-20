@@ -1053,7 +1053,11 @@ def test_answer_llm_prompt_omits_property_content_and_includes_entity_contexts()
 
     AnswerLLM(provider=provider).answer("What documents Atlas?", context)
 
-    prompt = json.loads(provider.messages[0][1]["content"])
+    prompt = json.loads(
+        provider.messages[0][1]["content"].split(
+            "\n\nOutput your results in language", 1
+        )[0]
+    )
     assert prompt["properties"] == [
         {
             "id": "manual",
@@ -1188,14 +1192,6 @@ def test_answer_llm_exposes_and_executes_project_graph_tools():
                                 "arguments": '{"query":"Atlas","max_result":3}',
                             },
                         },
-                        {
-                            "id": "call-tree",
-                            "type": "function",
-                            "function": {
-                                "name": "get_property_group_tree",
-                                "arguments": "{}",
-                            },
-                        },
                     ],
                 }
                 return
@@ -1213,7 +1209,7 @@ def test_answer_llm_exposes_and_executes_project_graph_tools():
                         {"score": 0.9, "name": "Atlas", "identifier": "atlas"}
                     ]
                 }
-            return {"group_name": "", "properties": [], "groups": []}
+            return {"error": "unexpected tool"}
 
     provider = ToolAwareProvider()
     toolbox = Toolbox()
@@ -1231,18 +1227,37 @@ def test_answer_llm_exposes_and_executes_project_graph_tools():
         "query_properties",
         "get_entity_detail",
         "get_property_detail",
-        "get_property_group_tree",
     }
-    assert toolbox.calls == [
-        ("query_entities", {"query": "Atlas", "max_result": 3}),
-        ("get_property_group_tree", {}),
-    ]
-    tool_messages = provider.requests[1]["messages"][-2:]
-    assert [message["name"] for message in tool_messages] == [
-        "query_entities",
-        "get_property_group_tree",
-    ]
-    assert json.loads(tool_messages[0]["content"])["entities"][0]["identifier"] == "atlas"
+    assert toolbox.calls == [("query_entities", {"query": "Atlas", "max_result": 3})]
+    tool_message = provider.requests[1]["messages"][-1]
+    assert tool_message["name"] == "query_entities"
+    assert json.loads(tool_message["content"])["entities"][0]["identifier"] == "atlas"
+
+
+def test_answer_llm_compacts_history_with_the_ai_query_provider():
+    class Provider:
+        def __init__(self):
+            self.request = None
+
+        def complete(self, messages, **kwargs):
+            self.request = {"messages": messages, "kwargs": kwargs}
+            return "The user asked about Atlas; the answer identified the manual."
+
+    provider = Provider()
+
+    summary = AnswerLLM(provider=provider).compact_history(
+        [
+            {"role": "user", "content": "Where is Atlas documented?"},
+            {"role": "assistant", "content": "In manual.md."},
+        ]
+    )
+
+    assert summary.startswith("The user asked about Atlas")
+    assert provider.request["messages"][0]["content"].startswith(
+        "You are a Conversation History Compaction Assistant. Your role is to "
+    )
+    assert "DocSeek" not in provider.request["messages"][0]["content"]
+    assert provider.request["kwargs"] == {"temperature": 0, "max_tokens": 16_000}
 
 
 def test_answer_llm_adds_deduplicated_citations_for_detail_tool_results():

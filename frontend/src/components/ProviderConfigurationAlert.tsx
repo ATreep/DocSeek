@@ -19,7 +19,6 @@ type ProviderConfigurationAlertProps = {
 const ROUTE_DISPLAY_NAMES: Record<string, string> = {
   dg_agent_route: "Definition Generation Agent",
   ga_agent_route: "Group Arrangement Agent",
-  pgb_agent_route: "Property Graph Building Agent",
   entity_agent_route: "Entity Extraction Agent",
   shared_embedding_route: "Shared Embedding Model",
 };

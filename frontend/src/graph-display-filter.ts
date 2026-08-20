@@ -88,11 +88,27 @@ export function filterGraphByPropertyIds(
   kind: GraphKind,
   propertyIds: Set<string>,
 ): GraphData {
-  const nodes = graph.nodes.filter(node => (
-    kind === 'property'
-      ? propertyIds.has(node.id)
-      : entitySourcePropertyIds(node).some(propertyId => propertyIds.has(propertyId))
-  ))
+  const includedIds = kind === 'property'
+    ? new Set(propertyIds)
+    : new Set(
+      graph.nodes
+        .filter(node => entitySourcePropertyIds(node).some(propertyId => propertyIds.has(propertyId)))
+        .map(node => node.id),
+    )
+  if (kind === 'property') {
+    let changed = true
+    while (changed) {
+      changed = false
+      for (const edge of graph.edges) {
+        if (!includedIds.has(edge.target) || includedIds.has(edge.source)) continue
+        const source = graph.nodes.find(node => node.id === edge.source)
+        if (source?.node_type !== 'group') continue
+        includedIds.add(edge.source)
+        changed = true
+      }
+    }
+  }
+  const nodes = graph.nodes.filter(node => includedIds.has(node.id))
   const nodeIds = new Set(nodes.map(node => node.id))
   return {
     ...graph,

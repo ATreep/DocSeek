@@ -3,7 +3,7 @@
 .check-info {
   display: block;
   padding: 8px 9px;
-  border-radius: 4px;
+  border-radius: var(--ui-radius);
 }
 
 .check-info {
@@ -28,14 +28,14 @@
   z-index: 30;
   top: calc(100% + 8px);
   right: 0;
-  min-width: 148px;
+  min-width: 210px;
   display: grid;
-  gap: 2px;
-  padding: 5px;
-  border: 1px solid #d5dde1;
-  border-radius: 5px;
+  gap: 8px;
+  padding: 18px;
+  border: 1px solid var(--floating-border);
+  border-radius: var(--ui-radius);
   background: #fff;
-  box-shadow: 0 12px 26px rgba(30, 49, 60, 0.16);
+  box-shadow: var(--floating-shadow);
   animation: floating-window-in 140ms ease-out both;
 }
 
@@ -44,10 +44,10 @@
   align-items: center;
   gap: 8px;
   border: 0;
-  border-radius: 3px;
-  background: transparent;
+  border-radius: var(--ui-radius);
+  background: #f7faf9;
   color: #40515a;
-  padding: 8px 9px;
+  padding: 10px 11px;
   text-align: left;
   font-size: 12px;
 }

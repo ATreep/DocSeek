@@ -5,7 +5,7 @@ import json
 import hashlib
 import math
 import re
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -294,6 +294,73 @@ class GraphSnapshot:
     entities: list[dict[str, Any]]
     property_edges: list[dict[str, Any]]
     entity_edges: list[dict[str, Any]]
+    property_groups: list[dict[str, Any]] = field(default_factory=list)
+
+
+def build_property_group_graph(
+    project_id: str,
+    properties: Iterable[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Build the property graph directly from the canonical group-tree paths."""
+    property_nodes = sorted(
+        (
+            dict(property_node)
+            for property_node in properties
+            if property_node.get("id")
+            and property_node.get("node_type") != "group"
+        ),
+        key=lambda item: (
+            str(item.get("directory") or ""),
+            str(item.get("filename") or ""),
+            str(item.get("id") or ""),
+        ),
+    )
+    if not property_nodes:
+        return [], []
+
+    group_paths: set[str] = set()
+    for property_node in property_nodes:
+        directory = str(property_node.get("directory") or "").strip("/")
+        parts = [part for part in directory.split("/") if part]
+        group_paths.update("/".join(parts[:index]) for index in range(1, len(parts) + 1))
+
+    def group_id(path: str) -> str:
+        return f"group:{project_id}:{path}"
+
+    groups = [
+        {
+            "id": group_id(path),
+            "project_id": project_id,
+            "name": path.rsplit("/", 1)[-1],
+            "group_path": path,
+            "node_type": "group",
+        }
+        for path in sorted(group_paths, key=lambda path: (path.count("/"), path))
+    ]
+    edges: list[dict[str, Any]] = []
+    for path in sorted(group_paths):
+        parent_path = path.rsplit("/", 1)[0] if "/" in path else ""
+        if not parent_path:
+            continue
+        edges.append(
+            {
+                "source": group_id(parent_path),
+                "target": group_id(path),
+                "type": "CONTAINS_GROUP",
+            }
+        )
+    for property_node in property_nodes:
+        directory = str(property_node.get("directory") or "").strip("/")
+        if not directory:
+            continue
+        edges.append(
+            {
+                "source": group_id(directory),
+                "target": str(property_node["id"]),
+                "type": "CONTAINS_PROPERTY",
+            }
+        )
+    return groups, edges
 
 
 def prune_property_snapshot(
@@ -324,15 +391,13 @@ def prune_properties_snapshot(
     properties = [
         dict(node)
         for node in property_graph.get("nodes", [])
+        if node.get("node_type") != "group"
         if str(node.get("id") or "") not in removed_property_ids
     ]
-    property_ids = {str(node.get("id") or "") for node in properties}
-    property_edges = [
-        dict(edge)
-        for edge in property_graph.get("edges", [])
-        if str(edge.get("source") or "") in property_ids
-        and str(edge.get("target") or "") in property_ids
-    ]
+    property_groups, property_edges = build_property_group_graph(
+        project_id,
+        properties,
+    )
 
     entities: list[dict[str, Any]] = []
     removed_entity_ids: set[str] = set()
@@ -386,6 +451,7 @@ def prune_properties_snapshot(
         entities=entities,
         property_edges=property_edges,
         entity_edges=entity_edges,
+        property_groups=property_groups,
     )
 
 
@@ -444,7 +510,7 @@ class LocalGraphStore:
         if not snapshot:
             return {"nodes": [], "edges": [], "snapshot_id": None}
         if kind == "property":
-            return {"nodes": snapshot.properties, "edges": snapshot.property_edges, "snapshot_id": snapshot.snapshot_id}
+            return {"nodes": [*snapshot.property_groups, *snapshot.properties], "edges": snapshot.property_edges, "snapshot_id": snapshot.snapshot_id}
         return {"nodes": snapshot.entities, "edges": normalize_entity_edges(snapshot.entities, snapshot.entity_edges), "snapshot_id": snapshot.snapshot_id}
 
     def neighbors(
@@ -487,7 +553,7 @@ class Neo4jGraphStore:
             if snapshot.properties and snapshot.properties[0].get("embedding"):
                 session.run("CREATE VECTOR INDEX property_embedding IF NOT EXISTS FOR (p:Property) ON (p.embedding) OPTIONS {indexConfig: {`vector.dimensions`: $dimensions, `vector.similarity_function`: 'cosine'}}", dimensions=len(snapshot.properties[0]["embedding"]))
             session.run("MATCH (p:CandidateProperty {project_id: $project, snapshot_id: $snapshot}) DETACH DELETE p", project=snapshot.project_id, snapshot=snapshot.snapshot_id)
-            for item in snapshot.properties:
+            for item in [*snapshot.property_groups, *snapshot.properties]:
                 session.run("CREATE (p:CandidateProperty $props)", props={**item, "snapshot_id": snapshot.snapshot_id})
             for edge in snapshot.property_edges:
                 session.run("MATCH (a:CandidateProperty {id:$source, project_id:$project, snapshot_id:$snapshot}), (b:CandidateProperty {id:$target, project_id:$project, snapshot_id:$snapshot}) CREATE (a)-[:RELATED {type:$type}]->(b)", **edge, project=snapshot.project_id, snapshot=snapshot.snapshot_id)
@@ -533,10 +599,10 @@ class Neo4jGraphStore:
         for result_kind, label, index_name, database in search_specs:
             with self.driver.session(database=database) as session:
                 try:
-                    rows = session.run("CALL db.index.vector.queryNodes($index_name, $limit, $query_vector) YIELD node, score WITH node, score WHERE node.project_id=$project RETURN node, score", index_name=index_name, limit=limit, query_vector=query_vector, project=project_id)
+                    rows = session.run("CALL db.index.vector.queryNodes($index_name, $limit, $query_vector) YIELD node, score WITH node, score WHERE node.project_id=$project AND coalesce(node.node_type, 'property') <> 'group' RETURN node, score", index_name=index_name, limit=limit, query_vector=query_vector, project=project_id)
                     results.extend({"kind": result_kind, **dict(row["node"]), "score": round(float(row["score"]), 4)} for row in rows)
                 except Exception:
-                    rows = session.run(f"MATCH (node:{label} {{project_id:$project}}) RETURN node LIMIT $limit", project=project_id, limit=limit)
+                    rows = session.run(f"MATCH (node:{label} {{project_id:$project}}) WHERE coalesce(node.node_type, 'property') <> 'group' RETURN node LIMIT $limit", project=project_id, limit=limit)
                     results.extend({"kind": result_kind, **dict(row["node"])} for row in rows)
         return results[:limit]
 
@@ -1129,6 +1195,31 @@ class GraphRAGBuilder:
             for entity in entities
         ]
 
+    @staticmethod
+    def _relation_entities_with_context(
+        entities: Iterable[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": str(entity.get("id") or ""),
+                "name": str(entity.get("name") or ""),
+                "definition": str(entity.get("definition") or ""),
+                "mention_contexts": [
+                    {
+                        "property_filename": str(
+                            context.get("property_filename")
+                            or context.get("property_id")
+                            or ""
+                        ),
+                        "content": str(context.get("text") or ""),
+                    }
+                    for context in entity.get("source_contexts") or []
+                    if isinstance(context, dict)
+                ],
+            }
+            for entity in entities
+        ]
+
     def propose_merges(self, pair: CollectionPair) -> list[tuple[str, str]]:
         if not self.llm or not pair.left:
             return []
@@ -1151,7 +1242,9 @@ class GraphRAGBuilder:
             )
         prompt = (
             "Judge redundancy from the supplied entity definitions. Merge only when two definitions "
-            "describe the same entity with nearly identical meaning. Do not merge entities merely "
+            "describe the same entity with nearly identical meaning. If two entities represent people "
+            "with the same person's name, always regard them as the same person and merge them. "
+            "Do not merge entities merely "
             "because they are related, similarly named, broader, narrower, components, or versions. "
             f"{direction} Return exactly one compact JSON object as "
             '{"merges":[["source_entity_id","target_entity_id"]]}. '
@@ -1211,10 +1304,10 @@ class GraphRAGBuilder:
         left_ids = {str(entity.get("id") or "") for entity in pair.left}
         right_ids = {str(entity.get("id") or "") for entity in pair.right}
         payload: dict[str, Any] = {
-            "first_collection": self._compact_relation_entities(pair.left),
+            "first_collection": self._relation_entities_with_context(pair.left),
         }
         if pair.is_cross:
-            payload["second_collection"] = self._compact_relation_entities(pair.right)
+            payload["second_collection"] = self._relation_entities_with_context(pair.right)
             endpoint_rule = (
                 "Each relation must have one endpoint in first_collection and the other in "
                 "second_collection. Either direction is allowed. Relations with both endpoints "
@@ -1225,9 +1318,10 @@ class GraphRAGBuilder:
                 "Both endpoints must be distinct entities in first_collection."
             )
         prompt = (
-            "Generate only meaningful directed relations supported by the supplied entity names and "
-            "definitions. Independent entities and disconnected subgraphs are valid; never infer a "
-            "relation from similarity or co-occurrence alone. Use a concise, precise Unicode relation "
+            "Generate only meaningful directed relations supported by the supplied entity definitions "
+            "and every stored mention context. Each mention context includes its property filename and "
+            "content; use both as evidence. Independent entities and disconnected subgraphs are valid; "
+            "never infer a relation from similarity or co-occurrence alone. Use a concise, precise Unicode relation "
             f"type. {endpoint_rule} Return exactly one compact JSON object as "
             '{"edges":[["source_entity_id","target_entity_id","relation_type"]]}. '
             "Return an empty edges list when no relation is supported. No Markdown or commentary.\n"
@@ -1284,6 +1378,11 @@ class GraphRAGBuilder:
                 edge = {"source": source, "target": target, "type": relation_type}
                 if edge not in edges:
                     edges.append(edge)
+            if items and not edges:
+                raise attach_model_response(
+                    ValueError("entity relation provider returned no valid edges"),
+                    raw,
+                )
             return edges
 
         return retry_model_call(invoke)

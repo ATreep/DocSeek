@@ -86,6 +86,76 @@ def test_query_history_preserves_citation_retrieval_paths(tmp_path):
     assert store.list("project", "user")[1]["citations"] == [citation]
 
 
+def test_query_history_persists_compaction_while_retaining_full_ui_history(tmp_path):
+    settings = Settings(data_dir=tmp_path / "data")
+    store = QueryHistoryStore(settings)
+    store.append_exchange(
+        "project", "user", "Where is Atlas documented?", "In manual.md.", []
+    )
+    original_history = store.list("project", "user")
+
+    store.save_compaction(
+        "project",
+        "user",
+        original_history,
+        "The user asked where Atlas is documented; the answer was manual.md.",
+    )
+    store.append_exchange(
+        "project", "user", "What format is it?", "Markdown.", []
+    )
+
+    full_history = store.list("project", "user")
+    assert len(full_history) == 4
+    assert store.cached_compaction("project", "user", full_history) == {
+        "message_count": 2,
+        "summary": "The user asked where Atlas is documented; the answer was manual.md.",
+    }
+
+
+def test_ai_query_history_context_compacts_once_then_reuses_cached_summary(
+    tmp_path,
+):
+    settings = Settings(data_dir=tmp_path / "data")
+    store = QueryHistoryStore(settings)
+    store.append_exchange("project", "user", "x" * 500, "A long answer.", [])
+
+    class Compactor:
+        provider = object()
+
+        def __init__(self):
+            self.calls = 0
+
+        def compact_history(self, history):
+            self.calls += 1
+            assert history[0]["content"] == "x" * 500
+            return "Earlier context summary."
+
+    compactor = Compactor()
+    history = query_api._llm_history(store.list("project", "user"))
+
+    first_context = query_api._history_context(
+        store, "project", "user", history, compactor, 100
+    )
+    store.append_exchange("project", "user", "Follow up?", "Yes.", [])
+    extended_history = query_api._llm_history(store.list("project", "user"))
+    second_context = query_api._history_context(
+        store, "project", "user", extended_history, compactor, 100
+    )
+
+    assert compactor.calls == 1
+    assert first_context == [
+        {
+            "role": "assistant",
+            "content": "Compacted earlier conversation context:\nEarlier context summary.",
+        }
+    ]
+    assert second_context == [
+        first_context[0],
+        {"role": "user", "content": "Follow up?"},
+        {"role": "assistant", "content": "Yes."},
+    ]
+
+
 def test_history_api_uses_the_authenticated_user_id(monkeypatch, tmp_path):
     settings = Settings(data_dir=tmp_path / "data")
     store = QueryHistoryStore(settings)

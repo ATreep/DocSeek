@@ -4,11 +4,15 @@ from typing import Any
 from .display_language import localized_messages
 from .providers import ProviderError, chat_provider
 from .retry import DEFAULT_MODEL_ATTEMPTS, retry_model_call
-from .system_prompts import AI_QUERY_SYSTEM_PROMPT
+from .system_prompts import (
+    AI_QUERY_HISTORY_COMPACTION_SYSTEM_PROMPT,
+    AI_QUERY_SYSTEM_PROMPT,
+)
 
 
 MAX_PROPERTY_CONTENT_READS = 3
 MAX_AI_QUERY_TOOL_ROUNDS = 8
+AI_QUERY_HISTORY_COMPACTION_MAX_TOKENS = 16_000
 READ_PROPERTY_CONTENT_TOOL = {
     "type": "function",
     "function": {
@@ -105,24 +109,11 @@ GET_PROPERTY_DETAIL_TOOL = {
         },
     },
 }
-GET_PROPERTY_GROUP_TREE_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "get_property_group_tree",
-        "description": "Return nested group names and filenames for hierarchy or location questions.",
-        "parameters": {
-            "type": "object",
-            "properties": {},
-            "additionalProperties": False,
-        },
-    },
-}
 PROJECT_GRAPH_TOOLS = [
     QUERY_ENTITIES_TOOL,
     QUERY_PROPERTIES_TOOL,
     GET_ENTITY_DETAIL_TOOL,
     GET_PROPERTY_DETAIL_TOOL,
-    GET_PROPERTY_GROUP_TREE_TOOL,
 ]
 
 
@@ -257,6 +248,7 @@ class AnswerLLM:
         prompt = json.dumps(
             {
                 "question": question,
+                "property_group_tree": context.get("property_group_tree", {}),
                 "properties": AnswerLLM._property_metadata(context),
                 "property_relations": AnswerLLM._property_relations(context),
                 "entities": AnswerLLM._entity_context(context),
@@ -280,6 +272,35 @@ class AnswerLLM:
             *conversation,
             {"role": "user", "content": prompt},
         ])
+
+    def compact_history(self, history: list[dict[str, str]]) -> str:
+        if self.provider is None or not hasattr(self.provider, "complete"):
+            raise ProviderError("AI Query history compaction requires a chat provider")
+        prompt = json.dumps(history, ensure_ascii=False, separators=(",", ":"))
+        messages = localized_messages(
+            [
+                {
+                    "role": "system",
+                    "content": AI_QUERY_HISTORY_COMPACTION_SYSTEM_PROMPT,
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "Compact this conversation for future AI Query context. Preserve chronology and "
+                        "distinguish user requests from assistant answers.\n\n"
+                        f"Conversation history:\n{prompt}"
+                    ),
+                },
+            ],
+            include=False,
+        )
+        return retry_model_call(
+            lambda: self.provider.complete(
+                messages,
+                temperature=0,
+                max_tokens=AI_QUERY_HISTORY_COMPACTION_MAX_TOKENS,
+            )
+        )
 
     @staticmethod
     def _read_property_content(

@@ -1,7 +1,5 @@
 import {
   FormEvent,
-  lazy,
-  Suspense,
   useEffect,
   useMemo,
   useRef,
@@ -44,7 +42,8 @@ import ProjectEmptyState from "./ProjectEmptyState";
 import EntityOverlay, { type Entity } from "./EntityOverlay";
 import AccountMenu from "./AccountMenu";
 import LanguageSwitcher from "./LanguageSwitcher";
-import type { ChatCitation, ChatMessage } from "./AIQueryChat";
+import FloatingWindow from "./FloatingWindow";
+import AIQueryChat, { type ChatCitation, type ChatMessage } from "./AIQueryChat";
 import PropertyTree from "./PropertyTree";
 import SettingsPanel from "./SettingsPanel";
 import { canLeaveProject, closeMcpBeforeSwitch } from "../project-switch";
@@ -71,8 +70,6 @@ import {
   type GraphRelationDetail,
 } from "../graph-relations";
 import type { GraphDisplaySelection } from "../graph-display-filter";
-
-const AIQueryChat = lazy(() => import("./AIQueryChat"));
 
 function droppedPropertyFiles(dataTransfer: DataTransfer): File[] {
   const items = Array.from(dataTransfer.items || []);
@@ -1176,6 +1173,10 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
               onDisplaySelectionChange={setPropertyGraphDisplaySelection}
               onRelationSelect={selectRelation}
               onSelect={(node) => {
+                if (node.node_type === 'group') {
+                  selectProperty(null);
+                  return;
+                }
                 selectProperty(
                   properties.find((item) => item.id === node.id) || null,
                 );
@@ -1194,9 +1195,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
             />
           )}
           {tab === "query" && (
-            <Suspense fallback={<div className="chat-loading"><span className="spinner" /></div>}>
-              <AIQueryChat question={question} messages={chatMessages} busy={busy} onQuestionChange={setQuestion} onSubmit={runQuery} onClear={clearChatHistory} onCitationSelect={selectQueryCitation} />
-            </Suspense>
+            <AIQueryChat question={question} messages={chatMessages} busy={busy} onQuestionChange={setQuestion} onSubmit={runQuery} onClear={clearChatHistory} onCitationSelect={selectQueryCitation} />
           )}</>}
         </main>
       </div>
@@ -1257,8 +1256,8 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
         llmResponse={processingStatus?.llm_response}
         onClose={() => setProcessingErrorOpen(false)}
       />
-      {results && (
-        <div className="search-drawer">
+      <FloatingWindow open={Boolean(results)} className="search-drawer" role="dialog" aria-label={t('Search results')}>
+        {results && <>
           <div className="overlay-header">
             <div>
               <span className="eyebrow">{t('SEARCH RESULTS')}</span>
@@ -1317,10 +1316,9 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
               </button>
             ))}
           </section>
-        </div>
-      )}
-      {uploadOpen && (
-        <div className="modal-backdrop">
+        </>}
+      </FloatingWindow>
+      <FloatingWindow open={uploadOpen} className="modal-backdrop" role="presentation">
           <form className="upload-modal property-upload-modal" onSubmit={submitUpload}>
             <div className="overlay-header">
               <div>
@@ -1350,15 +1348,13 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
               multiple
               disabled={busy}
               onChange={(event) => {
-                setUploadFiles((current) =>
-                  appendPropertyFiles(current, Array.from(event.target.files || [])),
-                );
+                const selectedFiles = Array.from(event.currentTarget.files || []);
+                setUploadFiles((current) => appendPropertyFiles(current, selectedFiles));
                 // Allow choosing the same local file again after removing it.
-                event.target.value = "";
+                event.currentTarget.value = "";
               }}
             />
-            <label
-              htmlFor="property-file-input"
+            <div
               className={`dropzone ${uploadDragActive ? "drag-active" : ""}`}
               aria-label={t('Choose property files')}
               role="button"
@@ -1371,7 +1367,8 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
                 }
               }}
               onClick={(event) => {
-                if (busy) event.preventDefault();
+                event.preventDefault();
+                if (!busy) uploadInput.current?.click();
               }}
               onDragEnter={(event) => {
                 event.preventDefault();
@@ -1394,15 +1391,17 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
                 );
               }}
             >
-              <Upload size={24} />
-              <strong>{t('Choose files')}</strong>
-              <span>{t('Text, documents, or images')}</span>
+              <span className="dropzone-icon" aria-hidden="true"><Upload size={22} /></span>
+              <span className="dropzone-copy">
+                <strong>{t('Choose files')}</strong>
+                <span>{t('Text, documents, or images')}</span>
+              </span>
               <span className="dropzone-count">
                 {uploadFiles.length
                   ? `${uploadFiles.length} ${t(uploadFiles.length === 1 ? "file" : "files")} ${t('selected')}`
                   : t('No files selected')}
               </span>
-            </label>
+            </div>
             {uploadFiles.length > 0 ? (
               <section className="upload-file-selection">
                 <div className="upload-file-selection-header">
@@ -1489,8 +1488,7 @@ export default function ProjectShell({ onLogout }: { onLogout: () => void }) {
               {t(busy ? "Preparing properties" : "Prepare import")}
             </button>
           </form>
-        </div>
-      )}
+      </FloatingWindow>
       <ProviderConfigurationAlert
         open={Boolean(providerReadiness)}
         missingRoutes={providerReadiness?.missing_routes || []}

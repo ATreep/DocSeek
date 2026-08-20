@@ -78,6 +78,13 @@ describe('processingStageDetail', () => {
   it('turns dynamic backend progress into a localizable message', () => {
     expect(processingStageDetail(
       'graph-entity-generation',
+      'Generating entity nodes: 40%',
+    )).toEqual({
+      key: 'Generating entity nodes: {{percent}}%',
+      values: { percent: 40 },
+    })
+    expect(processingStageDetail(
+      'graph-entity-generation',
       'Generating entity nodes 2/5: resuming completed properties',
     )).toEqual({
       key: 'Generating entity nodes {{current}}/{{total}}: resuming completed properties',

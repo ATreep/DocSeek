@@ -58,7 +58,6 @@ def test_import_provider_readiness_reports_each_missing_import_route(tmp_path):
             ] == [
                 "Definition Generation Agent",
                 "Group Arrangement Agent",
-                "Property Graph Building Agent",
                 "Entity Extraction Agent",
                 "Shared Embedding Model",
             ]
@@ -81,11 +80,6 @@ def test_import_provider_readiness_reports_each_missing_import_route(tmp_path):
                 "ready": False,
                 "missing_routes": [
                     {
-                        "key": "pgb_agent_route",
-                        "label": "Property Graph Building Agent",
-                        "provider_type": "llm",
-                    },
-                    {
                         "key": "entity_agent_route",
                         "label": "Entity Extraction Agent",
                         "provider_type": "llm",
@@ -103,7 +97,6 @@ def test_import_provider_readiness_reports_each_missing_import_route(tmp_path):
             client.patch(
                 "/api/system/config",
                 json={
-                    "pgb_agent_route": llm["id"],
                     "entity_agent_route": llm["id"],
                     "shared_embedding_route": embedding["id"],
                     "ai_query_route": None,
@@ -523,6 +516,7 @@ def test_system_config_exposes_default_retrieval_limits(tmp_path):
         app.dependency_overrides.pop(get_settings, None)
 
     assert response.status_code == 200
+    assert response.json()["ai_query_history_compaction_token_threshold"] == 150_000
     assert response.json()["retrieval"] == {
         "ai_query": {
             "property_limit": 15,
@@ -548,6 +542,7 @@ def test_system_config_persists_custom_retrieval_limits(tmp_path):
             response = client.patch(
                 "/api/system/config",
                 json={
+                    "ai_query_history_compaction_token_threshold": 175_000,
                     "ai_query_property_limit": 9,
                     "ai_query_entity_limit": 11,
                     "ai_query_total_node_limit": 17,
@@ -561,6 +556,10 @@ def test_system_config_persists_custom_retrieval_limits(tmp_path):
         app.dependency_overrides.pop(get_settings, None)
 
     assert response.status_code == 200
+    assert (
+        reloaded.json()["ai_query_history_compaction_token_threshold"]
+        == 175_000
+    )
     assert reloaded.json()["retrieval"] == {
         "ai_query": {
             "property_limit": 9,
@@ -585,6 +584,25 @@ def test_system_config_rejects_non_positive_retrieval_limits(tmp_path):
             response = client.patch(
                 "/api/system/config",
                 json={"ai_query_total_node_limit": 0},
+                headers=_headers(client),
+            )
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
+
+    assert response.status_code == 422
+
+
+def test_system_config_rejects_non_positive_history_compaction_threshold(tmp_path):
+    settings = Settings(data_dir=tmp_path)
+    settings.ensure_directories()
+    initialize(settings.sqlite_path)
+    seed_defaults(settings)
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        with TestClient(app) as client:
+            response = client.patch(
+                "/api/system/config",
+                json={"ai_query_history_compaction_token_threshold": 0},
                 headers=_headers(client),
             )
     finally:

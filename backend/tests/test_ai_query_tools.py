@@ -178,8 +178,8 @@ def test_get_property_detail_returns_definition_relations_and_owned_entities():
     }
 
 
-def test_get_property_group_tree_returns_only_structure_group_names_and_filenames():
-    assert ai_query_tools().get_property_group_tree() == {
+def test_property_group_tree_returns_hierarchy_with_property_ids_and_names():
+    assert ai_query_tools().property_group_tree() == {
         "group_name": "",
         "properties": [],
         "groups": [
@@ -189,11 +189,21 @@ def test_get_property_group_tree_returns_only_structure_group_names_and_filename
                 "groups": [
                     {
                         "group_name": "Atlas",
-                        "properties": [{"filename": "manual.md"}],
+                        "properties": [
+                            {
+                                "property_id": "manual",
+                                "property_name": "manual.md",
+                            }
+                        ],
                         "groups": [
                             {
                                 "group_name": "Engineering",
-                                "properties": [{"filename": "architecture.pdf"}],
+                                "properties": [
+                                    {
+                                        "property_id": "architecture",
+                                        "property_name": "architecture.pdf",
+                                    }
+                                ],
                                 "groups": [],
                             }
                         ],

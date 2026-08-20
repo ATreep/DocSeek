@@ -14,7 +14,13 @@ from ..services.display_language import current_display_language, iterate_in_dis
 from ..services.graph_store import Neo4jGraphStore
 from ..services.llm import AnswerLLM
 from ..services.providers import ProviderError
-from ..services.query_history import QueryHistoryStore
+from ..services.query_history import (
+    DEFAULT_AI_QUERY_HISTORY_COMPACTION_TOKEN_THRESHOLD,
+    QueryHistoryStore,
+    compacted_history_message,
+    estimated_history_tokens,
+    load_history_compaction_token_threshold,
+)
 from ..services.retrieval import GraphRetriever
 from ..services.retrieval_limits import load_retrieval_limits
 from .projects import get_project
@@ -85,6 +91,48 @@ def _llm_history(messages: list[dict]) -> list[dict[str, str]]:
         and isinstance(message.get("content"), str)
         and message["content"]
     ]
+
+
+def _history_context(
+    history_store: QueryHistoryStore,
+    project_id: str,
+    user_id: str,
+    history: list[dict[str, str]],
+    answer_llm: AnswerLLM,
+    token_threshold: int = DEFAULT_AI_QUERY_HISTORY_COMPACTION_TOKEN_THRESHOLD,
+) -> list[dict[str, str]]:
+    cached_compaction = getattr(history_store, "cached_compaction", None)
+    compacted_history = (
+        cached_compaction(project_id, user_id, history)
+        if callable(cached_compaction)
+        else None
+    )
+    if compacted_history:
+        message_count = compacted_history["message_count"]
+        history_context = [
+            compacted_history_message(compacted_history["summary"]),
+            *history[message_count:],
+        ]
+    else:
+        history_context = history
+
+    if estimated_history_tokens(history_context) <= token_threshold:
+        return history_context
+
+    compactor = getattr(answer_llm, "compact_history", None)
+    if getattr(answer_llm, "provider", object()) is None or not callable(compactor):
+        return history_context
+    compacted_summary = compactor(history_context)
+    compacted_history = [compacted_history_message(compacted_summary)]
+    save_compaction = getattr(history_store, "save_compaction", None)
+    if callable(save_compaction):
+        save_compaction(project_id, user_id, history, compacted_summary)
+    return compacted_history
+
+
+def _property_group_tree(toolbox: AIQueryTools) -> dict:
+    tree_builder = getattr(toolbox, "property_group_tree", None)
+    return tree_builder() if callable(tree_builder) else {}
 
 
 @router.get("/{project_id}/ai-query/history")
@@ -179,7 +227,17 @@ def ai_query(project_id: str, payload: QueryRequest, settings: Settings = Depend
         store,
         PropertyCatalog(settings),
     )
-    result = AnswerLLM(settings=settings, toolbox=toolbox).answer(
+    context = {**context, "property_group_tree": _property_group_tree(toolbox)}
+    answer_llm = AnswerLLM(settings=settings, toolbox=toolbox)
+    history = _history_context(
+        history_store,
+        project_id,
+        user["id"],
+        history,
+        answer_llm,
+        load_history_compaction_token_threshold(settings),
+    )
+    result = answer_llm.answer(
         payload.query, context, history=history
     )
     history_store.append_exchange(
@@ -227,10 +285,20 @@ def ai_query_stream(project_id: str, payload: QueryRequest, settings: Settings =
         store,
         PropertyCatalog(settings),
     )
+    context = {**context, "property_group_tree": _property_group_tree(toolbox)}
+    answer_llm = AnswerLLM(settings=settings, toolbox=toolbox)
+    history = _history_context(
+        history_store,
+        project_id,
+        user["id"],
+        history,
+        answer_llm,
+        load_history_compaction_token_threshold(settings),
+    )
     events = ai_query_events(
         payload.query,
         context,
-        AnswerLLM(settings=settings, toolbox=toolbox),
+        answer_llm,
         [settings.neo4j_property_database, settings.neo4j_entity_database],
         history,
         on_complete=lambda answer, citations: history_store.append_exchange(

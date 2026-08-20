@@ -165,7 +165,7 @@ def test_search_endpoint_uses_the_configured_search_limits(monkeypatch):
     }
 
 
-def test_ai_query_injects_only_the_configured_bounded_context(monkeypatch):
+def test_ai_query_injects_bounded_evidence_and_the_property_group_tree(monkeypatch):
     recorded = {}
     empty_context = {
         "properties": [],
@@ -192,18 +192,44 @@ def test_ai_query_injects_only_the_configured_bounded_context(monkeypatch):
         def append_exchange(self, *_args, **_kwargs):
             pass
 
+    class FakeToolbox:
+        def __init__(self, *_args):
+            pass
+
+        def property_group_tree(self):
+            return {
+                "group_name": "",
+                "properties": [
+                    {"property_id": "manual", "property_name": "manual.md"}
+                ],
+                "groups": [],
+            }
+
     class FakeAnswerLLM:
         def __init__(self, **_kwargs):
             pass
 
         def answer(self, _query, context, history=None):
-            assert context is empty_context
+            assert context == {
+                **empty_context,
+                "property_group_tree": {
+                    "group_name": "",
+                    "properties": [
+                        {
+                            "property_id": "manual",
+                            "property_name": "manual.md",
+                        }
+                    ],
+                    "groups": [],
+                },
+            }
             assert history == []
             return {"answer": "Bounded answer", "citations": []}
 
     monkeypatch.setattr(query_api, "get_project", lambda *_args: {"id": "project"})
     monkeypatch.setattr(query_api, "Neo4jGraphStore", lambda _settings: object())
     monkeypatch.setattr(query_api, "GraphRetriever", FakeRetriever)
+    monkeypatch.setattr(query_api, "AIQueryTools", FakeToolbox)
     monkeypatch.setattr(query_api, "QueryHistoryStore", FakeHistoryStore)
     monkeypatch.setattr(query_api, "AnswerLLM", FakeAnswerLLM)
     monkeypatch.setattr(
@@ -701,6 +727,22 @@ def test_ai_query_citations_explain_direct_and_graph_related_evidence():
 
 def test_ai_query_prompt_contains_only_the_bounded_evidence_graph():
     context = {
+        "property_group_tree": {
+            "group_name": "",
+            "properties": [],
+            "groups": [
+                {
+                    "group_name": "Manuals",
+                    "properties": [
+                        {
+                            "property_id": "manual",
+                            "property_name": "manual.md",
+                        }
+                    ],
+                    "groups": [],
+                }
+            ],
+        },
         "properties": [{"id": "manual", "filename": "manual.md", "definition": "Atlas manual."}],
         "entities": [{"id": "atlas", "name": "Atlas", "definition": "A product."}],
         "relations": [
@@ -726,10 +768,15 @@ def test_ai_query_prompt_contains_only_the_bounded_evidence_graph():
         "entity_graph": {"nodes": [{"id": "must-not-leak"}], "edges": []},
     }
 
-    prompt = json.loads(AnswerLLM._messages("What is Atlas?", context)[-1]["content"])
+    prompt = json.loads(
+        AnswerLLM._messages("What is Atlas?", context)[-1]["content"].split(
+            "\n\nOutput your results in language", 1
+        )[0]
+    )
 
     assert prompt["relations"] == context["relations"]
     assert prompt["retrieval_paths"] == context["retrieval_paths"]
+    assert prompt["property_group_tree"] == context["property_group_tree"]
     assert "property_graph" not in prompt
     assert "entity_graph" not in prompt
 
@@ -756,7 +803,12 @@ def test_ai_query_sends_the_complete_conversation_history_to_the_provider():
     )
 
     assert provider.messages[1:3] == history
-    assert json.loads(provider.messages[3]["content"])["question"] == "What did I just ask?"
+    prompt = json.loads(
+        provider.messages[3]["content"].split(
+            "\n\nOutput your results in language", 1
+        )[0]
+    )
+    assert prompt["question"] == "What did I just ask?"
 
 
 def test_ai_query_request_accepts_conversation_history():

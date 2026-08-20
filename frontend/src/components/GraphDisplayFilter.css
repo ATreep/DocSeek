@@ -8,14 +8,17 @@
   padding: 0 !important;
   border: 2px solid #fff !important;
   border-radius: 50% !important;
-  font: 700 8px/1 var(--sans) !important;
+  font-family: inherit !important;
+  font-size: 8px !important;
+  font-weight: 700 !important;
+  line-height: 1 !important;
   white-space: nowrap !important;
 }
 
 .graph-filter-badge.large {
   width: 22px !important;
   min-width: 22px !important;
-  border-radius: 9px !important;
+  border-radius: 999px !important;
 }
 
 .graph-filter-importance {
@@ -34,7 +37,7 @@
   min-width: 112px;
   height: 30px;
   border: 1px solid #d8e1e3;
-  border-radius: 4px;
+  border-radius: var(--ui-radius);
   background: #fbfcfc;
   color: #52656e;
   padding: 0 24px 0 8px;

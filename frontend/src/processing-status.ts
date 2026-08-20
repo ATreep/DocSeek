@@ -62,6 +62,11 @@ export function processingStageDetail(
     values: (match: RegExpMatchArray) => Record<string, string | number>
   }> = [
     {
+      pattern: /^Generating entity nodes: (\d+)%$/,
+      key: 'Generating entity nodes: {{percent}}%',
+      values: (match) => ({ percent: Number(match[1]) }),
+    },
+    {
       pattern: /^Generating entity nodes and property relations: (\d+)%$/,
       key: 'Generating entity nodes and property relations: {{percent}}%',
       values: (match) => ({ percent: Number(match[1]) }),

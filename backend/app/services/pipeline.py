@@ -17,7 +17,7 @@ from langgraph.graph import END, START, StateGraph
 from ..config import Settings
 from ..db import connect
 from ..api.projects import release_lock
-from .agents import DGAgent, GAAgent, PGBAgent
+from .agents import DGAgent, GAAgent
 from .catalog import PropertyCatalog
 from .extraction_text import (
     DEFAULT_EXTRACTION_TEXT_MAX_CHARS,
@@ -39,6 +39,7 @@ from .graph_store import (
     _context_word_count,
     embeddings_for_texts,
     entity_embedding_text,
+    build_property_group_graph,
     prune_property_snapshot,
     prune_properties_snapshot,
 )
@@ -136,102 +137,24 @@ def _flatten_call_results(
     return [item for result in results for item in result]
 
 
-def _generate_property_relation_edges(
-    settings: Settings,
-    job_id: str,
-    properties: list[dict],
-    active_property_graph: dict,
-    processed_property_ids: set[str],
-    on_progress: Callable[[int], None],
-    llm_slots: Semaphore | None = None,
-) -> list[dict]:
-    active_property_nodes = active_property_graph.get("nodes", [])
-    active_property_ids = {
-        str(item.get("id") or "")
-        for item in active_property_nodes
-        if item.get("id")
+def _entity_relation_evidence(
+    entity: dict,
+    filenames_by_property_id: dict[str, str],
+) -> dict:
+    return {
+        **entity,
+        "source_contexts": [
+            {
+                **context,
+                "property_filename": filenames_by_property_id.get(
+                    str(context.get("property_id") or ""),
+                    str(context.get("property_id") or ""),
+                ),
+            }
+            for context in entity.get("source_contexts") or []
+            if isinstance(context, dict)
+        ],
     }
-    if not active_property_ids:
-        processed_property_ids = {
-            str(item.get("id") or "") for item in properties
-        }
-    new_properties = [
-        item
-        for item in properties
-        if str(item.get("id") or "") in processed_property_ids
-    ]
-    old_properties = [
-        item
-        for item in properties
-        if str(item.get("id") or "") not in processed_property_ids
-    ]
-    within_calls, cross_calls = relation_call_specs(
-        new_properties,
-        old_properties,
-    )
-    total = len(within_calls) + len(cross_calls)
-
-    def report(completed: int) -> None:
-        on_progress(
-            min(100, max(0, int(completed * 100 / total))) if total else 100
-        )
-
-    def invoke_worker(pair: CollectionPair) -> list[dict]:
-        pgb_agent = PGBAgent(settings=settings)
-        try:
-            propose_pair = getattr(pgb_agent, "propose_pair", None)
-            if callable(propose_pair):
-                return propose_pair(pair)
-            return pgb_agent.propose([*pair.left, *pair.right])
-        finally:
-            provider = getattr(pgb_agent, "provider", None)
-            close = getattr(provider, "close", None)
-            if close:
-                close()
-
-    def worker(pair: CollectionPair) -> list[dict]:
-        if llm_slots is None:
-            return invoke_worker(pair)
-        with llm_slots:
-            return invoke_worker(pair)
-
-    report(0)
-    with _job_heartbeat(settings, job_id):
-        within_results = _run_bounded_calls(
-            settings,
-            job_id,
-            within_calls,
-            worker,
-            thread_name_prefix="property-relations-within",
-            on_complete=lambda completed, _total: report(completed),
-        )
-        cross_results = _run_bounded_calls(
-            settings,
-            job_id,
-            cross_calls,
-            worker,
-            thread_name_prefix="property-relations-cross",
-            on_complete=lambda completed, _total: report(
-                len(within_calls) + completed
-            ),
-        )
-    report(total)
-    old_property_ids = {
-        str(item.get("id") or "") for item in old_properties
-    }
-    preserved_edges = [
-        edge
-        for edge in active_property_graph.get("edges", [])
-        if str(edge.get("source") or "") in old_property_ids
-        and str(edge.get("target") or "") in old_property_ids
-    ]
-    return deduplicate_edges(
-        [
-            *preserved_edges,
-            *_flatten_call_results(within_results),
-            *_flatten_call_results(cross_results),
-        ]
-    )
 
 
 def _job_timings(raw: str | None) -> dict[str, float]:
@@ -661,7 +584,7 @@ def build_workflow(graph_store: Neo4jGraphStore):
         active_properties = {
             item["id"]: item
             for item in active_property_graph.get("nodes", [])
-            if item.get("id")
+            if item.get("id") and item.get("node_type") != "group"
         }
         incremental_entity_add = _should_extract_entities_incrementally(
             state.get("operation"), state.get("property_id"), active_properties
@@ -717,6 +640,7 @@ def build_workflow(graph_store: Neo4jGraphStore):
                 "content": text,
                 "relative_path": relative_path,
                 "directory": directory,
+                "node_type": "property",
                 "_embedding_route_signature": embedding_route_signature,
             }
             active_embedding_text = ""
@@ -829,7 +753,6 @@ def build_workflow(graph_store: Neo4jGraphStore):
         )
         embedder = embedding_provider(settings, route_key="shared_embedding_route")
         output_language = current_display_language()
-        property_relation_executor: ThreadPoolExecutor | None = None
         try:
             _transition_job(
                 settings,
@@ -841,30 +764,26 @@ def build_workflow(graph_store: Neo4jGraphStore):
                 vectors = embeddings_for_texts(pending_embedding_texts, embedder)
                 for index, vector in zip(pending_embedding_indexes, vectors):
                     properties[index]["embedding"] = vector
+            property_groups, property_edges = build_property_group_graph(
+                project_id,
+                properties,
+            )
             progress_lock = Lock()
             shared_llm_slots = Semaphore(load_batch_llm_concurrency(settings))
-            combined_progress = {
-                "entities": len(completed_property_ids),
-                "property_relations": 0,
-            }
+            entity_generation_progress = len(completed_property_ids)
 
-            def update_combined_progress(
-                *,
-                entities: int | None = None,
-                property_relations: int | None = None,
-            ) -> None:
+            def update_entity_generation_progress(entities: int | None = None) -> None:
+                nonlocal entity_generation_progress
                 with progress_lock:
                     if entities is not None:
-                        combined_progress["entities"] = entities
-                    if property_relations is not None:
-                        combined_progress["property_relations"] = property_relations
-                    entity_percent = (
+                        entity_generation_progress = entities
+                    percent = (
                         min(
                             100,
                             max(
                                 0,
                                 int(
-                                    combined_progress["entities"]
+                                    entity_generation_progress
                                     * 100
                                     / entity_generation_total
                                 ),
@@ -873,49 +792,14 @@ def build_workflow(graph_store: Neo4jGraphStore):
                         if entity_generation_total
                         else 100
                     )
-                    combined_percent = int(
-                        (entity_percent + combined_progress["property_relations"])
-                        / 2
-                    )
                     _transition_job(
                         settings,
                         state["job_id"],
-                        "graph-entity-property-relations",
-                        detail=(
-                            "Generating entity nodes and property relations: "
-                            f"{combined_percent}%"
-                        ),
+                        "graph-entity-generation",
+                        detail=f"Generating entity nodes: {percent}%",
                     )
 
-            processed_property_ids = set(batch_property_ids)
-            if not processed_property_ids and state.get("property_id"):
-                processed_property_ids.add(str(state["property_id"]))
-            update_combined_progress()
-            entity_generation_started = Event()
-
-            def generate_property_relations() -> list[dict]:
-                entity_generation_started.wait()
-                return _generate_property_relation_edges(
-                    settings,
-                    state["job_id"],
-                    properties,
-                    active_property_graph,
-                    processed_property_ids,
-                    lambda percent: update_combined_progress(
-                        property_relations=percent
-                    ),
-                    shared_llm_slots,
-                )
-
-            property_relation_executor = ThreadPoolExecutor(
-                max_workers=1,
-                thread_name_prefix="property-relations-stage",
-            )
-            property_relation_future = property_relation_executor.submit(
-                run_in_display_language,
-                output_language,
-                generate_property_relations,
-            )
+            update_entity_generation_progress()
             try:
                 generated_entities: list[dict] = list(recovered_generated_entities)
                 entities = list(current_entities) if checkpoint_resume else (
@@ -927,9 +811,10 @@ def build_workflow(graph_store: Neo4jGraphStore):
                 checkpoint_snapshot_id = None
                 total_batch_items = entity_generation_total
                 filenames_by_property_id = {
-                    document["property_id"]: document.get("filename")
-                    or document["property_id"]
-                    for document in entity_documents
+                    str(property_node["id"]): str(
+                        property_node.get("filename") or property_node["id"]
+                    )
+                    for property_node in properties
                 }
                 if is_batch_add:
                     checkpoint_snapshot_id = (
@@ -991,17 +876,6 @@ def build_workflow(graph_store: Neo4jGraphStore):
                 if entity_items:
                     results_by_index = {}
                     first_error = None
-                    if is_batch_add:
-                        property_ids = {item["id"] for item in properties}
-                        checkpoint_property_edges = [
-                            edge
-                            for edge in active_property_graph.get("edges", [])
-                            if edge.get("source") in property_ids
-                            and edge.get("target") in property_ids
-                        ]
-                    else:
-                        checkpoint_property_edges = []
-                    entity_generation_started.set()
                     with _job_heartbeat(settings, state["job_id"]):
                         with ThreadPoolExecutor(
                             max_workers=_batch_llm_workers(
@@ -1042,8 +916,8 @@ def build_workflow(graph_store: Neo4jGraphStore):
                                 )
                                 entity_edges = baseline_entity_edges
                                 completed_property_ids.add(item["property_id"])
-                                update_combined_progress(
-                                    entities=len(completed_property_ids),
+                                update_entity_generation_progress(
+                                    len(completed_property_ids)
                                 )
                                 if is_batch_add and checkpoint_snapshot_id:
                                     graph_store.write_snapshot(
@@ -1052,8 +926,9 @@ def build_workflow(graph_store: Neo4jGraphStore):
                                             checkpoint_snapshot_id,
                                             properties,
                                             entities,
-                                            checkpoint_property_edges,
+                                            property_edges,
                                             entity_edges,
+                                            property_groups,
                                         )
                                     )
                                     _update_job(
@@ -1073,16 +948,9 @@ def build_workflow(graph_store: Neo4jGraphStore):
                     if first_error is not None:
                         raise first_error
                 elif incremental_entity_add:
-                    entity_generation_started.set()
                     entities = list(current_entities) if checkpoint_resume else list(
                         baseline_entities
                     )
-                else:
-                    entity_generation_started.set()
-
-                property_edges = property_relation_future.result()
-                property_relation_executor.shutdown(wait=True)
-                property_relation_executor = None
 
                 old_entities_for_relations = (
                     baseline_entities if incremental_entity_add else []
@@ -1184,9 +1052,23 @@ def build_workflow(graph_store: Neo4jGraphStore):
                     context_word_count=_context_word_count,
                 )
 
+                relation_new_entities = [
+                    _entity_relation_evidence(
+                        entity,
+                        filenames_by_property_id,
+                    )
+                    for entity in surviving_new_entities
+                ]
+                relation_old_entities = [
+                    _entity_relation_evidence(
+                        entity,
+                        filenames_by_property_id,
+                    )
+                    for entity in exact_old
+                ]
                 within_relation_calls, cross_relation_calls = relation_call_specs(
-                    surviving_new_entities,
-                    exact_old,
+                    relation_new_entities,
+                    relation_old_entities,
                 )
                 relation_total = len(within_relation_calls) + len(cross_relation_calls)
 
@@ -1267,9 +1149,6 @@ def build_workflow(graph_store: Neo4jGraphStore):
                     for entity, vector in zip(entities, entity_vectors)
                 ]
         finally:
-            if property_relation_executor is not None:
-                entity_generation_started.set()
-                property_relation_executor.shutdown(wait=True)
             if embedder is not None:
                 close = getattr(embedder, "close", None)
                 if close:
@@ -1281,10 +1160,26 @@ def build_workflow(graph_store: Neo4jGraphStore):
             detail=f"Writing {len(properties)} properties and {len(entities)} entities",
         )
         snapshot_id = str(uuid.uuid4())
-        graph_store.write_snapshot(GraphSnapshot(project_id, snapshot_id, properties, entities, property_edges, entity_edges))
+        graph_store.write_snapshot(
+            GraphSnapshot(
+                project_id,
+                snapshot_id,
+                properties,
+                entities,
+                property_edges,
+                entity_edges,
+                property_groups,
+            )
+        )
         _update_job(settings, state["job_id"], candidate_snapshot=snapshot_id)
         _raise_if_cancelled(settings, state["job_id"])
-        return {"snapshot_id": snapshot_id, "entities": entities, "entity_edges": entity_edges, "properties": properties, "property_edges": property_edges}
+        return {
+            "snapshot_id": snapshot_id,
+            "entities": entities,
+            "entity_edges": entity_edges,
+            "properties": properties,
+            "property_edges": property_edges,
+        }
 
     def activate(state: PipelineState):
         settings, project_id, job_id = state["settings"], state["project_id"], state["job_id"]

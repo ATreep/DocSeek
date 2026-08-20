@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from 'react'
 
 import { request } from '../api'
 import { changeDisplayLanguage, type DisplayLanguage, useDocSeekTranslation } from '../i18n'
+import FloatingWindow from './FloatingWindow'
 
 type ProfileResponse = {
   preferences?: Record<string, unknown>
@@ -76,8 +77,11 @@ export default function LanguageSwitcher() {
       >
         <Languages size={17} />
       </button>
-      {open && (
-        <div className="language-menu" role="menu" aria-label={t('Language')}>
+      <FloatingWindow open={open} className="language-menu" role="menu" aria-label={t('Language')}>
+          <header className="compact-floating-header">
+            <span className="eyebrow">{t('Language')}</span>
+            <h2>{t('Language')}</h2>
+          </header>
           {choices.map((choice) => (
             <button
               type="button"
@@ -89,8 +93,7 @@ export default function LanguageSwitcher() {
               {language === choice.code && <Check size={14} />}
             </button>
           ))}
-        </div>
-      )}
+      </FloatingWindow>
     </div>
   )
 }

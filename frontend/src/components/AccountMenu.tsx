@@ -1,6 +1,7 @@
 import { LogOut } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { useDocSeekTranslation } from "../i18n";
+import FloatingWindow from "./FloatingWindow";
 import "./ui-hardening.css";
 
 export default function AccountMenu({
@@ -38,13 +39,15 @@ export default function AccountMenu({
       >
         A
       </button>
-      {open && (
-        <div className="account-menu-panel" role="menu">
+      <FloatingWindow open={open} className="account-menu-panel" role="menu" aria-label={t("Account menu")}>
+          <header className="compact-floating-header">
+            <span className="eyebrow">{t("ACCOUNT")}</span>
+            <h2>{t("Account menu")}</h2>
+          </header>
           <button type="button" role="menuitem" onClick={() => void signOut()}>
             <LogOut size={15} /> {t("Sign out")}
           </button>
-        </div>
-      )}
+      </FloatingWindow>
     </div>
   );
 }

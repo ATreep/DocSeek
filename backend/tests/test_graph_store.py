@@ -2,8 +2,30 @@ import pytest
 
 from backend.app.config import Settings
 from backend.app.db import initialize
-from backend.app.services.graph_store import GraphSnapshot, LocalGraphStore, entity_extraction_chunks, prune_property_snapshot
+from backend.app.services.graph_store import GraphSnapshot, LocalGraphStore, build_property_group_graph, entity_extraction_chunks, prune_property_snapshot
 from backend.app.services.graph_store import embedding
+
+
+def test_property_group_graph_mirrors_nested_group_tree_without_llm():
+    groups, edges = build_property_group_graph(
+        "project",
+        [
+            {"id": "root-property", "filename": "root.md", "directory": ""},
+            {"id": "nested-property", "filename": "nested.md", "directory": "Product/Research"},
+        ],
+    )
+
+    assert [(group["id"], group["name"], group["group_path"]) for group in groups] == [
+        ("group:project:/", "Root", ""),
+        ("group:project:Product", "Product", "Product"),
+        ("group:project:Product/Research", "Research", "Product/Research"),
+    ]
+    assert edges == [
+        {"source": "group:project:/", "target": "group:project:Product", "type": "CONTAINS_GROUP"},
+        {"source": "group:project:Product", "target": "group:project:Product/Research", "type": "CONTAINS_GROUP"},
+        {"source": "group:project:/", "target": "root-property", "type": "CONTAINS_PROPERTY"},
+        {"source": "group:project:Product/Research", "target": "nested-property", "type": "CONTAINS_PROPERTY"},
+    ]
 
 
 def test_prune_property_snapshot_removes_owned_nodes_edges_and_shared_sources(tmp_path):
@@ -36,7 +58,10 @@ def test_prune_property_snapshot_removes_owned_nodes_edges_and_shared_sources(tm
     pruned = prune_property_snapshot(store, "project", "remove", "after")
 
     assert [node["id"] for node in pruned.properties] == ["keep"]
-    assert pruned.property_edges == []
+    assert pruned.property_edges == [
+        {"source": "group:project:/", "target": "keep", "type": "CONTAINS_PROPERTY"}
+    ]
+    assert [group["id"] for group in pruned.property_groups] == ["group:project:/"]
     assert [node["id"] for node in pruned.entities] == ["shared", "unrelated"]
     shared = pruned.entities[0]
     assert shared["source_property_ids"] == ["keep"]

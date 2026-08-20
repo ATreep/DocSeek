@@ -320,9 +320,10 @@ def test_ai_query_system_prompt_explains_graph_tool_workflow():
         "query_properties",
         "get_entity_detail",
         "get_property_detail",
-        "get_property_group_tree",
         "read_property_content",
     ):
         assert tool_name in prompt
+    assert "property_group_tree" in prompt
+    assert "get_property_group_tree" not in prompt
     assert prompt.index("query_entities") < prompt.index("get_entity_detail")
     assert prompt.index("query_properties") < prompt.index("get_property_detail")

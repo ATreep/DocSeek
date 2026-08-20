@@ -1,0 +1,762 @@
+# Unit 2: General Random Variables
+
+我们已经在第一单元学习了离散型随机变量以及 PMF，这一单元将研究：
+
+- 连续型随机变量
+- 概率密度函数（PDF）
+- 累积分布函数（CDF）
+- 正态随机变量
+
+
+
+# 连续型随机变量与概率密度函数
+
+对于一个连续型的随机变量（Continuous R.V.），我们可以使用**概率密度函数**（Probability Density Function, PDF）描绘它：
+
+<img src="assets/image-20250606144635541.png" alt="image-20250606144635541" style="zoom:50%;" />
+
+计算随机变量 $X$ 在 $a$ 到 $b$ 的概率可以使用定积分（Integration）：$P(a\le X\le b)=\int_a^bf_X(x)dx$
+
+- 我们知道样本空间所有的结果概率相加为 1，因此单个随机变量的所有可能取值累加起来也是 1：$\int_{-\infty}^{\infty}f_X(x)dx=1$。
+- 请注意，对于连续型随机变量，指定一个特定的数值是没有意义的，因为 $P(X=c)=0,\ c\in \mathbb{R}$。（对于概率密度函数，只有对其进行积分得到的数值，即概率，才有意义，因此你不应该单独指定概率密度函数的某一个点，即使其不为 0。）
+
+
+
+> **将函数面积近似看作小矩形**
+>
+> 设 $\delta$ 是一个非常小的正数，那么 $P(x\le X \le x+\delta)=\int_x^{x+\delta}f_X(s)ds\approx f_X(x)\cdot \delta$
+
+
+
+## 均值与方差
+
+类似于离散型随机变量，连续型随机变量的均值和方差可以由定义推导出来。
+
+- $E[X]=\int_{-\infty}^{\infty}xf_X(x)dx$
+- $E[g(X)]=\int_{-\infty}^{\infty}g(x)f_X(x)dx$
+- $var(X)=\sigma^2_X=\int_{-\infty}^{\infty}(x-E[X])^2f_X(x)dx$
+
+
+
+## 连续均匀随机变量
+
+对于均匀分布的随机变量，其概率密度函数图像呈现一条直线形。
+
+<img src="assets/image-20250606151656663.png" alt="image-20250606151656663" style="zoom:50%;" />
+
+仅根据如图信息，我们可以得到 $a\le x\le b$ 范围的概率为 $f_X(x)=\frac{1}{b-a}$。
+
+> 我们已知样本空间下，所有结果概率的和为 1。因此 PDF 图像的面积必为 1。
+>
+> 所以这个图像的高度（即概率值）可以使用面积（=1）除以底边长（=b-a）得到。
+
+**连续均匀随机变量的方差：** 对于宽度为 $c$ 的连续均匀分布，其方差为 $\frac{c^2}{12}$。
+
+# 累积分布函数
+
+累积分布函数（Cumulative Distribution Function, CDF）的定义为：$F_X(x)=P(X\le x)$。
+
+- 对于连续型随机变量：$F_X(x)=P(X\le x)=\int_{-\infty}^{x}f_X(t)dt$
+- 对于离散型随机变量：$F_X(x)=p(X\le x)=\sum_{k\le x}p_X(k)$
+
+
+
+## 示例
+
+1. 概率密度函数对应的累积分布函数
+
+   <img src="assets/image-20250606152402235.png" alt="image-20250606152402235" style="zoom:50%;" />
+
+   CDF 图像的斜率也可以计算得到：$k=1/(b-a)$
+
+2. 概率质量函数对应的累积分布函数
+
+   <img src="assets/image-20250606152619840.png" alt="image-20250606152619840" style="zoom:50%;" />
+
+
+
+## 混合分布
+
+对于既有概率质量函数又有概率密度函数的混合分布，我们也可知写出对应的累积分布函数：
+
+<img src="assets/image-20250606152743749.png" alt="image-20250606152743749" style="zoom:50%;" />
+
+该分布在 $x=\frac{1}{2}$ 时概率为 $\frac{1}{2}$，其他情况下概率总和也应为 $\frac{1}{2}$。
+
+因此可以绘制 CDF 如下：
+
+<img src="assets/image-20250606153046813.png" alt="image-20250606153046813" style="zoom:50%;" />
+
+
+
+# 概念星图
+
+下图包含了概率质量函数、概率密度函数以及它们对应的联合分布函数与条件概率函数；以及与它们都有关的累积分布函数、数学期望以及方差。
+
+<img src="assets/image-20250606155810812.png" alt="image-20250606155810812" style="zoom:50%;" />
+
+
+
+# 高斯概率密度函数（正态分布）
+
+1. 标准正态概率密度函数 $N(0,1)$：$f_X(x)=\frac{1}{\sqrt{2\pi}}e^{\frac{-x^2}{2}}$
+
+<img src="assets/image-20250606153443434.png" alt="image-20250606153443434" style="zoom:50%;" />
+
+$E[X]=0,\ var(X)=1$。
+
+2. 一般正态概率密度函数 $N(\mu,\sigma^2)$：$f_X(x)=\frac{1}{\sigma\sqrt{2\pi}}e^{\frac{-(x-\mu)^2}{2\sigma^2}}$
+
+$E[X]=\mu,\ var(X)=\sigma^2$
+
+3. 若 $X$ 服从正态分布 $X\sim N(\mu,\sigma^2)$，那么设 $Y=aX+b$
+
+   由期望与方差的特性可得：$E[Y]=aE[X]+b,\ var(Y)=a^2var(X)$
+
+   实际上，$Y$ 也服从正态分布：$Y\sim N(a\mu+b,a^2\sigma^2)$
+
+
+
+## 归一化正态分布
+
+正态分布的 CDF 不存在闭式（Closed Form），但是我们可以将标准正态分布 $N(0,1)$ 的 CDF 数值列表：
+
+<img src="assets/image-20250606154336410.png" alt="image-20250606154336410" style="zoom:50%;" />
+
+然后对于非标准的正态分布，使用归一化方法将其变为标准正态分布。
+
+- 若 $X\sim N(\mu,\sigma^2)$，则 $\frac{X-\mu}{\sigma}\sim N(0,1)$
+
+根据此方法，我们可以归一化任何正态分布。
+
+**例如：**对于 $X\sim N(2,16)$
+
+若我们想求解 $P(X\le 3)$ 的数值，可以推导：
+
+$P(X\le 3)=P(\frac{X-2}{4}\le \frac{3-2}{4})=CDF(0.25)$
+
+查表可得标准正态分布的 $CDF(0.25)=0.5987$
+
+
+
+# 联合分布的概率密度函数
+
+对于有两个变量的概率密度函数 $f_{X,Y}(x,y)$，函数在区域 $S$ 的 “体积”（或比作为 “密度”） $\int\int_Sf_{X,Y}(x,y)dxdy$ 代表联合随机变量 $(X,Y)$ 落在某个区域 $S$ 内的概率。
+
+$P((X,Y)\in S)=\int\int_S f_{X,Y}(x,y)dxdy$
+
+
+
+**期望计算：**$E[g(X,Y)]=\int^\infty_{-\infty}\int^\infty_{-\infty}g(x,y)f_{X,Y}(x,y)dxdy$
+
+
+
+## 联合分布的 PDF 的一个几何解释
+
+假设 $X$ 与 $Y$ 都取很小的一段值 $\delta$，那么我们可以将联合分布的概率密度函数值想象成二维平面上单位面积的概率：
+
+$P(x\le X\le x+\delta,y \le Y\le y+\delta)\approx f_{X,Y}(x,y)\cdot \delta^2$
+
+因为 $\delta$ 非常小，所以 $\delta^2$ 可以当做平面上的单位面积，因此我们可以将单位面积每个点的概率都近似为点 $(x,y)$ 的概率。
+
+
+
+## 联合概率密度函数的边缘概率
+
+类似于离散随机变量的联合分布，要求边缘概率只需要定住一个变量，然后让另一个变量的取值累加即可：
+
+$f_X(x)=\int^\infty_{-\infty}f_{X,Y}(x,y)dy$
+
+
+
+> **从几何角度推导边缘概率**
+>
+> 取一段非常小的区间 $[x,x+\delta]$，让 $X$ 位于这个区间，则我们可知：
+>
+> $P(x\le X\le x+\delta)=\int^{\infty}_{-\infty}\int^{x+\delta}_xf_{X,Y}(\overline{x},y)d\overline{x}dy$
+>
+> 当 $\delta\to0$，内积分 $\int^{x+\delta}_xf_{X,Y}(\overline{x},y)d\overline{x}\approx\delta\cdot f_{X,Y}(x,y)$ （类似于上述的几何解释，由于 $\delta$ 很小，可以近似为该区间内的概率值恒定）。
+>
+> 因此 $P(x\le X\le x+\delta)\approx\int^{\infty}_{-\infty}\delta\cdot f_{X,Y}(x,y)dy$
+>
+> 由前面的联合分布的几何解释，我们可知：$P(x\le X\le x+\delta)\approx f_{X}(x)\cdot \delta$ 
+>
+> 上述两式相等，因此 $f_X(x)=\int^\infty_{-\infty}f_{X,Y}(x,y)dy$ （$\delta$ 被消除）。
+
+
+
+## 检验联合随机变量的独立性
+
+当满足此条件，可以认定 $X$ 和 $Y$ 是独立的：$f_{X,Y}(x,y)=f_X(x)f_Y(y)\ \text{for all}\ x,y$
+
+
+
+## Buffon's Needle
+
+这是一道连续型联合分布的例题。
+
+<img src="assets/image-20250623215815953.png" alt="image-20250623215815953" style="zoom:50%;" />
+
+设两个平行线距离 $d$，针的长度 $l$（$l\lt d$）。寻找 $P(\text{needle intersects one of the lines})$。
+
+
+
+**求解**
+
+让我们建立一个联合分布模型解决这个问题。
+
+设 $X\in[0,d/2]$：针的中点到最近的线的距离。
+
+设 $\Theta\in[0,\pi/2]$：对应上图中的 $q$。针与水平线相交的角度。
+
+$X$ 与 $\Theta$ **均匀**分布且**独立**。
+
+因此我们可以得到概率密度函数：
+
+$f_{X,\Theta}(x,\theta)=f_X(x)f_\Theta(\theta)=(2/d)(2/\pi)$（由两个随机变量均匀分布且独立得到。）
+
+
+
+使用数学公式表达针与平行线相交：$X\le\frac{l}{2}\text{sin}\Theta$
+
+> 上式中 $l\text{sin}\Theta$ 表示针在水平方向的投影长度，即针两端的垂直距离。其除以 2 表示针的中点到针两端的垂直距离。
+>
+> 此时，如果针的中点到某个平行线的距离小于针的中点到针的末端的垂直距离，说明针的末端位于平行线的另一边，即针与平行线相交
+
+
+
+现在，让我们求解题目的概率。
+
+$P(X\le \frac{l}{2}\text{sin}\Theta)=\int\int_{x\le\frac{l}{2}\text{sin}\theta}f_X(x)f_\Theta(\theta)\ dx\ d\theta$
+
+$=\frac{4}{\pi d}\int^{\pi/2}_0\int^{(l/2)\text{sin}\theta}_0\ dx\ d\theta=\frac{2l}{\pi d}$
+
+
+
+# 条件概率密度函数
+
+类似于离散型条件概率，连续型条件概率密度函数定义为：
+
+$f_{X|Y}(x|y)=\frac{f_{X,Y}(x,y)}{f_Y(y)}$
+
+
+
+> **条件概率可以看作联合密度的归一化**
+>
+> 条件密度 $f_{X|Y}(x|y)$ 是联合密度 $f_{X,Y}(x,y)$ 在 $Y\approx y$（连续型随机变量需要指定一个范围以计算概率，这里使用约等于来表示一个小范围） 处的 “截面”，为了保证 $X$ 从 $-\infty$ 到 $\infty$ 的取值加起来为 1，我们需要除以边缘概率 $f_Y(y)$  实现归一化。
+>
+> 若不进行归一化，从几何角度理解，$f_{X,Y}(x,y)$ 相当于某个区域的体积，而这个区域所在的整个空间加起来体积为 1。现在我们锁定了 $Y\in[y,y+\epsilon]$ 这个区域，为了使条件密度函数在这个区域的体积加起来变成 1，所以我们需要除以边缘概率进行归一化。
+
+
+
+已知当随机变量独立时，$f_{X,Y}=f_Xf_Y$，因此：
+
+$f_{X|Y}(x|y)=f_X(x)$
+
+
+
+> **由几何角度推导条件概率密度函数**
+>
+> 我们将使用类似于推导联合分布的边缘概率，我们会利用几何角度的近似来推导条件概率密度函数。
+>
+> 
+>
+> 已知 $P(x\le X\le x+\delta)\approx f_X(x)\cdot \delta$
+>
+> 如果我们加上条件，那么上式变成：
+>
+> $P(x\le X\le x+\delta|Y\approx y)\approx f_{X|Y}(x|y)\cdot\delta$ （请注意，在这里我们使用的是 $Y\approx y$，使用近似表示 $Y$ 位于关于 $y$ 的一个非常小的领域内）
+>
+> 
+>
+> 另一方面，由条件概率的定义，我们知道 $P(x\le X\le x+\delta|Y\approx y)=\frac{P((x\le X\le x+\delta)\cap (Y\approx y))}{P(Y\approx y)}$
+>
+> 分子可以写作联合分布形式：$P(x\le X\le x+\delta,\ y\le Y\le y+ϵ)=P_{X,Y}(x,y)$（使用 $\epsilon$ 表示另一个趋近于 0 的正数），因此上式可以写作：
+>
+> $\frac{P(x\le X\le x+\delta,\ y\le Y\le y+ϵ)}{P(y\le Y\le y+ϵ)}$
+>
+> 由前一节提到的联合分布的几何解释 $P(x\le X\le x+\delta,y \le Y\le y+\delta)\approx f_{X,Y}(x,y)\cdot \delta^2$，我们将上式近似为：
+>
+> $\approx\frac{f_{X,Y}(x,y)\cdot\delta\cdot\epsilon}{f_Y(y)\cdot\epsilon}=\frac{f_{X,Y}(x,y)}{f_Y(y)}\cdot \delta$
+>
+> 
+>
+> 此时，我们得到的两个式子放在一起即：
+>
+> $P(x\le X\le x+\delta|Y\approx y)\approx f_{X|Y}(x|y)\cdot\delta=\frac{f_{X,Y}(x,y)}{f_Y(y)}\cdot \delta$
+>
+> 两边同时消除 $\delta$，可以得到 $f_{X,Y}(x|y)=\frac{f_{X,Y}(x,y)}{f_Y(y)}$。
+
+
+
+## 使用条件密度函数表示联合密度函数
+
+类似于离散型随机变量的 PMF 的做法，我们可以使用如下式子表示（独立或非独立）的两个随机变量的联合密度函数：
+
+$f_{X,Y}(x,y)=f_X(x)f_{Y|X}(y|x)$
+
+因此，**边缘概率**可以表示为：$f_X(x)=\int_{y}f_{X,Y}(x,y)dy=\int_yf_Y(y)f_{X|Y}(y|x)dy$
+
+
+
+## 图示联合、边缘与条件密度
+
+![image-20250623235632852](assets/image-20250623235632852.png)
+
+
+
+## Stick-breaking Example
+
+将一根长度为 $l$ 的棍子掰断两次。
+
+第一次在 $X$ 处掰断：在 $[0,l]$ 中均匀分布
+
+第二次在 $Y$ 处掰断：在 $[0,X]$ 中均匀分布
+
+<img src="assets/image-20250624000438531.png" alt="image-20250624000438531" style="zoom:50%;" />
+
+由此图，我们易得 $f_X(x)$ 的图像高度为 $1/l$，而 $f_{Y|X}(y|x)$ 的图像高度为 $1/x$。
+
+
+
+因此我们可以组合为联合分布：$f_{X,Y}(x,y)=f_X(x)f_{Y|X}(y|x)=(1/l)(1/x)$
+
+<img src="assets/image-20250624001033258.png" alt="image-20250624001033258" style="zoom:50%;" />
+
+由此可得条件期望为：$E[Y|X=x]=\int yf_{Y|X}(y|X=x)dy=\int^{x}_0\frac{1}{x}dy$
+
+
+
+边缘概率： $f_Y(y)=\int f_{X,Y}(x,y)dx$
+
+$=\int^l_y\frac{1}{lx}dx=\frac{1}{l}\text{log}\frac{l}{y}$
+
+
+
+$Y$ 的期望：$E[Y]=\int^l_0yf_Y(y)dy=\frac{l}{4}$
+
+
+
+# 指数分布（Exponential Distribution）
+
+指数分布是一种连续型分布，且仅有一个参数 $\lambda$。
+
+若随机变量 $T$ 遵循指数分布，我们记作：$T\sim \text{exp}(\lambda)$
+
+则概率 $P(T\le t)=1-e^{-\lambda t},\ t\ge 0$
+
+上式为指数分布的 CDF，求导后可得其 PDF：$f_{T}(t)=\lambda e^{-\lambda t},\ t\ge 0$
+
+指数随机变量的期望 $E[T]=\frac{1}{\lambda}$
+
+
+
+## 指数分布的无记忆性（Memoryless Property）
+
+类似于**几何分布**，指数分布也具有无记忆性的属性。
+
+可以表示为：$P(X\gt s+t|X\gt s)=P(X\gt t),\ s,t\gt 0$
+
+即某事等待了 $s$ 时间还未发生，而再等 $t$ 时间才会发生的概率，等同于一开始就等待 $t$ 时间才会发生的概率。
+
+例如等公交车，且公交车到来的时间符合指数分布，那么无论你已经等了多久，接下来再等的时间分布与刚开始等的分布完全相同。
+
+
+
+## The Absent-minded Professor Problem
+
+一位粗心的教授将两位学生的会面安排在了同一时间。会面的持续时间是**独立的**且遵循**均值为 30 分钟**的**指数分布**。第一个学生准时到达，但是第二个学生迟到了 5 分钟才到达。请问从第一个学生到达到第二个学生离开的时间的均值是什么？
+
+
+
+**求解**
+
+因为均值为 30 分钟，根据 $E[T]=\frac{1}{\lambda}=30$，我们得知 $\lambda=\frac{1}{30}$。
+
+因此 $T_1\ne T_2\sim\text{exp}(\frac{1}{30})$。
+
+由于第一位学生的会面与第二位学生的会面在一维时间尺度上看，可能有两种情况：第一位学生会面结束后，教授等待了一段时间直到第二位学生到达才继续开始会面（$T_1\le5$）;第一位学生会面完成后紧接着开始第二位学生的会面（$T_1\gt5$）。因此我们需要分情况讨论数学期望。
+
+1. $T_1\le5$
+
+<img src="assets/image-20250624142128651.png" alt="image-20250624142128651" style="zoom:50%;" />
+
+$E[X|T_1\le5]=5+E[T_2]=5+30=35$
+
+因为前 5 分钟时间是必定存在的，因此需要加到均值中。
+
+$P(T_1\le5)=1-e^{-\frac{5}{30}}$ *因为遵循指数分布，可得。*
+
+2. $T_1\gt5$
+
+<img src="assets/image-20250624142447783.png" alt="image-20250624142447783" style="zoom:50%;" />
+
+$E[X|T_1\gt5]=5+E[T_1|T_1\gt5]+E[T_2]=5+30+30=65$ *由于指数分布的无记忆性，$T_1$ 在 5 分钟后遵循的分布与 $T_1$ 在时间 0 时相同。*
+
+$P(T_1\gt5)=1-P(T_1\le5)=e^{-\frac{5}{30}}$
+
+
+
+综合以上两种情况，我们可以得到：
+
+$E[X]=P(T_1\le5)E[X|T_1\le5]+P(T_1\gt5)E[X|T_1\gt5]\approx60.394$
+
+
+
+# 连续型贝叶斯定理（Continuous Bayes' Rule）
+
+回顾**离散型**随机变量的贝叶斯定理，我们得知通过以下推论公式可以计算**条件概率质量函数**：
+
+$p_{X|Y}(x|y)=\frac{p_{X,Y}(x,y)}{p_Y(y)}=\frac{p_X(x)p_{Y|X}(y|x)}{p_Y(y)}$
+
+其中 $p_Y(y)$ 由全概率定理可得：$p_Y(y)=\sum_xp_X(x)p_{Y|X}(y|x)$
+
+代入条件概率中，可以得到：$p_{X|Y}(x|y)=\frac{p_X(x)p_{Y|X}(y|x)}{\sum_xp_X(x)p_{Y|X}(y|x)}$
+
+
+
+**连续型**贝叶斯定理与离散型大致相同，除了将概率质量函数变为**概率密度函数**：
+
+$f_{X|Y}(x|y)=\frac{f_{X|Y}(x,y)}{f_Y(y)}=\frac{f_X(x)f_{Y|X}(y|x)}{f_Y(y)}$
+
+依据**全概率定理**积分得到： $f_Y(y)=\int_xf_X(x)f_{Y|X}(y|x)dx$
+
+代入可得：$f_{X|Y}(x|y)=\frac{f_X(x)f_{Y|X}(y|x)}{\int_xf_X(x)f_{Y|X}(y|x)dx}$
+
+
+
+> **贝叶斯公式中各个函数项的命名**
+>
+> - $f_{X|Y}(x|y)$：后验概率密度函数（Posterior）
+> - $f_{Y|X}(y|x)$：似然函数（Likelihood）
+> - $f_X(x)$：先验概率密度函数（Prior）
+> - $f_Y(y)$：边缘密度函数（Evidence）
+
+
+
+## 离散型与连续型的混合
+
+如果贝叶斯公式中的两个随机变量一个是离散型而另一个是连续型，我们可以将其做变形。
+
+
+
+### 离散的 $X$，连续的 $Y$
+
+$p_{X|Y}(x|y)=\frac{p_X(x)f_{Y|X}(y|x)}{f_Y(y)}$
+
+$f_Y(y)=\sum_xp_X(x)f_{Y|X}(y|x)$
+
+我们将**离散随机变量**的相应函数更改为了**概率质量函数**，而**连续型随机变量**的相应函数为**概率密度函数**。
+
+举例：$X$ 是离散的信号，而 $Y$ 是 $X$ 的噪音版本，因此 $f_{Y|X}(y|x)$ 是连续噪音模型。
+
+
+
+### 连续的 $X$，离散的 $Y$
+
+$f_{X|Y}(x|y)=\frac{f_X(x)p_{Y|X}(y|x)}{p_Y(y)}$
+
+$p_Y(y)=\int_xf_X(x)p_{Y|X}(y|x)dx$
+
+
+
+举例：$X$ 是连续的信号，$f_X(x)$ 可能为光束的强度；$Y$ 是受 $X$ 影响的离散型随机变量，如照片数量；$p_{Y|X}(y|x)$ 是离散型随机变量的模型。
+
+
+
+# 派生分布（Derived Distribution）
+
+派生分布是函数变换的分布。
+
+例如，已知随机变量 $X\sim f_X(x)$，则定义新随机变量 $Y=g(X)$。我们发现 $Y$ 的分布是从 $X$ 的分布派生出来的。
+
+现有如下联合分布：
+
+<img src="assets/image-20250628150618014.png" alt="image-20250628150618014" style="zoom:20%;" />
+
+
+但是我们想关注的不是 $f_{X,Y}$ 而是函数 $g(X,Y)=Y/X$。如何获得 $g(X,Y)$ 的 PDF？
+
+注意，你应该将函数 $g$ 看作一个新的**随机变量**。
+
+## 计算派生分布的期望
+
+如果我们只打算计算 $g(X,Y)$ 的数学期望，即 $E[g(X,Y)]$，那么我们没有必要再计算 $g$ 的 PDF，只需要使用已有的 $f_{X,Y}$ 即可：
+
+$E[g(X,Y)]=\int\int g(x,y)f_{X,Y}(x,y)dx\ dy$
+
+> **独立随机变量的派生分布**
+> 
+> 若随机变量 $X$  与 $Y$ 是独立的，那么随机变量 $Z=\frac{Y}{X}$ 的期望 $E[Z]$ 可以写为 $E[Z]=E[Y]E\left[ \frac{1}{x} \right]$。
+
+## 计算派生分布
+
+### 离散情况
+
+若我们想计算派生分布 $Y=g(X)$ 的概率质量函数，我们首先列出 $g(X)$ 函数的映射关系，如：
+
+<img src="assets/image-20250628152618016.png" alt="image-20250628152618016" style="zoom:30%;" />
+
+此时，概率质量函数
+
+$p_Y(y)=P(g(X)=y)=\sum_{x:\ g(x)=y}p_X(x)$
+
+对于每一个输入 $y$，我们需要反向找到其对应的所有 $x$，并将这些 $p_X(x)$ 概率值相加，即为 $p_Y(y)$。
+
+### 连续情况
+
+对于连续随机变量的派生分布，想计算其概率密度函数，我们可以分两步进行：
+
+- 计算 $Y$ 的累积分布函数：$F_Y(y)=P(Y\le y)$
+
+- 因为 CDF 与 PDF 之间是微分的关系，因此可以对 $F_Y(y)$ 求导得到 $f_Y(y)$：
+
+  $f_Y(y)=\frac{dF_Y}{dy}(y)$
+
+
+
+**示例**
+
+- $X$：在 $[0,2]$ 上均匀分布
+- $Y=X^3$
+
+寻找 $Y$ 的概率密度函数。
+
+
+
+计算 CDF：
+
+$F_Y(y)=P(Y\le y)=P(X^3\le y)$
+
+通过计算反函数的方式得到 $X<func(Y)$ 的形式
+
+$P(X^3\le y)=P(X\le y^{\frac{1}{3}})$
+
+为计算 $P(X\le y^{\frac{1}{3}})$。我们已知 $X$ 在 $[0,2]$ 均匀分布，则 $[0,2]$ 处函数图像的底为 2，高为 1/2。
+
+通过底 $y^{\frac{1}{3}}$ 与高 $\frac{1}{2}$，可得 $P(X\le y^{\frac{1}{3}})$ 为底与高相乘，即 $\frac{1}{2}y^{\frac{1}{3}}$。
+
+
+
+计算 PDF：
+
+$f_Y(y)=\frac{dF_Y}{dy}(y)=\frac{1}{6y^{\frac{2}{3}}}$
+
+
+
+### 线性函数的概率密度函数
+
+若 $Y=aX+b$，即线性函数，那么我们可以很快捷的求出 $f_Y(y)$：
+
+$f_Y(y)=\frac{1}{|a|}f_X(\frac{y-b}{a})$
+
+
+
+**推导**
+
+对于函数 $Y=aX+b$：
+
+<img src="assets/image-20250628155357628.png" alt="image-20250628155357628" style="zoom:50%;" />
+
+将函数拉伸后，其积分应该保持不变为 1，因此左右变长 a 倍后，高度应该缩小 $\frac{1}{a}$。
+
+
+
+以下是通过计算 CDF 的方式证明：
+
+1. $a\gt 0$
+
+$F_Y(y)=P(Y\le y)=P(aX+b\le y)=P(X\le\frac{y-b}{a})=F_X(\frac{y-b}{a})$
+
+左右同时求导：
+
+$f_Y(y)=\frac{1}{a}f_X(\frac{y-b}{a})$
+
+
+
+2. $a \lt 0$
+
+当 $a$ 小于 0 时，我们在变换关于 $X$ 与 $y$ 的不等式时应变号，因此：
+
+$F_Y(y)=P(Y\le y)=P(aX+b\le y)=P(X\ge\frac{y-b}{a})=1-F_X(\frac{y-b}{a})$
+
+求导后，得到：
+
+$f_Y(y)=-\frac{1}{a}f_X(\frac{y-b}{a})$
+
+与 $a\gt0$ 的结果合并可以写成绝对值的形式：
+
+$f_Y(y)=\frac{1}{|a|}f_X(\frac{y-b}{a})$
+
+
+
+### 绝对值函数的派生分布
+
+设随机变量 $X$，其概率密度函数为 $f_X$。寻找随机变量 $Y=|X|$ 的概率密度函数。
+
+$Y$ 是 $X$ 的绝对值意味着，若 $x\gt 0$，$x$ 与 $-x$ 对应着同一个 $y$，$y$ 的概率 $f_Y(y)$ 应该为 $f_X(x)$ 与 $f_X(-x)$ 之和。
+
+因此整理得：
+
+$f_Y(y) = \left\{ \begin{array}{cl} f_X(y)+f_X(-y) & : \ y \geq 0 \\ 0 & : \ y < 0 \end{array} \right.$
+
+*因为 $Y$ 是绝对值，因此其值大于等于 0。* 
+
+
+
+**示例**
+
+- 当 $f_X(x) = \left\{ \begin{array}{cl} \frac{1}{3} & : \ -2\lt x \le 1 \\ 0 & : \ \text{otherwise} \end{array} \right.$
+
+因为 $y\ge0$，因此我们对 $f_X(x)$ 的定义域大于等于 0 的部分分段计算。
+
+当 $0\lt y\le 1$，$f_X(y)=f_X(-y)=\frac{1}{3}$。所以 $f_Y(y)=f_X(y)+f_X(-y)=\frac{2}{3}$。
+
+当 $1\lt y\lt 2$，$f_X(y)=0$，$f_X(-y)=\frac{1}{3}$。所以 $f_Y(y)=\frac{1}{3}$。
+
+其他情况下，$f_Y(y)=0$。
+
+所以，$f_Y(y) = \begin{cases} \frac{2}{3}, & 0 \le y \leq 1 \\ \frac{1}{3}, & 1 < y \le 2 \\ 0 & \text{otherwise} \end{cases}$
+
+## 借助函数的变化计算派生密度
+
+设 $Y=g(X)$，$g$ 是一个严格的单调函数。
+![[assets/image-1752317837871.png]]
+则事件 $x\le X\le x+\delta$ 与 $g(x)\le Y\le g(x+\delta)$ 相同。
+或者从极限角度考虑，其近似于：$g(x)\le Y\le g(x)+\delta|\frac{dg}{dx}(x)|$
+进一步可得：
+$$\delta f_{X}(x)=\delta f_{Y}(y)|\frac{dg}{dx}(x)|$$
+其中，$y=g(x)$。
+
+# 卷积（Convolution）：$X+Y$ 的分布
+
+设 $W=X+Y$，且 $X$ 与 $Y$ 独立。对于此形式的分布，我们可以借助全概率定理计算其质量或密度。
+
+
+## 离散型随机变量
+
+设 $X,\ Y$ 的关系如下所示：
+
+<img src="assets/image-1752330741336.png" width="50%" />
+
+$p_{W}(w)=P(X+Y=w)$
+
+由全概率定理，可得：
+$p_{W}(w)=\sum_{x}P(X=x)P(Y=w-X|X=x)$
+
+因为 $X,\ Y$ 独立，因此：
+$$p_{W}(w)=\sum_{x}p_{X}(x)p_{Y}(w-x)$$
+
+此公式称作**离散卷积公式**，可表示为：$p_{W}(w)=(p_{X}*p_{Y})(w)$
+
+## 连续型随机变量
+
+设 $X,\ Y$ 的关系如下所示：
+
+<img src="assets/image-1752332060192.png" width="50%" />
+
+与离散型类似，连续型随机变量 $X+Y$ 的派生分布的密度为：
+$$f_{W}(w)=\int_{-\infty}^{\infty} f_{X}(x)f_{Y}(w-x) \, dx $$
+这是连续卷积公式，表示为：$f_{W}(w)=(f_{X}*f_{Y})(w)$
+
+
+# 独立的正态随机变量
+
+两个独立的正态随机变量相加后得到的随机变量也是正态的，且其均值为 0，方差为 $\sigma_{x}^2+\sigma_{y}^2$。
+![[assets/image-1752334610132.png]]
+
+# 协方差（Covariance）与相关系数（Correlation Coefficient）
+
+## 定义协方差
+
+- 定义协方差：$$\text{cov}(X,Y)=E[(X-E[X])\cdot (Y-E[Y])]$$
+- 同一个随机变量的协方差：$$\text{cov}(X,X)=\text{var}(X)$$
+- 零均值情况：$$\text{cov}(X,Y)=E[XY]$$
+- 使用随机变量的乘积的期望计算协方差：$$\text{cov}(X,Y)=E[XY]-E[X]E[Y]$$
+- 协方差符号与两个随机变量的分布有关：
+![[assets/image-1752334862866.png]]
+	- 当 $X$ 与 $Y$ 同符号概率高时（坐标 $(X,Y)$ 多位于第一和第三象限），其协方差为正 $\text{cov}(X,Y)\lt0$。
+	- 当 $X$ 与 $Y$ 异符号概率高时（坐标 $(X,Y)$ 多位于第二和第四象限），其协方差为正 $\text{cov}(X,Y)\gt0$。
+
+## 使用协方差计算随机变量之和的方差
+
+若多个随机变量 $X,\ Y$ 互相独立，那么我们可以直接得到：
+$$var(X+Y)=var(X)+var(Y)$$
+但是对于非独立的多个随机变量 $X_{i}$，我们可以使用协方差来计算它们：
+$$\text{var}\left( \sum_{i=1}^n X_{i} \right)=\sum^n_{i=1}\sum^n_{j=1}\text{cov}(X_{i},X_{j})$$
+因为同一个随机变量的协方差是其方差，我们可以写成以下形式：
+<img src="assets/image-1752336159430.png" width="50%" />
+
+## 相关系数
+
+相关系数是无量纲版（dimensionless）的协方差。
+<img src="assets/image-1752336536384.png" width="50%" />
+
+由于 $-1\le \rho\le 1$，因此使用相关系数可以更好的对比两个随机变量的相关性。
+
+### 线性相关
+
+当相关系数的绝对值为 1，$|\rho|=1$，两个随机变量满足：
+$$(X-E[X])=c(Y-E[Y])$$
+
+## 独立性（Independence）与线性相关性（Linear Correlation）
+
+两个随机变量**独立**：一个随机变量的取值不影响另一个随机变量。
+两个随机变量**线性相关**：一个随机变量可以由另一个随机变量线性表示。
+
+独立 -> 一定线性无关，而且也不会有任何其他关系
+线性无关 -> 不一定独立，也可能有其他线性关系
+
+> **使用协方差或相关系数证明线性无关**
+> 
+> 协方差（cov）或相关系数（ρ）为 0 与两个随机变量线性无关是充分必要关系。
+> 但是不能由此证明独立性，独立性应该使用 $P(A|B)=P(A)$ 证明。
+
+# 条件期望（Conditional Expectation）
+
+>在介绍条件概率质量函数时，知道了在给定条件 $Y=y$，计算 $X$ 的数学期望为：$E[X|Y=y]=\sum_{x}xp_{X|Y}(x|y)$
+>注意：对于连续型情况，应该使用积分。
+
+$E[X|Y=y]$ 的结果显而易见是一个数字。但是若没有给定具体的条件，计算条件期望时，我们会得到如下表达式：
+$$E[X|Y=y]=\frac{y}{2}\ \text{(number)}$$
+$$E[X|Y]=\frac{Y}{2}\ \text{(r.v.)}$$
+由于 $E[X|Y]$ 的结果包含随机变量 $Y$，因此，我们应该将这个条件期望看作一个新的随机变量。
+
+## 迭代期望定律（Law of Iterated Expectations）
+
+若要计算随机变量 $E[X|Y]$ 的数学期望，由数学期望的定义式可得：
+$$E[E[X|Y]]=\sum_{y}E[X|Y=y]p_{Y}(y)=E[X]$$
+迭代期望可以直接看作无条件的数学期望，这是一种简便计算数学期望的方法。
+
+# 条件方差（Conditional Variance）与全方差定理（Law of Total Variance）
+
+由条件期望，我们类比可知：
+<img src="assets/image-1752426672772.png" width="50%" />
+
+全方差定理：
+$var(X)=E[var(X|Y)]+var(E[X|Y])$
+
+> **全方差定理的证明**
+> 
+> <img src="assets/image-1752427043938.png" width="50%" />
+
+
+# 随机数量的独立随机变量的和
+
+设我们去了 $N$ 个商店，在每个商店的消费为 $X_{i}$ （$N$ 与 $X_{i}$ 是独立的随机变量，且 $X_{i}$ 是独立同分布，因此每个 $X_{i}$ 的期望与方差相同）。
+设我们的消费总和 $Y=X_{1}+\dots+X_{N}$
+
+那么为了计算我们消费的期望，可得：
+
+<img src="assets/image-1752427808919.png" width="50%" />
+
+则条件期望 $E[Y|N]=NE[X]$
+由迭代期望定理可得：
+<img src="assets/image-1752427866069.png" width="30%" />
+
+由全方差定理，$var(Y)$ 可得：
+<img src="assets/image-1752427961812.png" width="50%" />
+
+> **上式的推导**
+> 
+> <img src="assets/image-1752428268480.png" width="50%" />

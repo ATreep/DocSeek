@@ -3,6 +3,7 @@ import { FileText, Folder, ListFilter } from 'lucide-react'
 import { useDocSeekTranslation } from '../i18n'
 import type { Property } from '../api'
 import './GraphDisplayFilter.css'
+import FloatingWindow from './FloatingWindow'
 import {
   graphDisplayGroups,
   type GraphDisplaySelection,
@@ -87,10 +88,11 @@ export default function GraphDisplayFilter({
       <ListFilter size={15} />
       {selectionCount > 0 && <span className={`graph-filter-badge${selectionCount > 99 ? ' large' : ''}`} title={`${selectionCount} ${t('selections')}`}>{badgeLabel}</span>}
     </button>
-    {open && <div className="graph-display-filter-popover" role="dialog" aria-label={t('Graph display filter')}>
+    <FloatingWindow open={open} className="graph-display-filter-popover" role="dialog" aria-label={t('Graph display filter')}>
       <header>
         <div>
-          <strong>{t('Display filter')}</strong>
+          <span className="eyebrow">{t('GRAPH DISPLAY')}</span>
+          <h2>{t('Display filter')}</h2>
           <small>{selectionCount ? `${selectionCount} ${t('selected')}` : t('All properties')}</small>
         </div>
         <button
@@ -158,6 +160,6 @@ export default function GraphDisplayFilter({
           </label>)}
         </section>}
       </div>
-    </div>}
+    </FloatingWindow>
   </div>
 }

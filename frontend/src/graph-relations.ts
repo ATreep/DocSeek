@@ -5,6 +5,8 @@ export type GraphNode = {
   name?: string
   filename?: string
   property_type?: string
+  node_type?: 'property' | 'group'
+  group_path?: string
   source_property_ids?: string[]
   type?: string
   [key: string]: unknown

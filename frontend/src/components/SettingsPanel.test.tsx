@@ -77,6 +77,7 @@ describe('SettingsPanel', () => {
       },
     })
     expect(normalized.batch_llm_concurrency).toBe(50)
+    expect(normalized.ai_query_history_compaction_token_threshold).toBe(150_000)
   })
 
   it('shows system, access, and profile management sections', async () => {
@@ -91,7 +92,7 @@ describe('SettingsPanel', () => {
     expect(screen.getByRole('button', { name: 'Remove provider Embedding' })).toBeTruthy()
     expect(screen.getByRole('combobox', { name: 'Definition Generation Agent' })).toBeTruthy()
     expect(screen.getByRole('combobox', { name: 'Group Arrangement Agent' })).toBeTruthy()
-    expect(screen.getByRole('combobox', { name: 'Property Graph Building Agent' })).toBeTruthy()
+    expect(screen.queryByRole('combobox', { name: 'Property Graph Building Agent' })).toBeNull()
     expect(screen.getByRole('combobox', { name: 'Entity Extraction Agent' })).toBeTruthy()
     expect(screen.getByRole('combobox', { name: 'Shared Embedding Model' })).toBeTruthy()
     expect(screen.queryByRole('combobox', { name: 'DG-Agent LLM' })).toBeNull()

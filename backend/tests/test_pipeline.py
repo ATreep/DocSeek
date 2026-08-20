@@ -203,23 +203,9 @@ def test_ga_directory_suggestion_is_applied_with_candidate_activation(
         db.execute("INSERT INTO projects(id,name,created_at,updated_at) VALUES (?,?,?,?)", (project_id, "GA", "now", "now"))
         db.execute("INSERT INTO jobs(id,project_id,stage,status,heartbeat) VALUES (?,?,?,?,?)", (job_id, project_id, "queued", "queued", "now"))
     PropertyCatalog(settings).create(project_id, {"id": property_id, "project_id": project_id, "filename": "guide.md", "property_type": "markdown", "relative_path": "properties/guide.md", "definition": None, "filename_suggestion": None, "status": "queued", "created_at": "now", "updated_at": "now"})
-    pgb_call = {}
-
-    class RecordingPGBAgent:
-        def __init__(self, settings):
-            pgb_call["settings"] = settings
-
-        def propose(self, inventory):
-            pgb_call["inventory"] = inventory
-            return []
-
-    monkeypatch.setattr("backend.app.services.pipeline.PGBAgent", RecordingPGBAgent)
-
     run_pipeline(settings, project_id, property_id, job_id, "guide.md", "markdown", source)
 
     row = PropertyCatalog(settings).get(project_id, property_id)
-    assert pgb_call["settings"] is settings
-    assert [item["id"] for item in pgb_call["inventory"]] == [property_id]
     assert row["relative_path"] == "properties/Guide/guide.md"
     assert (settings.projects_dir / project_id / row["relative_path"]).read_text(encoding="utf-8") == "Guidance for deployment runbooks."
     assert not source.exists()
@@ -460,7 +446,6 @@ def test_add_extracts_only_new_property_and_remove_prunes_graphs_without_models(
         )
     )
     active_store.activate(project_id, "active-before-add")
-    pgb_inventories = []
     entity_document_sets = []
     entity_build_modes = []
     entity_only_modes = []
@@ -468,23 +453,6 @@ def test_add_extracts_only_new_property_and_remove_prunes_graphs_without_models(
     embedding_batches = []
     extracted_paths = []
     agent_calls = {"dg": 0, "ga": 0}
-
-    class RebuildingPGBAgent:
-        def __init__(self, settings):
-            pass
-
-        def propose_pair(self, pair):
-            ids = [item["id"] for item in [*pair.left, *pair.right]]
-            pgb_inventories.append(ids)
-            if ids == ["beta", "alpha"]:
-                return [
-                    {
-                        "source": "beta",
-                        "target": "alpha",
-                        "type": "EXTENDS_DESIGN",
-                    }
-                ]
-            return []
 
     class RebuildingEntityBuilder:
         def __init__(self, *args, **kwargs):
@@ -554,7 +522,6 @@ def test_add_extracts_only_new_property_and_remove_prunes_graphs_without_models(
             agent_calls["dg"] += 1
             return type("Definition", (), {"definition": "The Beta extension."})()
 
-    monkeypatch.setattr("backend.app.services.pipeline.PGBAgent", RebuildingPGBAgent)
     monkeypatch.setattr("backend.app.services.pipeline.GraphRAGBuilder", RebuildingEntityBuilder)
     monkeypatch.setattr("backend.app.services.pipeline.GAAgent", StableGAAgent)
     monkeypatch.setattr("backend.app.services.pipeline.DGAgent", StableDGAgent)
@@ -590,7 +557,6 @@ def test_add_extracts_only_new_property_and_remove_prunes_graphs_without_models(
     after_add = LocalGraphStore(settings).read(project_id)
 
     counts_before_remove = {
-        "pgb": len(pgb_inventories),
         "entity": len(entity_document_sets),
         "embedding": len(embedding_batches),
         **agent_calls,
@@ -604,13 +570,13 @@ def test_add_extracts_only_new_property_and_remove_prunes_graphs_without_models(
     )
     after_remove = LocalGraphStore(settings).read(project_id)
 
-    assert pgb_inventories == [["beta"], ["beta", "alpha"]]
     assert entity_document_sets == [["beta"]]
     assert entity_build_modes == [None]
     assert entity_only_modes == [None]
     assert entity_inventories == [[]]
     assert after_add.property_edges == [
-        {"source": "beta", "target": "alpha", "type": "EXTENDS_DESIGN"}
+        {"source": "group:full-rebuild:/", "target": "alpha", "type": "CONTAINS_PROPERTY"},
+        {"source": "group:full-rebuild:/", "target": "beta", "type": "CONTAINS_PROPERTY"},
     ]
     assert after_add.entity_edges == [
         {"source": "alpha-system", "target": "coredb", "type": "STORES_DATA_IN"},
@@ -628,14 +594,15 @@ def test_add_extracts_only_new_property_and_remove_prunes_graphs_without_models(
     assert any("Beta extends Alpha." in batch for batch in embedding_batches)
     assert agent_calls == {"dg": 0, "ga": 1}
     assert counts_before_remove == {
-        "pgb": len(pgb_inventories),
         "entity": len(entity_document_sets),
         "embedding": len(embedding_batches),
         **agent_calls,
     }
     assert extracted_paths == ["beta.txt"]
     assert [item["id"] for item in after_remove.properties] == ["alpha"]
-    assert after_remove.property_edges == []
+    assert after_remove.property_edges == [
+        {"source": "group:full-rebuild:/", "target": "alpha", "type": "CONTAINS_PROPERTY"}
+    ]
     assert after_remove.entity_edges == [
         {"source": "alpha-system", "target": "coredb", "type": "STORES_DATA_IN"}
     ]
@@ -761,20 +728,12 @@ def test_rebuild_reuses_unchanged_property_content_and_embedding(
         def build(self, documents, **kwargs):
             return [], []
 
-    class EmptyPGBAgent:
-        def __init__(self, settings):
-            pass
-
-        def propose(self, inventory):
-            return []
-
     monkeypatch.setattr("backend.app.services.pipeline.extract_text", recording_extract)
     monkeypatch.setattr("backend.app.services.pipeline.DGAgent", StableDGAgent)
     monkeypatch.setattr("backend.app.services.pipeline.GAAgent", StableGAAgent)
     monkeypatch.setattr(
         "backend.app.services.pipeline.GraphRAGBuilder", EmptyEntityBuilder
     )
-    monkeypatch.setattr("backend.app.services.pipeline.PGBAgent", EmptyPGBAgent)
     monkeypatch.setattr(
         "backend.app.services.pipeline.embedding_provider",
         lambda *_args, **_kwargs: RecordingEmbedder(),
@@ -874,7 +833,6 @@ def test_pipeline_records_granular_graph_stage_timings(tmp_path, monkeypatch):
         "graph-entity-generation",
         "graph-entity-merging",
         "graph-entity-relations",
-        "graph-property-relations",
         "graph-entity-embedding",
         "graph-snapshot",
         "graph-activate",
@@ -934,7 +892,7 @@ def test_transition_job_keeps_stage_start_time_for_progress_updates(tmp_path):
     assert json.loads(job["timings_json"]) == {"graph-property-read": 1.25}
 
 
-def test_batch_pipeline_generates_entities_in_parallel_with_property_relations(
+def test_batch_pipeline_generates_entities_in_parallel_with_group_tree_graph(
     tmp_path, monkeypatch
 ):
     import backend.app.services.pipeline as pipeline_service
@@ -1048,11 +1006,8 @@ def test_batch_pipeline_generates_entities_in_parallel_with_property_relations(
     entity_calls = []
     merge_calls = []
     relation_calls = []
-    property_relation_calls = []
     progress_updates = []
     entity_barrier = Barrier(2, timeout=3)
-    entity_generation_started = Event()
-    property_relations_finished = Event()
     calls_lock = Lock()
     original_transition_job = pipeline_service._transition_job
 
@@ -1060,10 +1015,9 @@ def test_batch_pipeline_generates_entities_in_parallel_with_property_relations(
         stage = args[2] if len(args) > 2 else kwargs.get("stage")
         detail = kwargs.get("detail")
         if stage in {
-            "graph-entity-property-relations",
+            "graph-entity-generation",
             "graph-entity-merging",
             "graph-entity-relations",
-            "graph-property-relations",
         }:
             progress_updates.append((stage, detail))
         return original_transition_job(*args, **kwargs)
@@ -1082,7 +1036,6 @@ def test_batch_pipeline_generates_entities_in_parallel_with_property_relations(
 
         def build(self, documents, **kwargs):
             property_id = documents[0]["property_id"]
-            entity_generation_started.set()
             entity_barrier.wait()
             with calls_lock:
                 entity_calls.append(
@@ -1131,7 +1084,6 @@ def test_batch_pipeline_generates_entities_in_parallel_with_property_relations(
             ]
 
         def propose_merges(self, pair):
-            assert property_relations_finished.is_set()
             merge_calls.append(
                 (
                     [item["id"] for item in pair.left],
@@ -1156,27 +1108,6 @@ def test_batch_pipeline_generates_entities_in_parallel_with_property_relations(
                 {"source": "atlas-product", "target": "coredb", "type": "USES"}
             ]
 
-    class RecordingPGBAgent:
-        def __init__(self, settings):
-            self.provider = None
-
-        def propose_pair(self, pair):
-            assert entity_generation_started.is_set()
-            left_ids = [item["id"] for item in pair.left]
-            right_ids = [item["id"] for item in pair.right]
-            property_relation_calls.append((left_ids, right_ids))
-            if len(property_relation_calls) == 2:
-                property_relations_finished.set()
-            if not right_ids:
-                return [
-                    {
-                        "source": "atlas",
-                        "target": "nova",
-                        "type": "INTEGRATES_WITH",
-                    }
-                ]
-            return []
-
     class RecordingEmbedder:
         def embed(self, texts):
             return [[1.0] for _ in texts]
@@ -1186,7 +1117,6 @@ def test_batch_pipeline_generates_entities_in_parallel_with_property_relations(
 
     monkeypatch.setattr(pipeline_service, "GAAgent", RecordingGAAgent)
     monkeypatch.setattr(pipeline_service, "GraphRAGBuilder", RecordingEntityBuilder)
-    monkeypatch.setattr(pipeline_service, "PGBAgent", RecordingPGBAgent)
     monkeypatch.setattr(
         pipeline_service, "_transition_job", recording_transition_job
     )
@@ -1233,7 +1163,7 @@ def test_batch_pipeline_generates_entities_in_parallel_with_property_relations(
             "documents": ["atlas"],
             "text": "Atlas uses CoreDB.",
             "original_text": "Atlas uses CoreDB.",
-            "has_offsets": True,
+            "has_offsets": False,
             "inventory": [],
             "incremental": None,
             "entity_only": None,
@@ -1242,7 +1172,7 @@ def test_batch_pipeline_generates_entities_in_parallel_with_property_relations(
             "documents": ["nova"],
             "text": "Nova integrates with Atlas.",
             "original_text": "Nova integrates with Atlas.",
-            "has_offsets": True,
+            "has_offsets": False,
             "inventory": [],
             "incremental": None,
             "entity_only": None,
@@ -1251,19 +1181,15 @@ def test_batch_pipeline_generates_entities_in_parallel_with_property_relations(
     generation_details = [
         detail
         for stage, detail in progress_updates
-        if stage == "graph-entity-property-relations"
+        if stage == "graph-entity-generation"
     ]
-    assert generation_details[0] == "Generating entity nodes and property relations: 0%"
-    assert generation_details[-1] == "Generating entity nodes and property relations: 100%"
+    assert generation_details[0] == "Generating entity nodes: 0%"
+    assert generation_details[-1] == "Generating entity nodes: 100%"
     assert ("graph-entity-relations", "Generating relations for entities: 100%") in progress_updates
     assert len(merge_calls) == 2
     assert relation_calls == [
         (["atlas-product", "nova-product"], []),
         (["atlas-product", "nova-product"], ["coredb"]),
-    ]
-    assert property_relation_calls == [
-        (["atlas", "nova"], []),
-        (["atlas", "nova"], ["core"]),
     ]
     assert not (
         settings.projects_dir
@@ -1286,7 +1212,13 @@ def test_batch_pipeline_generates_entities_in_parallel_with_property_relations(
         {"source": "atlas-product", "target": "coredb", "type": "USES"},
     ]
     assert snapshot.property_edges == [
-        {"source": "atlas", "target": "nova", "type": "INTEGRATES_WITH"}
+        {"source": "group:batch-project:/", "target": "group:batch-project:Existing", "type": "CONTAINS_GROUP"},
+        {"source": "group:batch-project:/", "target": "group:batch-project:Products", "type": "CONTAINS_GROUP"},
+        {"source": "group:batch-project:Products", "target": "group:batch-project:Products/Atlas", "type": "CONTAINS_GROUP"},
+        {"source": "group:batch-project:Products", "target": "group:batch-project:Products/Nova", "type": "CONTAINS_GROUP"},
+        {"source": "group:batch-project:Existing", "target": "core", "type": "CONTAINS_PROPERTY"},
+        {"source": "group:batch-project:Products/Atlas", "target": "atlas", "type": "CONTAINS_PROPERTY"},
+        {"source": "group:batch-project:Products/Nova", "target": "nova", "type": "CONTAINS_PROPERTY"},
     ]
     active_rows = {row["id"]: row for row in catalog.list(project_id)}
     assert active_rows["atlas"]["relative_path"] == (
@@ -1459,17 +1391,15 @@ def test_batch_retry_relates_completed_entities_recovered_from_checkpoint(
 
     merge_calls = []
     relation_calls = []
-    property_relation_calls = []
     progress_updates = []
     original_transition_job = pipeline_service._transition_job
 
     def recording_transition_job(*args, **kwargs):
         stage = args[2] if len(args) > 2 else kwargs.get("stage")
         if stage in {
-            "graph-entity-property-relations",
+            "graph-entity-generation",
             "graph-entity-merging",
             "graph-entity-relations",
-            "graph-property-relations",
         }:
             progress_updates.append((stage, kwargs.get("detail")))
         return original_transition_job(*args, **kwargs)
@@ -1503,16 +1433,6 @@ def test_batch_retry_relates_completed_entities_recovered_from_checkpoint(
                 }
             ]
 
-    class RetryPGBAgent:
-        def __init__(self, settings):
-            self.provider = None
-
-        def propose_pair(self, pair):
-            left_ids = [item["id"] for item in pair.left]
-            right_ids = [item["id"] for item in pair.right]
-            property_relation_calls.append((left_ids, right_ids))
-            return []
-
     class RecordingEmbedder:
         def embed(self, texts):
             return [[1.0] for _ in texts]
@@ -1521,7 +1441,6 @@ def test_batch_retry_relates_completed_entities_recovered_from_checkpoint(
             return None
 
     monkeypatch.setattr(pipeline_service, "GraphRAGBuilder", RetryEntityBuilder)
-    monkeypatch.setattr(pipeline_service, "PGBAgent", RetryPGBAgent)
     monkeypatch.setattr(
         pipeline_service, "_transition_job", recording_transition_job
     )
@@ -1560,13 +1479,9 @@ def test_batch_retry_relates_completed_entities_recovered_from_checkpoint(
         (["atlas-product", "nova-product"], ["coredb"]),
     ]
     assert relation_calls == merge_calls
-    assert property_relation_calls == [
-        (["atlas", "nova"], []),
-        (["atlas", "nova"], ["core"]),
-    ]
     assert (
-        "graph-entity-property-relations",
-        "Generating entity nodes and property relations: 50%",
+        "graph-entity-generation",
+        "Generating entity nodes: 100%",
     ) in progress_updates
     assert (
         "graph-entity-merging",
@@ -1579,8 +1494,8 @@ def test_batch_retry_relates_completed_entities_recovered_from_checkpoint(
     assert ("graph-entity-relations", "Generating relations for entities: 0%") in progress_updates
     assert ("graph-entity-relations", "Generating relations for entities: 100%") in progress_updates
     assert any(
-        stage == "graph-entity-property-relations"
-        and detail == "Generating entity nodes and property relations: 100%"
+        stage == "graph-entity-generation"
+        and detail == "Generating entity nodes: 100%"
         for stage, detail in progress_updates
     )
     snapshot = LocalGraphStore(settings).read(project_id)

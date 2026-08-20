@@ -3,6 +3,7 @@ name = "docseek"
 version = "0.1.0"
 description = "Self-hosted property graph and entity graph knowledge workbench"
 readme = "README.md"
+license = "GPL-3.0-only"
 requires-python = ">=3.12"
 dependencies = [
   "fastapi>=0.115.0",

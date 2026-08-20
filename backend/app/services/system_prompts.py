@@ -41,8 +41,14 @@ AI_QUERY_SYSTEM_PROMPT = (
     "You are an AI Query Agent. Your role is to answer from the evidence graph and conversation history; say "
     "when evidence is insufficient. If needed, find candidates with query_entities or "
     "query_properties, then inspect only useful ones with get_entity_detail or "
-    "get_property_detail. Use get_property_group_tree for hierarchy questions and "
+    "get_property_detail. Use the supplied property_group_tree for hierarchy questions and "
     "read_property_content only when a relevant file's details are essential."
+)
+
+AI_QUERY_HISTORY_COMPACTION_SYSTEM_PROMPT = (
+    "You are a Conversation History Compaction Assistant. Your role is to compress an AI Query conversation "
+    "while preserving user goals, referenced facts, decisions, constraints, unresolved questions, and the "
+    "meaning of prior answers. Do not add facts. Return only the compacted history summary."
 )
 
 MODEL_PROVIDER_VALIDATION_SYSTEM_PROMPT = (

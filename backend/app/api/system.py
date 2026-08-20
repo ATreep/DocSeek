@@ -14,6 +14,7 @@ from ..services.parallelism import (
     batch_llm_concurrency_from_values,
 )
 from ..services.providers import ProviderError, probe_provider_profile, save_provider_secret
+from ..services.query_history import history_compaction_token_threshold_from_values
 from ..services.retrieval_limits import (
     MAX_RETRIEVAL_LIMIT_PER_KIND,
     MAX_RETRIEVAL_TOTAL_NODE_LIMIT,
@@ -25,7 +26,6 @@ router = APIRouter(prefix="/system", tags=["system"])
 IMPORT_PROVIDER_ROUTES = (
     ("dg_agent_route", "Definition Generation Agent", "llm"),
     ("ga_agent_route", "Group Arrangement Agent", "llm"),
-    ("pgb_agent_route", "Property Graph Building Agent", "llm"),
     ("entity_agent_route", "Entity Extraction Agent", "llm"),
     ("shared_embedding_route", "Shared Embedding Model", "embedding"),
 )
@@ -34,7 +34,6 @@ IMPORT_PROVIDER_ROUTES = (
 class SystemConfigUpdate(BaseModel):
     dg_agent_route: str | None = None
     ga_agent_route: str | None = None
-    pgb_agent_route: str | None = None
     entity_agent_route: str | None = None
     ai_query_route: str | None = None
     shared_embedding_route: str | None = None
@@ -43,6 +42,10 @@ class SystemConfigUpdate(BaseModel):
     mcp_enabled: bool | None = None
     batch_llm_concurrency: int | None = Field(
         default=None, ge=1, le=MAX_BATCH_LLM_CONCURRENCY
+    )
+    ai_query_history_compaction_token_threshold: int | None = Field(
+        default=None,
+        ge=1,
     )
     ai_query_property_limit: int | None = Field(
         default=None, ge=1, le=MAX_RETRIEVAL_LIMIT_PER_KIND
@@ -82,7 +85,7 @@ def get_config(settings: Settings = Depends(get_settings), user=Depends(require_
         values = {row["key"]: row["value"] for row in db.execute("SELECT key,value FROM system_config")}
     mcp_enabled = str(values.get("mcp_enabled", "true")).lower() in {"1", "true", "yes", "on"}
     retrieval = retrieval_limits_from_values(values)
-    return {"routes": {key: values.get(key) for key in ("dg_agent_route", "ga_agent_route", "pgb_agent_route", "entity_agent_route", "ai_query_route", "shared_embedding_route")}, "entity_schema": values.get("entity_schema", DEFAULT_ENTITY_SCHEMA), "entity_prompt": values.get("entity_prompt", DEFAULT_ENTITY_PROMPT), "neo4j": {"uri": settings.neo4j_uri, "property_database": settings.neo4j_property_database, "entity_database": settings.neo4j_entity_database, "use_neo4j": settings.use_neo4j}, "mcp": {"enabled": mcp_enabled}, "batch_llm_concurrency": batch_llm_concurrency_from_values(values, default=int(settings.batch_llm_concurrency)), "retrieval": retrieval.as_system_config()}
+    return {"routes": {key: values.get(key) for key in ("dg_agent_route", "ga_agent_route", "entity_agent_route", "ai_query_route", "shared_embedding_route")}, "entity_schema": values.get("entity_schema", DEFAULT_ENTITY_SCHEMA), "entity_prompt": values.get("entity_prompt", DEFAULT_ENTITY_PROMPT), "neo4j": {"uri": settings.neo4j_uri, "property_database": settings.neo4j_property_database, "entity_database": settings.neo4j_entity_database, "use_neo4j": settings.use_neo4j}, "mcp": {"enabled": mcp_enabled}, "batch_llm_concurrency": batch_llm_concurrency_from_values(values, default=int(settings.batch_llm_concurrency)), "ai_query_history_compaction_token_threshold": history_compaction_token_threshold_from_values(values), "retrieval": retrieval.as_system_config()}
 
 
 @router.get("/import-provider-readiness")

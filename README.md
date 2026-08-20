@@ -1,23 +1,14 @@
 # DocSeek
 
-DocSeek is a self-hosted knowledge workbench for turning uploaded properties into a Property Graph, an Entity Graph, graph-only Search results, and grounded AI Query answers.
+[English README](README.en-US.md)
 
-Release 1 is a modular monolith:
+## 简介
 
-- `backend/` contains the FastAPI API, local auth/roles, project and property lifecycle, LangGraph processing workflow, Neo4j adapters, retrieval, AI Query, and project-scoped MCP lifecycle.
-- `frontend/` contains the React/Vite workbench with the property tree, graph tabs, Search, AI Query, property inspection overlay, and MCP controls.
-- SQLite under `data/conf/` stores users, groups, roles, sessions, projects, and operational locks/jobs only. Graph/property/entity canonical data is written through the graph adapter.
-- Neo4j uses the named `property_graph` and `entity_graph` databases when reachable. The GraphRAG adapter exposes Neo4j GraphRAG's `SimpleKGPipeline` seam for configured provider objects and preserves source property IDs in document metadata. With `DOCSEEK_ALLOW_LOCAL_FALLBACK=true` (the default), development uses JSON graph snapshots under `data/graph-fallback/` while preserving the same adapter contract.
+DocSeek 是一个可自托管的知识工作台：上传文档或其他资产后，系统会提取内容，构建资产图谱与实体图谱，并提供可追溯引用的搜索和 AI 查询。
 
-## Fresh setup with uv
+## 快速开始
 
-Prerequisites:
-
-- [uv](https://docs.astral.sh/uv/getting-started/installation/)
-- Node.js 20 or newer with npm
-- Git
-
-Clone the repository and let uv install the required Python version and all locked Python dependencies:
+环境要求：`uv`、Node.js 20+、npm 和 Git。
 
 ```bash
 git clone https://github.com/ATreep/DocSeek.git
@@ -25,33 +16,47 @@ cd DocSeek
 uv python install 3.12
 uv sync --group dev
 npm --prefix frontend install
-```
-
-Start the API and frontend together:
-
-```bash
 ./start.sh
 ```
 
-The script stops prior DocSeek API/frontend processes, uses `uv run` for the Python API, starts both services, and prints the frontend URL: `http://localhost:5173`.
+启动完成后访问 <http://localhost:5173>，使用本地开发账号 `admin` / `admin` 登录。首次登录后请立即修改密码；不要在未加固的情况下将开发服务暴露到公网。
 
-The seeded local development account is `admin` / `admin`. Change local credentials before exposing the deployment.
+`start.sh` 会启动 API（默认 `http://127.0.0.1:8000`）和前端，并将运行数据写入 `data/`。如果使用 Neo4j，请在启动前配置 `DOCSEEK_NEO4J_*` 环境变量；未配置时会使用本地 JSON 图谱回退存储。
 
-To update dependencies, edit `pyproject.toml`, run `uv lock`, and commit both `pyproject.toml` and `uv.lock`. Use `uv sync --locked --group dev` in reproducible development or CI environments.
+## 主要功能
 
-## Configuration
+- **资产导入与解析**：支持文本、PDF、Office 文档等常见格式，保留项目和资产层级。
+- **资产图谱**：展示资产之间的关系，支持筛选、搜索、缩放、聚焦和重新布局。
+- **实体图谱**：从资产内容中提取实体、定义和关系，并保留来源资产。
+- **搜索与 AI 查询**：在资产和实体中检索；AI 查询基于图谱证据回答，并提供引用和关系路径。
+- **项目级 MCP**：按项目启用或关闭 MCP 端点，供兼容客户端调用。
+- **权限与多语言**：内置用户、群组、角色和能力管理，界面支持中英文切换。
+- **本地优先部署**：Neo4j 可选；未连接 Neo4j 时仍可使用本地回退存储快速体验。
 
-The application runs without an environment file by using its deterministic local fallback. Configure model providers from the Settings panel, or create a local `.env` file with `DOCSEEK_LLM_*`, `DOCSEEK_EMBEDDING_*`, and optional `DOCSEEK_NEO4J_*` values. Hidden files and the runtime `data/` directory are intentionally excluded from Git. Provider failures are surfaced as failed candidate jobs and never activate a partial graph.
+## 界面截图
 
-The System settings panel also manages provider profiles, route selection, Neo4j/storage checks, users, groups, roles, and the current profile. Provider secrets are accepted only as configuration metadata by the local control plane; runtime API secrets should be supplied through environment variables and are never returned by the API.
+完整截图目录：[screenshots/](screenshots/)
 
-## Verification
+### AI 查询
+
+![AI 查询](screenshots/ai-query.png)
+
+### 实体图谱总览
+
+![实体图谱总览](screenshots/entity-graph-overview.png)
+
+### 实体关系预览
+
+![实体关系预览](screenshots/entity-relation-preview.png)
+
+## 开发验证
 
 ```bash
-uv sync --locked --group dev
 uv run pytest -q
 npm --prefix frontend test
 npm --prefix frontend run build
 ```
 
-The backend tests cover capability resolution, project/property naming and lifecycle, exclusive locks, image exclusion from Entity Graph input, graph database separation, GraphRAG adapter contracts, Search without an LLM call, AI Query citations, recovery, and MCP manual lifecycle. Frontend Vitest tests cover graph filtering controls, image preview rendering, and lock-aware property actions.
+## 许可证
+
+本项目使用 [GPL-3.0](LICENSE) 许可证。

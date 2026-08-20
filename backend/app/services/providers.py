@@ -23,7 +23,6 @@ class ProviderError(RuntimeError):
 ROUTE_TYPES = {
     "dg_agent_route": "llm",
     "ga_agent_route": "llm",
-    "pgb_agent_route": "llm",
     "entity_agent_route": "llm",
     "ai_query_route": "llm",
     "shared_embedding_route": "embedding",
